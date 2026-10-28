@@ -357,8 +357,7 @@ a version-carrying row-merge command — `SeedRow`s
 (`(kind, logical, value-or-tombstone, version)`) merge-applied at their
 **carried** versions with the stored bytes verbatim (intent envelopes
 included), emitting nothing into the child's change log and witnessing the
-batch's max version into the group's HLC (`propose_seed_batch` /
-`seed_rows_kind` are its propose/read pair; `tests/seed_batch.rs` +
+batch's max version into the group's HLC (`propose_seed_batch` is its propose path;
 `ANIMUS_SPLIT_SEEDS` is its corpus). **Originally built for the now-deleted
 copy-based split-build driver, its sole surviving consumer is the restore
 driver** (`animusd::backup_restore`, ADR 0059 §7) seeding a restore's
@@ -3571,7 +3570,7 @@ replicas at `A = awake_max_per_core x cores` by deferring **bulk** wakes only.
 
 ## Background budget (ADR 0079 layer 3, step 5)
 
-`src/background_budget.rs`: node-local permit pools (snapshot send 2 / receive 2,
+`src/background_budget.rs` (also owns the node `FlushBudget`, `--memtable-budget-bytes`, issue #1389 / ADR 0079 amendment: each tablet engine's flush threshold is its share of a 256 MiB node memtable budget, 64 KiB to 4 MiB; `0` = off): node-local permit pools (snapshot send 2 / receive 2,
 learner catch-up 4, splits 1 on by default; compactions `max(1, cores/2)` only
 with `--cores`, else off; `0` = off). Class L, no gate. Permits are RAII; a pool
 that is full reaps idle-TTL'd permits lazily at the next acquire. The raftkv

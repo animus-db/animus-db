@@ -1033,8 +1033,7 @@ a literal `:0`.
   threaded through the same layered-wrapper convention as `quiesce_after`/
   `stream_retention`: `BoundNode::start_with_growth`'s own trailing
   parameter, defaulted by every wrapper above it, with
-  `run_node_with_ttl_sweep_interval`/`run_node_with_streams_quiesce_and_
-  ttl_sweep_interval` as the test-facing entry points (a real minute would
+  `run_node_with_streams_quiesce_and_ttl_sweep_interval` as the test-facing entry point (a real minute would
   make any e2e test glacial) — **no `--ttl-sweep-interval` CLI flag exists
   yet** (a documented gap, the same shape as `quiesce_after`'s own
   not-yet-wired split-deployment paths) and the data-only spawn site has no
@@ -4442,7 +4441,7 @@ existing trailing knobs:
   does still hardcodes `false`**, unaffected by this closure (the narrower
   `start_cluster_with*` wrappers, `start_data_with_streams`, the narrower
   `run_node_with_streams_*` wrappers, `index_drain.rs`'s own in-crate
-  bring-up helper, `run_node_data`/`run_node_data_with_streams`) all
+  bring-up helper, `run_node_data`) all
   hardcode `false` directly at their own call into a shared-WAL-aware
   layer, mirroring `--heartbeat-batch`'s own hardcoded-`false` wrapper list
   exactly (see that section's own bullet for the full enumeration and
@@ -7423,7 +7422,7 @@ with an empty `ext`; an era-on peer refuses and redials (closing it needs an
 
 - **Per-node state**: `ClusterEdgeState::version()` -> `VersionState {
   features (ClusterFeatures), halt (VersionHalt), profile (range + build) }`.
-  `Node::features()` / `version_halt_reason()` / `wait_version_halt()` expose
+  `Node::features()` / `wait_version_halt()` expose
   it. P2-B's emitters consult `ctx.edge.version().features`.
 - **`version_wiring_loop`** (spawned from `spawn_common_tail` and every
   `SimCluster` node; one generic task, every role): feeds `ClusterFeatures`
@@ -12705,6 +12704,8 @@ removing several Regions in one call drops every link between them. The saga pro
 walk open with a partition on its first call and assert the window is open
 before healing; see
 `docs/lessons/testing/2026-10-21-a-stuck-first-call-is-the-reliable-way-to-hold-a-walk-open.md`.
+
+- **Console backend dispatch (2026-10-27):** `lib.rs`'s `ConsoleBackend` bodies live once in `console_op_*` helpers generic over the private `ConsoleDispatch` trait; `ProductionDispatch` (concrete `execute_routed`) and `GenericDispatch` (`execute_routed_as_generic`) must stay distinct. See `docs/lessons/code-patterns/2026-10-27-share-a-body-across-prod-and-sim-impls-by-passing-the-dispatch.md`. `admin.rs`'s two `AdminHost` impls are already one-line forwards and differ in `action_data_dynamo` and `debug_inboxes_view`; leave them.
 
 ## Settling decided txn records (issue #1380, `Gate::TxnSettled`)
 

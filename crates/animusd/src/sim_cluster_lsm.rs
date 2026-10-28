@@ -68,6 +68,42 @@ impl SimStall {
     }
 }
 
+/// Issue #1389: a per-node memtable budget (bytes, floor, cap) every tablet
+/// engine of the cluster joins, installed per thread like [`SimStall`]. Each
+/// node's factory builds its own [`animus_storage::FlushBudget`], as
+/// production's `BackgroundBudget` does per node.
+#[derive(Clone, Copy)]
+pub(crate) struct SimFlushBudget {
+    pub(crate) budget: usize,
+    pub(crate) floor: usize,
+    pub(crate) cap: usize,
+}
+
+thread_local! {
+    static SIM_FLUSH_BUDGET: std::cell::RefCell<Option<SimFlushBudget>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Removes the thread's [`SimFlushBudget`] when dropped.
+pub(crate) struct SimFlushBudgetGuard(());
+
+impl Drop for SimFlushBudgetGuard {
+    fn drop(&mut self) {
+        SIM_FLUSH_BUDGET.with(|d| *d.borrow_mut() = None);
+    }
+}
+
+impl SimFlushBudget {
+    pub(crate) fn install(self) -> SimFlushBudgetGuard {
+        SIM_FLUSH_BUDGET.with(|d| *d.borrow_mut() = Some(self));
+        SimFlushBudgetGuard(())
+    }
+
+    fn current() -> Option<SimFlushBudget> {
+        SIM_FLUSH_BUDGET.with(|d| *d.borrow())
+    }
+}
+
 struct SimWedge(Arc<std::sync::atomic::AtomicBool>);
 
 impl animus_storage::CompactionGate for SimWedge {
@@ -96,6 +132,7 @@ pub(crate) enum SimEngineBackend {
 pub(crate) struct SimLsmTabletFactory {
     env: SimEnv,
     stall: Option<SimStall>,
+    flush_budget: Option<animus_storage::FlushBudget>,
     files: animus_cp_data::tablet_files::TabletFileIndex<SimEnv>,
 }
 
@@ -103,6 +140,8 @@ impl SimLsmTabletFactory {
     pub(crate) fn new(env: SimEnv) -> Self {
         Self {
             stall: SimStall::current(),
+            flush_budget: SimFlushBudget::current()
+                .map(|b| animus_storage::FlushBudget::new(b.budget, b.floor, b.cap)),
             files: animus_cp_data::tablet_files::TabletFileIndex::new(
                 env.clone(),
                 |t| tablet_lsm_prefix(t.0),
@@ -127,6 +166,9 @@ impl EngineFactory<LsmEngine<SimEnv>> for SimLsmTabletFactory {
             Ok(engine) => {
                 if let Some(st) = &self.stall {
                     engine.set_compaction_gate(Arc::new(SimWedge(st.wedge.clone())));
+                }
+                if let Some(fb) = &self.flush_budget {
+                    engine.set_flush_budget(fb);
                 }
                 Ok(engine)
             }
@@ -163,6 +205,9 @@ impl EngineFactory<LsmEngine<SimEnv>> for SimLsmTabletFactory {
             .map_err(|e| e.to_string())?;
         if let Some(st) = &self.stall {
             engine.set_compaction_gate(Arc::new(SimWedge(st.wedge.clone())));
+        }
+        if let Some(fb) = &self.flush_budget {
+            engine.set_flush_budget(fb);
         }
         Ok(engine)
     }

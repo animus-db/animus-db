@@ -228,8 +228,7 @@ pub const JOIN_DEADLINE: Duration = Duration::from_secs(30);
 /// this function survives only for the callers that genuinely need a
 /// not-yet-bound address to hand to a **growth** or **self-minted-id join**
 /// path *before* that path itself binds anything ([`grow_deadline`],
-/// [`join_allocated_fresh_deadline`], [`join_data_allocated_fresh_
-/// deadline`], [`bring_up_split`]) — those retry their own bind-and-join
+/// [`join_allocated_fresh_deadline`], [`bring_up_split`]) — those retry their own bind-and-join
 /// step as a unit, the same shape every one of these bring-up helpers used
 /// before this fix. **The two EXPLICIT-`--id` join helpers no longer use
 /// this function at all (issue #1042)** — [`join_fresh_deadline`]/
@@ -888,62 +887,6 @@ pub async fn join_allocated_fresh_deadline(
                 assert!(
                     tokio::time::Instant::now() < hard_deadline,
                     "could not join (minted id) within {deadline:?}: {e}"
-                );
-                sleep(Duration::from_millis(50)).await;
-                attempt += 1;
-            }
-        }
-    }
-}
-
-/// Join a fresh **data-only, self-minted-id** node against `seeds` (ADR 0040
-/// Decision B/C) — the data-only dual of [`join_allocated_fresh_deadline`].
-/// Still uses [`free_addrs`] for the identical reason that function's own
-/// doc gives.
-pub async fn join_data_allocated_fresh_deadline(
-    seeds: &[SocketAddr],
-    dir: &Path,
-    label: &str,
-    backend: StorageBackend,
-    deadline: Duration,
-) -> Node {
-    let hard_deadline = tokio::time::Instant::now() + deadline;
-    let mut attempt: u64 = 0;
-    loop {
-        let raw = free_addrs(6);
-        let addrs = RoleAddrs {
-            // See `join_allocated_fresh_deadline`'s identical placeholder.
-            id: animus_env::NodeId::new_unchecked("pending-mint"),
-            role: NodeRole::Data,
-            internal: raw[0],
-            client: raw[1],
-            dynamo: raw[2],
-            admin: raw[3],
-            intra: raw[4],
-            console: raw[5],
-            advertise_host: None,
-            tls: None,
-            encryption_key_path: None,
-            labels: Default::default(),
-            overload: None,
-        };
-        let node_dir = dir.join(format!("data-join-alloc-{label}-{attempt}"));
-        match animusd::run_node_data_join(
-            seeds.iter().map(ToString::to_string).collect(),
-            None,
-            addrs,
-            &node_dir,
-            backend,
-            BTreeMap::new(),
-            None,
-        )
-        .await
-        {
-            Ok(node) => return node,
-            Err(e) => {
-                assert!(
-                    tokio::time::Instant::now() < hard_deadline,
-                    "could not join as a data node (minted id) within {deadline:?}: {e}"
                 );
                 sleep(Duration::from_millis(50)).await;
                 attempt += 1;

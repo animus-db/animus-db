@@ -1933,7 +1933,28 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             }
         };
 
-        if let Some(reason) = first_err {
+        // Decide whether to abort *before* touching the anchor: a participant's
+        // own typed failure, else the pre-commit precondition refresh (check
+        // #2 — see this method's own doc for why this is a value re-check, not
+        // the ADR's ts-based one), evaluated only when no participant failed.
+        // `why` is the text spliced into the "abort itself failed" message; it
+        // differs from `reason`'s own `Display` for the precondition case.
+        let abort: Option<(TxnAbortReason, String)> = if let Some(reason) = first_err {
+            let why = reason.to_string();
+            Some((reason, why))
+        } else if !preconditions.is_empty()
+            && self
+                .check_preconditions(&preconditions)
+                .await
+                .map_err(TxnAbortReason::Other)?
+                != observed
+        {
+            Some(precondition_changed_abort())
+        } else {
+            None
+        };
+
+        if let Some((reason, why)) = abort {
             // ADR 0018 §2/PR5 decision-semantics amendment: this abort
             // attempt can itself lose to a concurrent recovery *commit* on
             // the same record (every participant genuinely staged after
@@ -1964,44 +1985,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                     resolve_all(TxnOutcome::Committed { commit_ts }, staged).await;
                     Ok(commit_ts)
                 }
-                Err(e) => Err(TxnAbortReason::Other(format!(
-                    "transaction aborted: {reason} (and abort itself failed after retrying: {e}); \
-                     retry"
-                ))),
-            }
-        } else if !preconditions.is_empty()
-            && self
-                .check_preconditions(&preconditions)
-                .await
-                .map_err(TxnAbortReason::Other)?
-                != observed
-        {
-            // Precondition check #2 (pre-commit refresh — see this method's own
-            // doc for why this is a value re-check, not the ADR's ts-based one).
-            match self
-                .txn_decide_anchor_retrying(
-                    &anchor_table,
-                    txn_id.clone(),
-                    record_key.clone(),
-                    false,
-                    candidate,
-                )
-                .await
-            {
-                Ok(TxnOutcome::Aborted) => {
-                    resolve_all(TxnOutcome::Aborted, staged).await;
-                    Err(TxnAbortReason::Other(
-                        "a precondition changed between prepare and commit; retry".into(),
-                    ))
-                }
-                Ok(TxnOutcome::Committed { commit_ts }) => {
-                    resolve_all(TxnOutcome::Committed { commit_ts }, staged).await;
-                    Ok(commit_ts)
-                }
-                Err(e) => Err(TxnAbortReason::Other(format!(
-                    "transaction aborted: a precondition changed between prepare and commit \
-                     (and abort itself failed after retrying: {e}); retry"
-                ))),
+                Err(e) => Err(abort_attempt_failed(&why, &e)),
             }
         } else {
             match self
@@ -2120,6 +2104,62 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             observed.push((table.clone(), key.clone(), actual));
         }
         Ok(observed)
+    }
+}
+
+/// The abort for a precondition that changed between prepare and the
+/// pre-commit refresh: the typed reason returned to the caller, and the
+/// shorter phrase [`abort_attempt_failed`] splices into its own message.
+fn precondition_changed_abort() -> (TxnAbortReason, String) {
+    const WHY: &str = "a precondition changed between prepare and commit";
+    (TxnAbortReason::Other(format!("{WHY}; retry")), WHY.into())
+}
+
+/// The error when the abort decision itself could not be recorded after
+/// retrying (the outcome is therefore unknown, hence the `; retry` suffix
+/// that [`TxnAbortReason::is_ambiguous`] keys on).
+fn abort_attempt_failed(why: &str, e: &dyn std::fmt::Display) -> TxnAbortReason {
+    TxnAbortReason::Other(format!(
+        "transaction aborted: {why} (and abort itself failed after retrying: {e}); retry"
+    ))
+}
+
+#[cfg(test)]
+mod abort_tail_tests {
+    use super::*;
+
+    /// Pins the exact abort texts of `cp_txn`'s decision tail (byte-identical
+    /// across the collapse of its two abort branches).
+    #[test]
+    fn abort_texts_are_pinned() {
+        let (reason, why) = precondition_changed_abort();
+        assert_eq!(
+            reason,
+            TxnAbortReason::Other(
+                "a precondition changed between prepare and commit; retry".into()
+            )
+        );
+        assert_eq!(
+            abort_attempt_failed(&why, &"boom"),
+            TxnAbortReason::Other(
+                "transaction aborted: a precondition changed between prepare and commit \
+                 (and abort itself failed after retrying: boom); retry"
+                    .into()
+            )
+        );
+        let typed = TxnAbortReason::ConditionFailed {
+            table: "t".into(),
+            key: vec![1],
+        };
+        assert_eq!(
+            abort_attempt_failed(&typed.to_string(), &"boom"),
+            TxnAbortReason::Other(format!(
+                "transaction aborted: {typed} (and abort itself failed after retrying: boom); \
+                 retry"
+            ))
+        );
+        assert!(abort_attempt_failed(&why, &"boom").is_ambiguous());
+        assert!(reason.is_ambiguous());
     }
 }
 

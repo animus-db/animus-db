@@ -177,7 +177,7 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::ops::Bound;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
@@ -220,6 +220,9 @@ const L1_TABLE_BUDGET: usize = 4;
 /// the default flush threshold so a flush usually covers and removes one or more
 /// whole segments.
 const DEFAULT_WAL_SEGMENT_BYTES: u64 = 64 * 1024;
+/// `LsmOptions::production()` WAL segment size: 1 MiB, a quarter of the
+/// adaptive flush cap, so a capped flush drops ~4 whole segments.
+const PRODUCTION_WAL_SEGMENT_BYTES: u64 = 1 << 20;
 /// Low bits of an HLC-packed version (`wall_ms << 20 | logical`); mirrors
 /// `animus-cp-data`'s `hlc::LOGICAL_BITS`. The storage crate stays HLC-agnostic
 /// (versions are opaque `u64`s to the engine); this only sizes the default grace.
@@ -392,6 +395,9 @@ impl LsmOptions {
     pub fn production() -> Self {
         Self {
             background_maintenance: true,
+            // Sized for the adaptive flush's cap (a few MiB memtable): a few
+            // segments per flush, not dozens of 64 KiB files (issue #1389).
+            wal_segment_bytes: PRODUCTION_WAL_SEGMENT_BYTES,
             l0_slowdown_factor: stall::DEFAULT_L0_SLOWDOWN_FACTOR,
             l0_stop_factor: stall::DEFAULT_L0_STOP_FACTOR,
             ..Self::default()
@@ -753,9 +759,38 @@ impl Drop for FlushPendingGuard {
     }
 }
 
-const FAIL_LANE_NONE: u8 = 0;
-const FAIL_LANE_FLUSH: u8 = 1;
-const FAIL_LANE_COMPACTION: u8 = 2;
+/// Which background lane recorded a failure (see [`BgHealth::lane`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FailLane {
+    Flush,
+    Compaction,
+}
+
+/// The latest unresolved background-maintenance failure, as one record so its
+/// parts are always read and written together (under one lock) and a reader
+/// never sees a half-updated combination.
+#[derive(Default, Clone)]
+struct BgHealth {
+    /// Which lane recorded the latest failure, so a success on the *other*
+    /// lane does not clear it (a flush that fits must not mask a compaction
+    /// that keeps failing for space). `None` while nothing is unresolved.
+    lane: Option<FailLane>,
+    /// Whether the latest background run failed for want of disk space
+    /// (ENOSPC/EDQUOT) — cleared by the next successful run on the owning
+    /// lane. Lets `await_backpressure` surface [`StorageError::StorageFull`]
+    /// instead of a generic backend error.
+    full: bool,
+    /// Consecutive background runs that failed with a non-ENOSPC error; reset
+    /// by a clearing success or an ENOSPC failure. The backpressure gate errors
+    /// only once this reaches [`BACKPRESSURE_MAX_CONSECUTIVE_FAILURES`].
+    streak: u32,
+    /// The most recent background maintenance failure, if any (introspection —
+    /// `background_maintenance` is fire-and-forget from the writer's point of
+    /// view, so an error has nowhere else to surface; the next write that
+    /// crosses the threshold retriggers maintenance regardless). Overwritten
+    /// only by a failure; a success does not clear it.
+    last_error: Option<String>,
+}
 
 /// Admission for background compaction runs (ADR 0079 layer 3): a node-wide
 /// pool bounds how many compactions run at once across every engine on the
@@ -1099,24 +1134,10 @@ pub struct LsmEngine<E: Env> {
     /// flush has its own task, so it never waits behind the compaction task's
     /// run-to-quiescence loop. At most one flush task runs at a time.
     flush_scheduled: Arc<AtomicBool>,
-    /// Which lane recorded the latest background failure (`FAIL_LANE_*`), so a
-    /// success on the *other* lane does not clear it (a flush that fits must not
-    /// mask a compaction that keeps failing for space).
-    failure_lane: Arc<std::sync::atomic::AtomicU8>,
-    /// The most recent background maintenance failure, if any (introspection —
-    /// `background_maintenance` is fire-and-forget from the writer's point of
-    /// view, so an error has nowhere else to surface; the next write that
-    /// crosses the threshold retriggers maintenance regardless).
-    background_error: Arc<Mutex<Option<String>>>,
-    /// Whether the latest background maintenance run failed for want of disk
-    /// space (ENOSPC/EDQUOT) — cleared by the next successful run. Lets
-    /// `await_backpressure` surface [`StorageError::StorageFull`] instead of a
-    /// generic backend error.
-    background_full: Arc<AtomicBool>,
-    /// Consecutive background-maintenance runs that failed with a non-ENOSPC
-    /// error; reset by any success or an ENOSPC failure. The backpressure gate
-    /// errors only once this reaches [`BACKPRESSURE_MAX_CONSECUTIVE_FAILURES`].
-    maintenance_consecutive_failures: Arc<AtomicU32>,
+    /// The latest unresolved background failure (lane, ENOSPC flag, non-ENOSPC
+    /// streak, last error text) as one record; see [`BgHealth`]. Never held
+    /// across an `.await`.
+    bg_health: Arc<Mutex<BgHealth>>,
     /// How many times an inline post-write flush/compaction failed with
     /// ENOSPC and was deferred (the write itself had already succeeded).
     /// Introspection for tests.
@@ -1128,6 +1149,9 @@ pub struct LsmEngine<E: Env> {
     /// ADR 0081: this engine's write-stall bookkeeping (levels, ledger
     /// registration, introspection counters).
     stall: Arc<StallState>,
+    /// The node's memtable budget slot (issue #1389), if installed; when set
+    /// it replaces `opts.flush_threshold_bytes` with the budget's live share.
+    flush_slot: Arc<std::sync::OnceLock<crate::flush_budget::FlushSlot>>,
 }
 
 /// Per-engine write-stall bookkeeping (ADR 0081). Everything here is
@@ -1502,12 +1526,10 @@ impl<E: Env> LsmEngine<E> {
             metrics,
             maintenance_scheduled: Arc::new(AtomicBool::new(false)),
             flush_scheduled: Arc::new(AtomicBool::new(false)),
-            failure_lane: Arc::new(std::sync::atomic::AtomicU8::new(FAIL_LANE_NONE)),
-            background_error: Arc::new(Mutex::new(None)),
-            background_full: Arc::new(AtomicBool::new(false)),
-            maintenance_consecutive_failures: Arc::new(AtomicU32::new(0)),
+            bg_health: Arc::new(Mutex::new(BgHealth::default())),
             maintenance_deferrals: Arc::new(AtomicU64::new(0)),
             compaction_gate: Arc::new(std::sync::OnceLock::new()),
+            flush_slot: Arc::new(std::sync::OnceLock::new()),
             compaction_retry_scheduled: Arc::new(AtomicBool::new(false)),
             stall: Arc::new(StallState::default()),
         })
@@ -1844,10 +1866,11 @@ impl<E: Env> LsmEngine<E> {
     /// The flush half of [`Self::maybe_flush_and_compact`]: flush the memtable if
     /// it is over the threshold (and no flush is already running).
     async fn flush_if_due(&self) -> Result<()> {
+        let threshold = self.flush_threshold();
         let should_flush = {
             let inner = self.lock();
             !inner.memtable.is_empty()
-                && inner.memtable_bytes >= self.opts.flush_threshold_bytes
+                && inner.memtable_bytes >= threshold
                 // A cheap decision-time hint; `flush` re-checks it under the
                 // maintenance lock and then *drains* in-flight applies behind the
                 // flush-pending entry gate (it no longer skips when one is in
@@ -1859,7 +1882,7 @@ impl<E: Env> LsmEngine<E> {
             if self.opts.stall_fault == StallFault::FlushGated {
                 self.wait_flush_behind_io_budget().await;
             }
-            self.flush_if_over(self.opts.flush_threshold_bytes).await?;
+            self.flush_if_over(threshold).await?;
         }
         Ok(())
     }
@@ -2074,6 +2097,31 @@ impl<E: Env> LsmEngine<E> {
         }
     }
 
+    /// Join the node's memtable budget (issue #1389): from now on this
+    /// engine's flush threshold is the budget's live per-engine share
+    /// (`clamp(budget / active engines, floor, cap)`) instead of
+    /// `LsmOptions::flush_threshold_bytes`, and the memtable hard cap follows
+    /// it. At most once; later calls are ignored.
+    pub fn set_flush_budget(&self, budget: &crate::flush_budget::FlushBudget) {
+        let _ = self.flush_slot.set(budget.slot());
+    }
+
+    /// The flush threshold in force now: the node budget's share when joined,
+    /// else `opts.flush_threshold_bytes`. Also refreshes this engine's
+    /// active/idle report to the budget (an engine is active while its
+    /// memtable holds bytes), so it is called on every write and flush.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn flush_threshold(&self) -> usize {
+        match self.flush_slot.get() {
+            Some(slot) => {
+                slot.set_dirty(self.lock().memtable_bytes > 0);
+                slot.budget().threshold()
+            }
+            None => self.opts.flush_threshold_bytes,
+        }
+    }
+
     /// Install the node's compaction pool ([`CompactionGate`]). At most once;
     /// a second call is ignored.
     pub fn set_compaction_gate(&self, gate: Arc<dyn CompactionGate>) {
@@ -2170,32 +2218,32 @@ impl<E: Env> LsmEngine<E> {
     /// error, the ENOSPC flag, and the consecutive non-ENOSPC failure count the
     /// backpressure gate keys on.
     fn record_maintenance_result(&self, r: Result<()>) {
-        self.record_lane_result(FAIL_LANE_COMPACTION, r);
+        self.record_lane_result(FailLane::Compaction, r);
     }
 
-    fn record_lane_result(&self, lane: u8, r: Result<()>) {
-        match r {
-            Ok(()) => {
-                let owner = self.failure_lane.load(Ordering::Acquire);
-                if owner == FAIL_LANE_NONE || owner == lane {
-                    self.background_full.store(false, Ordering::Release);
-                    self.maintenance_consecutive_failures
-                        .store(0, Ordering::Release);
-                    self.failure_lane.store(FAIL_LANE_NONE, Ordering::Release);
+    fn record_lane_result(&self, lane: FailLane, r: Result<()>) {
+        {
+            // One lock for the whole transition, so readers see the lane, flag,
+            // streak and text of the same outcome.
+            let mut h = self.bg_health.lock().expect("poisoned");
+            match r {
+                Ok(()) => {
+                    if h.lane.is_none() || h.lane == Some(lane) {
+                        h.full = false;
+                        h.streak = 0;
+                        h.lane = None;
+                    }
                 }
-            }
-            Err(e) => {
-                self.failure_lane.store(lane, Ordering::Release);
-                let full = e.is_storage_full();
-                self.background_full.store(full, Ordering::Release);
-                if full {
-                    self.maintenance_consecutive_failures
-                        .store(0, Ordering::Release);
-                } else {
-                    self.maintenance_consecutive_failures
-                        .fetch_add(1, Ordering::AcqRel);
+                Err(e) => {
+                    h.lane = Some(lane);
+                    h.full = e.is_storage_full();
+                    h.streak = if h.full {
+                        0
+                    } else {
+                        h.streak.saturating_add(1)
+                    };
+                    h.last_error = Some(e.to_string());
                 }
-                *self.background_error.lock().expect("poisoned") = Some(e.to_string());
             }
         }
         self.publish_stall();
@@ -2205,8 +2253,7 @@ impl<E: Env> LsmEngine<E> {
     /// tests).
     #[must_use]
     pub fn maintenance_consecutive_failures(&self) -> u32 {
-        self.maintenance_consecutive_failures
-            .load(Ordering::Acquire)
+        self.bg_health.lock().expect("poisoned").streak
     }
 
     /// If the memtable is over the flush threshold, or a compaction is due, and
@@ -2218,9 +2265,10 @@ impl<E: Env> LsmEngine<E> {
     /// write that still finds work due will trigger another task once this one
     /// finishes.
     fn trigger_background_maintenance(&self) {
+        let threshold = self.flush_threshold();
         let should_flush = {
             let inner = self.lock();
-            !inner.memtable.is_empty() && inner.memtable_bytes >= self.opts.flush_threshold_bytes
+            !inner.memtable.is_empty() && inner.memtable_bytes >= threshold
         };
         if should_flush
             && self
@@ -2233,7 +2281,7 @@ impl<E: Env> LsmEngine<E> {
             let engine = self.clone();
             self.env.spawn_task(async move {
                 let r = engine.flush_if_due().await;
-                engine.record_lane_result(FAIL_LANE_FLUSH, r);
+                engine.record_lane_result(FailLane::Flush, r);
                 engine.flush_scheduled.store(false, Ordering::Release);
                 // A flush adds an L0 table: a compaction may now be due.
                 engine.trigger_background_compaction();
@@ -2289,7 +2337,12 @@ impl<E: Env> LsmEngine<E> {
     }
 
     async fn stall_gate(&self, bytes: u64) -> Result<()> {
-        let policy = self.opts.stall_policy();
+        let mut policy = self.opts.stall_policy();
+        if self.flush_slot.get().is_some() {
+            policy.memtable_cap = self
+                .flush_threshold()
+                .saturating_mul(BACKPRESSURE_OVERSHOOT_FACTOR);
+        }
         let mut guard = StallGuard::new(self);
         let mut polls = 0u64;
         let mut confirmed_full = false;
@@ -2335,14 +2388,18 @@ impl<E: Env> LsmEngine<E> {
         waited: Duration,
         confirmed_full: &mut bool,
     ) -> Result<()> {
-        let failures = self
-            .maintenance_consecutive_failures
-            .load(Ordering::Acquire);
-        let last_error = || self.background_error.lock().expect("poisoned").clone();
-        // `background_full` is stale while a fresh run is in flight (space may
+        // One snapshot: the streak, the ENOSPC flag and the error text are from
+        // the same recorded outcome.
+        let BgHealth {
+            full,
+            streak: failures,
+            last_error,
+            ..
+        } = self.bg_health.lock().expect("poisoned").clone();
+        // `full` is stale while a fresh run is in flight (space may
         // have returned since it was set): only a *finished* run that failed
         // for want of space is a StorageFull verdict.
-        if self.background_full.load(Ordering::Acquire)
+        if full
             && !self.maintenance_scheduled.load(Ordering::Acquire)
             && !self.flush_scheduled.load(Ordering::Acquire)
         {
@@ -2359,7 +2416,7 @@ impl<E: Env> LsmEngine<E> {
                 "write stall ({}): background maintenance is out of disk space \
                  (last error: {:?})",
                 cause.name(),
-                last_error()
+                last_error
             )));
         }
         let limit_hit = match self.opts.stall_fault {
@@ -2374,7 +2431,7 @@ impl<E: Env> LsmEngine<E> {
                 "write stall ({}): {failures} consecutive background maintenance \
                  failures, waited {waited:?} (last error: {:?})",
                 cause.name(),
-                last_error()
+                last_error
             )));
         }
         Ok(())
@@ -2590,6 +2647,8 @@ impl<E: Env> LsmEngine<E> {
         // Observability (ADR 0015): a flush actually committed (the manifest swap
         // is done and the new table is live).
         self.metrics.incr(Metric::StorageFlushes);
+        // The memtable may now be empty: stop counting against the node budget.
+        let _ = self.flush_threshold();
         // ADR 0081 decision 4: a flush is charged to the node's IO budget (so
         // the gauge shows real disk use) but never delayed by it.
         if let Some(gate) = self.compaction_gate.get() {
@@ -2940,7 +2999,7 @@ impl<E: Env> LsmEngine<E> {
     #[doc(hidden)]
     #[must_use]
     pub fn background_maintenance_error(&self) -> Option<String> {
-        self.background_error.lock().expect("poisoned").clone()
+        self.bg_health.lock().expect("poisoned").last_error.clone()
     }
 
     /// How many inline post-write flushes/compactions were deferred because the

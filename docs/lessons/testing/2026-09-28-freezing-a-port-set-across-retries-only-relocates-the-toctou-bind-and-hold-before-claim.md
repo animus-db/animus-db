@@ -66,7 +66,7 @@ earlier durable claim under a self-minted attempt's own (different) id for
 a later attempt to collide with. That path's own production ordering
 (claim, using the caller-supplied pre-bind addresses, then bind) was
 deliberately left unchanged, and its own test helpers
-(`join_allocated_fresh_deadline`/`join_data_allocated_fresh_deadline`)
+(`join_allocated_fresh_deadline`, and formerly its data-only dual)
 correspondingly still need `free_addrs` to hand them a real,
 already-resolvable address up front — passing a literal `:0` into that
 unchanged branch would register a bogus, unreachable `"host:0"` NodeAddrs,

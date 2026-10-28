@@ -21,8 +21,6 @@
 //! instead. This is what lets one `Service` per role-port apply uniformly
 //! across every pod's identical `targetPort`.
 
-use std::collections::BTreeMap;
-
 use serde::{Deserialize, Serialize};
 
 use crate::crd::AnimusClusterSpec;
@@ -871,11 +869,6 @@ pub fn entrypoint_script(spec: &AnimusClusterSpec) -> String {
 fn shell_single_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
-
-/// The `dynamo_auth` field is intentionally absent from [`ClusterConfig`]
-/// (see its own doc); this alias documents that a caller building a
-/// `Secret`-mounted credentials file must produce this exact shape.
-pub type DynamoAuthCredentials = BTreeMap<String, String>;
 
 #[cfg(test)]
 mod tests {

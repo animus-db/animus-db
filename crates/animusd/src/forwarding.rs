@@ -987,20 +987,39 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         self.relay.relay(addr, &request, CLIENT_TIMEOUT).await
     }
 
+    /// Resolve the leader this node holds for `tablet`, or the exact
+    /// [`not_leader_refusal`](Self::not_leader_refusal) for it (with its
+    /// leader hint) — "serve here or refuse", never re-forward. `tablet` is
+    /// `None` when the op's `(table, key)` did not resolve to any tablet.
+    fn leader_for(
+        &self,
+        tablet: Option<TabletId>,
+    ) -> Result<(TabletId, crate::CpGroup<E>), Box<ClientResponse>> {
+        match tablet.and_then(|t| self.edge.cp_leader(t).map(|leader| (t, leader))) {
+            Some(found) => Ok(found),
+            None => Err(Box::new(self.not_leader_refusal(tablet))),
+        }
+    }
+
+    /// The `Ok(()) => PutOk, Err(e) => Error(e)` reply of a leader-local write.
+    fn put_ok(result: Result<(), String>) -> ClientResponse {
+        match result {
+            Ok(()) => ClientResponse::PutOk,
+            Err(e) => ClientResponse::Error(e),
+        }
+    }
+
     /// Serve a **forwarded** CP op locally: this node must lead the op's tablet (it
     /// does not re-forward — bounding routing to one hop). The op's `(table, key)`
     /// resolves to its owning tablet, then to that tablet's leader on this node.
     pub(crate) async fn cp_serve_forwarded(&self, inner: ClientRequest) -> ClientResponse {
         match inner {
             ClientRequest::Put { key, value, table } => {
-                let tablet = self.tablet_for(&table, &key);
-                let Some(leader) = tablet.and_then(|t| self.edge.cp_leader(t)) else {
-                    return self.not_leader_refusal(tablet);
+                let (_, leader) = match self.leader_for(self.tablet_for(&table, &key)) {
+                    Ok(found) => found,
+                    Err(refusal) => return *refusal,
                 };
-                match Self::cp_put_local(&leader, key, value).await {
-                    Ok(()) => ClientResponse::PutOk,
-                    Err(e) => ClientResponse::Error(e),
-                }
+                Self::put_ok(Self::cp_put_local(&leader, key, value).await)
             }
             ClientRequest::PutBatch { entries, table } => {
                 // All entries share one tablet (the forwarder grouped by tablet), so
@@ -1008,14 +1027,11 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 let Some(first) = entries.first().map(|(k, _)| k.clone()) else {
                     return ClientResponse::PutOk; // empty batch is a no-op
                 };
-                let tablet = self.tablet_for(&table, &first);
-                let Some(leader) = tablet.and_then(|t| self.edge.cp_leader(t)) else {
-                    return self.not_leader_refusal(tablet);
+                let (_, leader) = match self.leader_for(self.tablet_for(&table, &first)) {
+                    Ok(found) => found,
+                    Err(refusal) => return *refusal,
                 };
-                match Self::cp_batch_local(&leader, entries).await {
-                    Ok(()) => ClientResponse::PutOk,
-                    Err(e) => ClientResponse::Error(e),
-                }
+                Self::put_ok(Self::cp_batch_local(&leader, entries).await)
             }
             ClientRequest::KindWrite {
                 table,
@@ -1028,9 +1044,9 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 let Some(first) = writes.first().map(|(_, k, _)| k.clone()) else {
                     return ClientResponse::PutOk; // empty batch is a no-op
                 };
-                let tablet = self.tablet_for(&table, &first);
-                let Some(leader) = tablet.and_then(|t| self.edge.cp_leader(t)) else {
-                    return self.not_leader_refusal(tablet);
+                let (_, leader) = match self.leader_for(self.tablet_for(&table, &first)) {
+                    Ok(found) => found,
+                    Err(refusal) => return *refusal,
                 };
                 // The identical confirm `cp_kind_write_raw`'s own Local arm
                 // runs — never a second implementation (the now-deleted
@@ -1041,10 +1057,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 // #1037) so this remote leader's own local execution marks
                 // its accepted propose the identical way the originating
                 // node would have, had it been the leader itself.
-                match Self::cp_kind_raw_local(&leader, writes, change_log, housekeeping).await {
-                    Ok(()) => ClientResponse::PutOk,
-                    Err(e) => ClientResponse::Error(e),
-                }
+                Self::put_ok(Self::cp_kind_raw_local(&leader, writes, change_log, housekeeping).await)
             }
             // ADR 0046 U3: the evaluate-at-leader write RPC — resolve the
             // leader by the item's own base key, recomputed here from
@@ -1060,9 +1073,9 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 condition,
             } => {
                 let key = dynamo::item_key(&pk, sk.as_ref());
-                let tablet = self.tablet_for(&table, &key);
-                let Some(leader) = tablet.and_then(|t| self.edge.cp_leader(t)) else {
-                    return self.not_leader_refusal(tablet);
+                let (_, leader) = match self.leader_for(self.tablet_for(&table, &key)) {
+                    Ok(found) => found,
+                    Err(refusal) => return *refusal,
                 };
                 let meta = self.effective_metadata();
                 match dynamo::kind_write_item_at_leader::<E, R>(
@@ -1127,9 +1140,9 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                         results: Vec::new(),
                     };
                 };
-                let tablet = self.tablet_for(&table, &first);
-                let Some(leader) = tablet.and_then(|t| self.edge.cp_leader(t)) else {
-                    return self.not_leader_refusal(tablet);
+                let (_, leader) = match self.leader_for(self.tablet_for(&table, &first)) {
+                    Ok(found) => found,
+                    Err(refusal) => return *refusal,
                 };
                 let meta = self.effective_metadata();
                 let results = dynamo::kind_write_batch_at_leader::<E, R>(
@@ -1191,20 +1204,18 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 table,
                 stale: false,
             } => {
-                let tablet = self.tablet_for(&table, &key);
-                match tablet.and_then(|t| self.edge.cp_leader(t)) {
-                    // Read-side scope pre-check + served/absent disambiguation
-                    // (ADR 0033) — the same `cp_get_local` decision as `cp_read`'s
-                    // Local arm. Serve-or-error only (never re-forward, never
-                    // wait): the forwarder's own retry loop re-resolves routing on
-                    // a `"; retry"` error.
-                    Some(leader) => {
-                        match self.cp_get_local_resolving(&leader, &table, &key).await {
-                            Ok(v) => ClientResponse::Value(v),
-                            Err(e) => ClientResponse::Error(e),
-                        }
-                    }
-                    None => self.not_leader_refusal(tablet),
+                let (_, leader) = match self.leader_for(self.tablet_for(&table, &key)) {
+                    Ok(found) => found,
+                    Err(refusal) => return *refusal,
+                };
+                // Read-side scope pre-check + served/absent disambiguation
+                // (ADR 0033) — the same `cp_get_local` decision as `cp_read`'s
+                // Local arm. Serve-or-error only (never re-forward, never
+                // wait): the forwarder's own retry loop re-resolves routing on
+                // a `"; retry"` error.
+                match self.cp_get_local_resolving(&leader, &table, &key).await {
+                    Ok(v) => ClientResponse::Value(v),
+                    Err(e) => ClientResponse::Error(e),
                 }
             }
             // ADR 0018 §2, torn-pair-fix stack PR2: the non-blocking
@@ -1216,25 +1227,22 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             // `Get`'s own `"; retry"` `Error`, since the two callers'
             // outer loops act on those differently.
             ClientRequest::GetSnapshot { key, table } => {
-                let tablet = self.tablet_for(&table, &key);
-                match tablet.and_then(|t| self.edge.cp_leader(t)) {
-                    Some(leader) => match self.cp_get_local_snapshot(&leader, &key).await {
-                        Ok(SnapshotRead::Value(v)) => ClientResponse::Value(v),
-                        Ok(SnapshotRead::Unresolved) => ClientResponse::Unresolved,
-                        Err(e) => ClientResponse::Error(e),
-                    },
-                    None => self.not_leader_refusal(tablet),
+                let (_, leader) = match self.leader_for(self.tablet_for(&table, &key)) {
+                    Ok(found) => found,
+                    Err(refusal) => return *refusal,
+                };
+                match self.cp_get_local_snapshot(&leader, &key).await {
+                    Ok(SnapshotRead::Value(v)) => ClientResponse::Value(v),
+                    Ok(SnapshotRead::Unresolved) => ClientResponse::Unresolved,
+                    Err(e) => ClientResponse::Error(e),
                 }
             }
             ClientRequest::Delete { key, table } => {
-                let tablet = self.tablet_for(&table, &key);
-                let Some(leader) = tablet.and_then(|t| self.edge.cp_leader(t)) else {
-                    return self.not_leader_refusal(tablet);
+                let (_, leader) = match self.leader_for(self.tablet_for(&table, &key)) {
+                    Ok(found) => found,
+                    Err(refusal) => return *refusal,
                 };
-                match Self::cp_delete_local(&leader, key).await {
-                    Ok(()) => ClientResponse::PutOk,
-                    Err(e) => ClientResponse::Error(e),
-                }
+                Self::put_ok(Self::cp_delete_local(&leader, key).await)
             }
             // ADR 0055's scan arm — same serve-or-refuse discipline as the
             // eventual `Get` above.
@@ -1275,9 +1283,9 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 table,
                 stale: false,
             } => {
-                let tablet = self.tablet_for(&table, &start);
-                let Some(leader) = tablet.and_then(|t| self.edge.cp_leader(t)) else {
-                    return self.not_leader_refusal(tablet);
+                let (tablet, leader) = match self.leader_for(self.tablet_for(&table, &start)) {
+                    Ok(found) => found,
+                    Err(refusal) => return *refusal,
                 };
                 // Read-side scope pre-check (ADR 0033) — the same
                 // `cp_scan_local` decision as `cp_scan_one`'s Local arm: a
@@ -1286,12 +1294,9 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 //
                 // ADR 0065 §2/§3 — the identical per-tablet check
                 // `cp_scan_one`'s own Local arm makes.
-                let precharge = match tablet {
-                    Some(t) => match self.throttle_precharge_read(&table, t, true) {
-                        Ok(p) => p,
-                        Err(e) => return ClientResponse::Error(e),
-                    },
-                    None => None,
+                let precharge = match self.throttle_precharge_read(&table, tablet, true) {
+                    Ok(p) => p,
+                    Err(e) => return ClientResponse::Error(e),
                 };
                 match Self::cp_scan_local(&leader, &start, end.as_deref(), limit, reverse).await {
                     Ok(p) => {
@@ -1346,18 +1351,15 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 reverse,
                 stale: false,
             } => {
-                let tablet = self.tablet_for(&table, &start);
-                let Some(leader) = tablet.and_then(|t| self.edge.cp_leader(t)) else {
-                    return self.not_leader_refusal(tablet);
+                let (tablet, leader) = match self.leader_for(self.tablet_for(&table, &start)) {
+                    Ok(found) => found,
+                    Err(refusal) => return *refusal,
                 };
                 // ADR 0065 §2/§3 — the identical per-tablet check
                 // `cp_scan_kind_one`'s own Local arm makes.
-                let precharge = match tablet {
-                    Some(t) => match self.throttle_precharge_read(&table, t, true) {
-                        Ok(p) => p,
-                        Err(e) => return ClientResponse::Error(e),
-                    },
-                    None => None,
+                let precharge = match self.throttle_precharge_read(&table, tablet, true) {
+                    Ok(p) => p,
+                    Err(e) => return ClientResponse::Error(e),
                 };
                 match Self::cp_scan_kind_local(
                     &leader,
@@ -1382,8 +1384,9 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             // why there is no client key to derive it from).
             ClientRequest::ForceSeal { tablet } => {
                 let tablet = TabletId(tablet);
-                let Some(leader) = self.edge.cp_leader(tablet) else {
-                    return self.not_leader_refusal(Some(tablet));
+                let (_, leader) = match self.leader_for(Some(tablet)) {
+                    Ok(found) => found,
+                    Err(refusal) => return *refusal,
                 };
                 let table = self
                     .effective_metadata()
@@ -1402,8 +1405,9 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             // of `ForceSeal` just above, identical shape.
             ClientRequest::ForcePitrSeal { tablet } => {
                 let tablet = TabletId(tablet);
-                let Some(leader) = self.edge.cp_leader(tablet) else {
-                    return self.not_leader_refusal(Some(tablet));
+                let (_, leader) = match self.leader_for(Some(tablet)) {
+                    Ok(found) => found,
+                    Err(refusal) => return *refusal,
                 };
                 let table = self
                     .effective_metadata()
@@ -1427,8 +1431,9 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             // E's single-token skip.
             ClientRequest::TriggerAutoSplit { tablet } => {
                 let tablet = TabletId(tablet);
-                let Some(leader) = self.edge.cp_leader(tablet) else {
-                    return self.not_leader_refusal(Some(tablet));
+                let (_, leader) = match self.leader_for(Some(tablet)) {
+                    Ok(found) => found,
+                    Err(refusal) => return *refusal,
                 };
                 match median_split_key(&leader).await {
                     None => ClientResponse::Error(STREAM_GROW_NO_SPLIT_POINT.into()),
@@ -1452,8 +1457,9 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 limit,
             } => {
                 let tablet = TabletId(tablet);
-                let Some(leader) = self.edge.cp_leader(tablet) else {
-                    return self.not_leader_refusal(Some(tablet));
+                let (_, leader) = match self.leader_for(Some(tablet)) {
+                    Ok(found) => found,
+                    Err(refusal) => return *refusal,
                 };
                 // The ADR 0048 scope-transition latch died with the mutable
                 // scope (ADR 0050 rung 7): ranges are immutable and a split
@@ -1476,8 +1482,9 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             // no engine scan, unlike `StreamHotRead`.
             ClientRequest::StreamHotChangeMax { tablet } => {
                 let tablet = TabletId(tablet);
-                let Some(leader) = self.edge.cp_leader(tablet) else {
-                    return self.not_leader_refusal(Some(tablet));
+                let (_, leader) = match self.leader_for(Some(tablet)) {
+                    Ok(found) => found,
+                    Err(refusal) => return *refusal,
                 };
                 let pairs = match leader.hot_change_max().await {
                     Some((ts, ordinal)) => {
@@ -1494,13 +1501,11 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             // `StreamHotRead` above (see this variant's own doc for why).
             ClientRequest::ClearBackfillCursor { tablet, index } => {
                 let tablet = TabletId(tablet);
-                let Some(leader) = self.edge.cp_leader(tablet) else {
-                    return self.not_leader_refusal(Some(tablet));
+                let (_, leader) = match self.leader_for(Some(tablet)) {
+                    Ok(found) => found,
+                    Err(refusal) => return *refusal,
                 };
-                match index_drain::clear_backfill_cursor(&leader, &index).await {
-                    Ok(()) => ClientResponse::PutOk,
-                    Err(e) => ClientResponse::Error(e),
-                }
+                Self::put_ok(index_drain::clear_backfill_cursor(&leader, &index).await)
             }
             // Issue #950: the cross-replica leader-hint probe — answered by
             // ANY replica of `tablet`, leader or follower, straight from its
@@ -1541,9 +1546,9 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                             .encode(),
                     );
                 };
-                let tablet = self.tablet_for(&table, &first);
-                let Some(leader) = tablet.and_then(|t| self.edge.cp_leader(t)) else {
-                    return self.not_leader_refusal(tablet);
+                let (_, leader) = match self.leader_for(self.tablet_for(&table, &first)) {
+                    Ok(found) => found,
+                    Err(refusal) => return *refusal,
                 };
                 // ADR 0046 U3 (PR2): the shared local-stage step also used by
                 // `txn_prepare`'s own `CpRoute::Local` branch — see
@@ -1584,9 +1589,9 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 min_commit_ts,
                 orphan_created_ts,
             } => {
-                let tablet = self.tablet_for(&table, &record_key);
-                let Some(leader) = tablet.and_then(|t| self.edge.cp_leader(t)) else {
-                    return self.not_leader_refusal(tablet);
+                let (_, leader) = match self.leader_for(self.tablet_for(&table, &record_key)) {
+                    Ok(found) => found,
+                    Err(refusal) => return *refusal,
                 };
                 // ADR 0018 §2/PR5: resolves nothing here (the caller does,
                 // uniformly, for every participant including the anchor's
@@ -1647,9 +1652,9 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 let Some(first) = keys.first().cloned() else {
                     return ClientResponse::PutOk; // nothing to resolve
                 };
-                let tablet = self.tablet_for(&table, &first);
-                let Some(leader) = tablet.and_then(|t| self.edge.cp_leader(t)) else {
-                    return self.not_leader_refusal(tablet);
+                let (_, leader) = match self.leader_for(self.tablet_for(&table, &first)) {
+                    Ok(found) => found,
+                    Err(refusal) => return *refusal,
                 };
                 match leader.txn_resolve(txn_id, record_key, keys, outcome).await {
                     Some((_, outcome)) => ClientResponse::TxnResolved { outcome },
@@ -1659,9 +1664,9 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 }
             }
             ClientRequest::TxnStatus { table, record_key } => {
-                let tablet = self.tablet_for(&table, &record_key);
-                let Some(leader) = tablet.and_then(|t| self.edge.cp_leader(t)) else {
-                    return self.not_leader_refusal(tablet);
+                let (_, leader) = match self.leader_for(self.tablet_for(&table, &record_key)) {
+                    Ok(found) => found,
+                    Err(refusal) => return *refusal,
                 };
                 match leader.txn_status_local(&record_key).await {
                     Some(status) => ClientResponse::TxnStatusReply { status },
@@ -1674,9 +1679,9 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             // ADR 0018 §2/PR5: the two recovery-only internal RPCs — see
             // `ClientCtx::txn_record_view`/`txn_verify`, the one callers.
             ClientRequest::TxnRecordView { table, record_key } => {
-                let tablet = self.tablet_for(&table, &record_key);
-                let Some(leader) = tablet.and_then(|t| self.edge.cp_leader(t)) else {
-                    return self.not_leader_refusal(tablet);
+                let (_, leader) = match self.leader_for(self.tablet_for(&table, &record_key)) {
+                    Ok(found) => found,
+                    Err(refusal) => return *refusal,
                 };
                 match leader.txn_record_view(&record_key).await {
                     Some(view) => ClientResponse::TxnRecordViewReply { view },
@@ -1690,9 +1695,9 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 span,
                 txn_id,
             } => {
-                let tablet = self.tablet_for(&table, &span.start);
-                let Some(leader) = tablet.and_then(|t| self.edge.cp_leader(t)) else {
-                    return self.not_leader_refusal(tablet);
+                let (_, leader) = match self.leader_for(self.tablet_for(&table, &span.start)) {
+                    Ok(found) => found,
+                    Err(refusal) => return *refusal,
                 };
                 match leader.txn_verify_staged(&span, &txn_id).await {
                     Some(staged) => ClientResponse::TxnVerifyReply { staged },

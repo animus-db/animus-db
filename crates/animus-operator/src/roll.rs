@@ -397,8 +397,50 @@ pub enum Effect {
     },
 }
 
-/// A condition to set (`Some(message)`) or clear (`None`).
-pub type CondChange = (&'static str, Option<String>);
+/// The roll's condition state: exactly one of `UpgradeInProgress`,
+/// `UpgradeBlocked`, `UpgradeFinalizePending` and `RollComplete` is on (with
+/// its message) and the other three are off. `Blocked` also keeps
+/// `UpgradeInProgress` on with a fixed "paused" message.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RollCond {
+    /// `UpgradeInProgress` with this message.
+    Progress(String),
+    /// `UpgradeBlocked` with this message (and `UpgradeInProgress` paused).
+    Blocked(String),
+    /// `UpgradeFinalizePending` with this message.
+    FinalizePending(String),
+    /// `RollComplete` with this message.
+    Complete(String),
+}
+
+impl RollCond {
+    /// Record this on `status`: set the one condition (two for `Blocked`, in
+    /// the order `UpgradeInProgress` then `UpgradeBlocked`) and clear the rest.
+    fn apply(&self, status: &mut AnimusClusterStatus) {
+        let (in_progress, blocked, finalize_pending, complete) = match self {
+            Self::Progress(m) => (Some(m.as_str()), None, None, None),
+            Self::Blocked(m) => (
+                Some("roll paused; see UpgradeBlocked"),
+                Some(m.as_str()),
+                None,
+                None,
+            ),
+            Self::FinalizePending(m) => (None, None, Some(m.as_str()), None),
+            Self::Complete(m) => (None, None, None, Some(m.as_str())),
+        };
+        for (t, msg) in [
+            (CONDITION_UPGRADE_IN_PROGRESS, in_progress),
+            (CONDITION_UPGRADE_BLOCKED, blocked),
+            (CONDITION_UPGRADE_FINALIZE_PENDING, finalize_pending),
+            (CONDITION_ROLL_COMPLETE, complete),
+        ] {
+            match msg {
+                Some(m) => set_cond(status, t, m.to_string()),
+                None => clear_cond(status, t),
+            }
+        }
+    }
+}
 
 /// Everything one [`drive`] decision changes.
 #[derive(Clone, Debug, PartialEq)]
@@ -407,7 +449,7 @@ pub struct Outcome {
     pub partition: i32,
     pub effect: Option<Effect>,
     pub phase: UpgradePhase,
-    pub conds: Vec<CondChange>,
+    pub cond: RollCond,
     pub in_flight: Option<(String, i64)>,
     pub settled_since: Option<i64>,
     pub from_version: Option<u32>,
@@ -423,27 +465,6 @@ pub fn ordinal_of(name: &str, node: &str) -> Option<i32> {
     node.strip_prefix(&format!("{name}-"))?.parse().ok()
 }
 
-fn blocked_conds(msg: String) -> Vec<CondChange> {
-    vec![
-        (
-            CONDITION_UPGRADE_IN_PROGRESS,
-            Some("roll paused; see UpgradeBlocked".to_string()),
-        ),
-        (CONDITION_UPGRADE_BLOCKED, Some(msg)),
-        (CONDITION_UPGRADE_FINALIZE_PENDING, None),
-        (CONDITION_ROLL_COMPLETE, None),
-    ]
-}
-
-fn progress_conds(msg: String) -> Vec<CondChange> {
-    vec![
-        (CONDITION_UPGRADE_IN_PROGRESS, Some(msg)),
-        (CONDITION_UPGRADE_BLOCKED, None),
-        (CONDITION_UPGRADE_FINALIZE_PENDING, None),
-        (CONDITION_ROLL_COMPLETE, None),
-    ]
-}
-
 /// The outcome for a roll that cannot be evaluated (admin unreachable, no
 /// verdict, PDB `0`): hold the partition exactly where it is, surface why.
 /// **Fail closed.**
@@ -453,7 +474,7 @@ pub fn blocked(partition: i32, prev: Option<&UpgradeStatus>, msg: String) -> Out
         partition,
         effect: None,
         phase: UpgradePhase::Blocked,
-        conds: blocked_conds(msg),
+        cond: RollCond::Blocked(msg),
         in_flight: prev.and_then(|p| Some((p.in_flight_node.clone()?, p.in_flight_since?))),
         settled_since: None,
         from_version: prev.and_then(|p| p.from_version),
@@ -570,7 +591,8 @@ pub fn drive(input: &DriveInput<'_>, obs: &Observation) -> Outcome {
         partition: input.partition,
         effect: None,
         phase: UpgradePhase::InProgress,
-        conds: Vec::new(),
+        // Every arm below replaces this.
+        cond: RollCond::Progress(String::new()),
         in_flight,
         settled_since,
         from_version,
@@ -584,13 +606,13 @@ pub fn drive(input: &DriveInput<'_>, obs: &Observation) -> Outcome {
         Action::Restart { node } => match next_ord {
             Some(next) if ordinal_of(input.cluster, &node) == Some(next) => {
                 out.partition = next;
-                out.conds = progress_conds(format!(
+                out.cond = RollCond::Progress(format!(
                     "gate open: lowered partition to {next}; pod ordinal {next} is being \
                      restarted on the new revision"
                 ));
             }
             _ => {
-                out.conds = progress_conds(format!(
+                out.cond = RollCond::Progress(format!(
                     "gate open for {node} but it is not the next pod the partition admits; \
                      waiting for the next safe step"
                 ));
@@ -598,33 +620,33 @@ pub fn drive(input: &DriveInput<'_>, obs: &Observation) -> Outcome {
         },
         Action::TransferControlLeadership { from, to } => match ordinal_of(input.cluster, &from) {
             Some(leader_ordinal) => {
-                out.conds = progress_conds(format!(
+                out.cond = RollCond::Progress(format!(
                     "{from} is the control leader and is next: transferring leadership to \
                          {to} before restarting it"
                 ));
                 out.effect = Some(Effect::Transfer { leader_ordinal, to });
             }
             None => {
-                out.conds = progress_conds(format!("cannot map control leader {from} to a pod"));
+                out.cond = RollCond::Progress(format!("cannot map control leader {from} to a pod"));
             }
         },
         Action::Wait { node, why } => {
-            out.conds = progress_conds(format!("waiting for {node}: {}", why.join("; ")));
+            out.cond = RollCond::Progress(format!("waiting for {node}: {}", why.join("; ")));
         }
         Action::Blocked(b) => {
             out.phase = UpgradePhase::Blocked;
-            out.conds = blocked_conds(b.to_string());
+            out.cond = RollCond::Blocked(b.to_string());
         }
         Action::AwaitEra => {
             out.partition = 0;
-            out.conds = progress_conds(
+            out.cond = RollCond::Progress(
                 "every pod is on the new binary; waiting for the versioning era to start"
                     .to_string(),
             );
         }
         Action::Soak { remaining } => {
             out.partition = 0;
-            out.conds = progress_conds(format!(
+            out.cond = RollCond::Progress(format!(
                 "every pod is on the new revision and healthy; soaking {}s before finalize",
                 remaining.as_secs()
             ));
@@ -632,19 +654,11 @@ pub fn drive(input: &DriveInput<'_>, obs: &Observation) -> Outcome {
         Action::ReadyToFinalize { to } => {
             out.partition = 0;
             out.phase = UpgradePhase::FinalizePending;
-            out.conds = vec![
-                (CONDITION_UPGRADE_IN_PROGRESS, None),
-                (CONDITION_UPGRADE_BLOCKED, None),
-                (
-                    CONDITION_UPGRADE_FINALIZE_PENDING,
-                    Some(format!(
-                        "every pod runs the new binary and can_finalize holds: run `animus \
-                         cluster finalize` to raise the cluster version to {to} (irreversible), \
-                         or set spec.upgrade.finalize: Auto"
-                    )),
-                ),
-                (CONDITION_ROLL_COMPLETE, None),
-            ];
+            out.cond = RollCond::FinalizePending(format!(
+                "every pod runs the new binary and can_finalize holds: run `animus \
+                 cluster finalize` to raise the cluster version to {to} (irreversible), \
+                 or set spec.upgrade.finalize: Auto"
+            ));
         }
         Action::Finalize { to, expected } => {
             out.partition = 0;
@@ -655,15 +669,9 @@ pub fn drive(input: &DriveInput<'_>, obs: &Observation) -> Outcome {
                 .and_then(|l| ordinal_of(input.cluster, l))
             {
                 Some(leader_ordinal) => {
-                    out.conds = vec![
-                        (CONDITION_UPGRADE_IN_PROGRESS, None),
-                        (CONDITION_UPGRADE_BLOCKED, None),
-                        (
-                            CONDITION_UPGRADE_FINALIZE_PENDING,
-                            Some(format!("finalizing cluster version {expected} -> {to}")),
-                        ),
-                        (CONDITION_ROLL_COMPLETE, None),
-                    ];
+                    out.cond = RollCond::FinalizePending(format!(
+                        "finalizing cluster version {expected} -> {to}"
+                    ));
                     out.effect = Some(Effect::Finalize {
                         leader_ordinal,
                         to,
@@ -672,8 +680,9 @@ pub fn drive(input: &DriveInput<'_>, obs: &Observation) -> Outcome {
                 }
                 None => {
                     out.phase = UpgradePhase::Blocked;
-                    out.conds =
-                        blocked_conds("cannot finalize: no control leader is known".to_string());
+                    out.cond = RollCond::Blocked(
+                        "cannot finalize: no control leader is known".to_string(),
+                    );
                 }
             }
         }
@@ -686,12 +695,7 @@ pub fn drive(input: &DriveInput<'_>, obs: &Observation) -> Outcome {
                 "roll complete: every pod is on the new revision (no cluster-version change)"
                     .to_string()
             };
-            out.conds = vec![
-                (CONDITION_UPGRADE_IN_PROGRESS, None),
-                (CONDITION_UPGRADE_BLOCKED, None),
-                (CONDITION_UPGRADE_FINALIZE_PENDING, None),
-                (CONDITION_ROLL_COMPLETE, Some(msg)),
-            ];
+            out.cond = RollCond::Complete(msg);
         }
     }
     out
@@ -792,12 +796,7 @@ fn clear_cond(status: &mut AnimusClusterStatus, type_: &str) {
 
 /// Record `out` on `status`.
 pub fn apply_outcome(status: &mut AnimusClusterStatus, out: &Outcome) {
-    for (t, msg) in &out.conds {
-        match msg {
-            Some(m) => set_cond(status, t, m.clone()),
-            None => clear_cond(status, t),
-        }
-    }
+    out.cond.apply(status);
     let u = status
         .upgrade
         .get_or_insert_with(|| blank_upgrade(out.phase));
@@ -861,20 +860,10 @@ pub fn begin_roll(
     match pdb_refusal {
         Some(why) => {
             u.phase = UpgradePhase::Blocked;
-            for (t, m) in blocked_conds(why.to_string()) {
-                match m {
-                    Some(m) => set_cond(status, t, m),
-                    None => clear_cond(status, t),
-                }
-            }
+            RollCond::Blocked(why.to_string()).apply(status);
         }
         None => {
-            for (t, m) in progress_conds(msg) {
-                match m {
-                    Some(m) => set_cond(status, t, m),
-                    None => clear_cond(status, t),
-                }
-            }
+            RollCond::Progress(msg).apply(status);
         }
     }
     status.upgrade = Some(u);
@@ -941,8 +930,6 @@ pub async fn observe<A: AdminOps>(
     let mut health = BTreeMap::new();
     let mut views: Vec<(Platform, Value)> = Vec::new();
     let mut saw_not_found = false;
-    let mut first_ready: Option<i32> = None;
-    let mut new_own_max: Option<u32> = None;
 
     for i in 0..replicas {
         let id = desired::cluster_config::node_id(t.name, i);
@@ -953,7 +940,6 @@ pub async fn observe<A: AdminOps>(
             health.insert(id, Health::Unreachable);
             continue;
         }
-        first_ready.get_or_insert(i);
         let h = match admin
             .get_json(&t.url(i, "/admin/roll-health"), t.tls_ca)
             .await
@@ -968,18 +954,7 @@ pub async fn observe<A: AdminOps>(
                 .get_json(&t.url(i, "/admin/cluster-version"), t.tls_ca)
                 .await
             {
-                Ok(v) => {
-                    if pf == Platform::New
-                        && let Some(m) = v
-                            .get("own_range")
-                            .and_then(|r| r.get("max"))
-                            .and_then(Value::as_u64)
-                    {
-                        let m = u32::try_from(m).unwrap_or(u32::MAX);
-                        new_own_max = Some(new_own_max.map_or(m, |x| x.max(m)));
-                    }
-                    views.push((pf, v));
-                }
+                Ok(v) => views.push((pf, v)),
                 Err(e) if is_not_found(&e) => saw_not_found = true,
                 Err(_) => {}
             }
@@ -993,7 +968,9 @@ pub async fn observe<A: AdminOps>(
     {
         Some((_, v)) => v.clone(),
         None if saw_not_found => {
-            let i = first_ready.ok_or("no pod is Ready")?;
+            let i = (0..replicas)
+                .find(|i| pods.get(i).is_some_and(|f| f.ready && !f.terminating))
+                .ok_or("no pod is Ready")?;
             phase1_view(admin, t, i, replicas, control_nodes).await?
         }
         None => {
@@ -1003,6 +980,15 @@ pub async fn observe<A: AdminOps>(
 
     let active = view.get("active").and_then(Value::as_u64).unwrap_or(0);
     let active = u32::try_from(active).unwrap_or(u32::MAX);
+    // The highest `own_range.max` any new-binary pod reported.
+    let new_own_max = views
+        .iter()
+        .filter(|(p, _)| *p == Platform::New)
+        .filter_map(|(_, v)| {
+            let m = v.get("own_range")?.get("max")?.as_u64()?;
+            Some(u32::try_from(m).unwrap_or(u32::MAX))
+        })
+        .max();
     let goal = new_own_max.map_or(active, |m| m.max(active));
 
     let mut control_leader = None;
@@ -1230,30 +1216,19 @@ pub async fn step<C: ClusterApi, A: AdminOps>(
                         if let Some(to) = finalized_to {
                             out.phase = UpgradePhase::Complete;
                             out.active = Some(to);
-                            out.conds = vec![
-                                (CONDITION_UPGRADE_IN_PROGRESS, None),
-                                (CONDITION_UPGRADE_BLOCKED, None),
-                                (CONDITION_UPGRADE_FINALIZE_PENDING, None),
-                                (
-                                    CONDITION_ROLL_COMPLETE,
-                                    Some(format!(
-                                        "roll complete: cluster version finalized to {to}"
-                                    )),
-                                ),
-                            ];
+                            out.cond = RollCond::Complete(format!(
+                                "roll complete: cluster version finalized to {to}"
+                            ));
                         }
                     }
                     Err(e) => {
                         warn!(cluster = %name, error = %e, "roll effect failed; retrying next reconcile");
                         let msg = format!("{e} (retried every reconcile, never forced)");
                         if finalized_to.is_some() {
-                            out.conds
-                                .retain(|(t, _)| *t != CONDITION_UPGRADE_FINALIZE_PENDING);
-                            out.conds
-                                .push((CONDITION_UPGRADE_FINALIZE_PENDING, Some(msg)));
+                            out.cond = RollCond::FinalizePending(msg);
                         } else {
                             out.phase = UpgradePhase::Blocked;
-                            out.conds = blocked_conds(msg);
+                            out.cond = RollCond::Blocked(msg);
                         }
                     }
                 }
@@ -1495,11 +1470,7 @@ mod tests {
         assert_eq!(out.effect, None);
         assert_eq!(out.phase, UpgradePhase::InProgress);
         // it was lowered by one, never straight to zero
-        assert!(
-            out.conds
-                .iter()
-                .any(|(t, m)| *t == CONDITION_UPGRADE_IN_PROGRESS && m.is_some())
-        );
+        assert!(matches!(out.cond, RollCond::Progress(_)));
     }
 
     #[test]
@@ -1549,11 +1520,10 @@ mod tests {
     }
 
     fn blocked_msg(out: &Outcome) -> String {
-        out.conds
-            .iter()
-            .find(|(t, m)| *t == CONDITION_UPGRADE_BLOCKED && m.is_some())
-            .and_then(|(_, m)| m.clone())
-            .expect("an UpgradeBlocked message")
+        match &out.cond {
+            RollCond::Blocked(m) => m.clone(),
+            other => panic!("expected an UpgradeBlocked message, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1606,11 +1576,7 @@ mod tests {
         let out = drive(&input(0, 100, None), &o);
         assert_eq!(out.phase, UpgradePhase::FinalizePending);
         assert_eq!(out.effect, None);
-        assert!(
-            out.conds
-                .iter()
-                .any(|(t, m)| *t == CONDITION_UPGRADE_FINALIZE_PENDING && m.is_some())
-        );
+        assert!(matches!(out.cond, RollCond::FinalizePending(_)));
         // can_finalize true, Auto, soak 0: finalize 1 -> 2 on the leader.
         let out = drive(&i, &o);
         assert_eq!(

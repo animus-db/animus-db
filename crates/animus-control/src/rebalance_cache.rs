@@ -140,12 +140,6 @@ impl RebalanceCache {
         self.stats
     }
 
-    /// The remaining planned moves (test and diagnostics).
-    #[must_use]
-    pub fn planned_len(&self) -> usize {
-        self.plan.as_ref().map_or(0, |p| p.moves.len())
-    }
-
     /// The move to propose now: always equal to
     /// `view.rebalance(recently_done, ..)`, from the cache when the view is
     /// provably what the plan expects, from a fresh plan otherwise.
