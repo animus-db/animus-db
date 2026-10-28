@@ -12739,3 +12739,9 @@ before healing; see
 `docs/lessons/testing/2026-10-21-a-stuck-first-call-is-the-reliable-way-to-hold-a-walk-open.md`.
 
 - **Console backend dispatch (2026-10-27):** `lib.rs`'s `ConsoleBackend` bodies live once in `console_op_*` helpers generic over the private `ConsoleDispatch` trait; `ProductionDispatch` (concrete `execute_routed`) and `GenericDispatch` (`execute_routed_as_generic`) must stay distinct. See `docs/lessons/code-patterns/2026-10-27-share-a-body-across-prod-and-sim-impls-by-passing-the-dispatch.md`. `admin.rs`'s two `AdminHost` impls are already one-line forwards and differ in `action_data_dynamo` and `debug_inboxes_view`; leave them.
+
+## Settling decided txn records (issue #1380, `Gate::TxnSettled`)
+
+- `txn_resolver_decided_pass` is paged (`TXN_DECIDED_BATCH`/`TXN_REAP_BATCH` = 128, per-tablet `decided_cursor`). Gate open: verify (`txn_participants_clear`), `txn_settle` the clear batch, grace-delayed resolve then re-verify for the rest, then the reaper (`settled_reapable` + `txn_reap`). Gate closed: the old resolve-and-keep path.
+- The reap age (`TXN_SETTLED_REAP_AGE`) is tied to `TXN_IDEMPOTENCY_TTL_SECS + 2 * CLIENT_TIMEOUT` by a compile-time assertion in `dynamo.rs`; the safety argument is in ADR 0018's 2026-10-27 amendment.
+- `/admin/txns?limit=` (default 200, max 5000) plus `*_total` fields; `sim_cluster_txn_settled.rs` is the regression (seeded, restart, negative control); a restarted `SimCluster` group never re-quiesces, so it asserts the tracker, not quiescence (`docs/lessons/testing/2026-10-27-...`). Mixed-version cell `release9_to_release10_txn_settle_gate`.

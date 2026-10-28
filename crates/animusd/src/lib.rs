@@ -1515,19 +1515,16 @@ impl<E: Env> CpGroup<E> {
     /// `past_grace` are computed against this node's own clock at request
     /// time (`env().now()`), mirroring `ClientCtx::txn_recover`'s own
     /// `now_ms` derivation.
-    async fn txn_view(&self, tablet: TabletId) -> admin::CpTxnView {
+    async fn txn_view(&self, tablet: TabletId, limit: usize) -> admin::CpTxnView {
         let node = self.env().node_id();
         let now_ms = self.env().now().0 / 1_000_000;
 
-        macro_rules! pending_and_unresolved {
-            ($n:expr) => {
-                ($n.pending_txns(), $n.unresolved_decided())
-            };
-        }
-        let (pending, unresolved_decided) = match self {
-            CpGroup::Lsm(n) => pending_and_unresolved!(n),
-            CpGroup::Mem(n) => pending_and_unresolved!(n),
-        };
+        let counts = self.txn_tracker_counts();
+        let pending = self.pending_txns();
+        // One entry past the cap tells "exactly `limit`" from "cut".
+        let mut unresolved_decided = self.unresolved_decided_batch(None, limit.saturating_add(1));
+        let unresolved_decided_truncated = unresolved_decided.len() > limit;
+        unresolved_decided.truncate(limit);
 
         let mut pending_views = Vec::with_capacity(pending.len());
         for (txn_id, (record_key, created_ts)) in pending {
@@ -1579,6 +1576,10 @@ impl<E: Env> CpGroup<E> {
             node,
             pending: pending_views,
             unresolved_decided: unresolved_views,
+            unresolved_decided_total: counts.unresolved_decided,
+            unresolved_decided_truncated,
+            unsettled_total: counts.unsettled,
+            settled_total: counts.settled,
         }
     }
 
@@ -1860,12 +1861,74 @@ impl<E: Env> CpGroup<E> {
         }
     }
 
-    /// This group's currently-tracked decided-but-unresolved records. See
-    /// [`RaftKvNode::unresolved_decided`].
-    fn unresolved_decided(&self) -> BTreeMap<TxnId, (Vec<u8>, TxnOutcome)> {
+    /// A bounded page of this group's decided-but-unresolved records. See
+    /// [`RaftKvNode::unresolved_decided_batch`].
+    fn unresolved_decided_batch(
+        &self,
+        after: Option<&TxnId>,
+        limit: usize,
+    ) -> Vec<(TxnId, (Vec<u8>, TxnOutcome))> {
         match self {
-            CpGroup::Lsm(n) => n.unresolved_decided(),
-            CpGroup::Mem(n) => n.unresolved_decided(),
+            CpGroup::Lsm(n) => n.unresolved_decided_batch(after, limit),
+            CpGroup::Mem(n) => n.unresolved_decided_batch(after, limit),
+        }
+    }
+
+    /// A bounded page of this group's decided-but-unsettled records (issue
+    /// #1380). See [`RaftKvNode::unsettled_batch`].
+    fn unsettled_batch(
+        &self,
+        after: Option<&TxnId>,
+        limit: usize,
+    ) -> Vec<(TxnId, (Vec<u8>, TxnOutcome))> {
+        match self {
+            CpGroup::Lsm(n) => n.unsettled_batch(after, limit),
+            CpGroup::Mem(n) => n.unsettled_batch(after, limit),
+        }
+    }
+
+    /// Settled stubs old enough to reap. See [`RaftKvNode::settled_reapable`].
+    fn settled_reapable(&self, now_wall_ms: u64, limit: usize) -> Vec<(TxnId, Vec<u8>)> {
+        match self {
+            CpGroup::Lsm(n) => n.settled_reapable(now_wall_ms, limit),
+            CpGroup::Mem(n) => n.settled_reapable(now_wall_ms, limit),
+        }
+    }
+
+    /// See [`RaftKvNode::txn_tracker_counts`].
+    fn txn_tracker_counts(&self) -> animus_cp_data::TxnTrackerCounts {
+        match self {
+            CpGroup::Lsm(n) => n.txn_tracker_counts(),
+            CpGroup::Mem(n) => n.txn_tracker_counts(),
+        }
+    }
+
+    /// Whether this group's feature handle has `Gate::TxnSettled` open (the
+    /// emit-site check of the settle/reap proposals; they also re-check it).
+    fn txn_settled_open(&self) -> bool {
+        match self {
+            CpGroup::Lsm(n) => n
+                .features()
+                .is_open(animus_control::version::Gate::TxnSettled),
+            CpGroup::Mem(n) => n
+                .features()
+                .is_open(animus_control::version::Gate::TxnSettled),
+        }
+    }
+
+    /// See [`RaftKvNode::txn_settle`].
+    async fn txn_settle(&self, entries: Vec<(TxnId, Vec<u8>)>) -> bool {
+        match self {
+            CpGroup::Lsm(n) => n.txn_settle(entries).await,
+            CpGroup::Mem(n) => n.txn_settle(entries).await,
+        }
+    }
+
+    /// See [`RaftKvNode::txn_reap`].
+    async fn txn_reap(&self, entries: Vec<(TxnId, Vec<u8>)>) -> bool {
+        match self {
+            CpGroup::Lsm(n) => n.txn_reap(entries).await,
+            CpGroup::Mem(n) => n.txn_reap(entries).await,
         }
     }
 
@@ -14683,6 +14746,17 @@ const TXN_RESOLVER_INTERVAL: Duration = Duration::from_secs(1);
 /// long it takes to.
 const RECOVERY_STUCK_GRACE: Duration = Duration::from_secs(30);
 
+/// How many decided records the decided pass examines per led group per tick
+/// (issue #1380). The work-list was the group's whole decided history after a
+/// restart (clone of ~157k entries per tick on the 8 h soak); it is now paged,
+/// so a tick costs at most this many record reads and participant verifies per
+/// group, and one `TxnSettle` entry. Larger than the #1369 backlog test's 120
+/// records so its one-task negative control still starves.
+const TXN_DECIDED_BATCH: usize = 128;
+
+/// How many Settled stubs one tick hands the reaper per led group.
+const TXN_REAP_BATCH: usize = 128;
+
 /// The **intent-resolver background task** (ADR 0018 §2/PR5) — what makes a
 /// crashed coordinator harmless (the Decision section's Recovery bullet)
 /// and lets [`ClientCtx::cp_txn`]'s successful-commit resolve be async/
@@ -14746,6 +14820,11 @@ struct TxnResolverState {
     /// `RECOVERY_STUCK_GRACE` (issue #298 shape B fix), pruned every tick
     /// against `pending_txns()`.
     stuck_recovery_warned: BTreeSet<TxnId>,
+    /// Where the decided pass resumes in each led group's decided work-list
+    /// (issue #1380: it walks bounded pages, not the whole map). Absent = start
+    /// from the beginning; cleared when a page comes back short (the list was
+    /// exhausted), so the next tick wraps.
+    decided_cursor: BTreeMap<TabletId, TxnId>,
 }
 
 /// The table a resolver pass should act on for `tablet`'s `group`, or `None`
@@ -14879,19 +14958,45 @@ async fn txn_resolver_decided_pass<E: Env, R: RelayClient>(
     let TxnResolverState {
         unresolved_first_seen,
         unresolved_stuck_warned,
+        decided_cursor,
         ..
     } = state;
-    // Every `TxnId` `unresolved_decided()` reports this tick, across
-    // every hosted group — the live set the two maps above are pruned
-    // against once the tick's tablet loop below finishes.
-    let mut unresolved_seen_this_tick: BTreeSet<TxnId> = BTreeSet::new();
+    // Signal-only memos are bounded by clearing rather than by pruning against
+    // "seen this tick": with paging, most live entries are legitimately not in
+    // the current page.
+    if unresolved_first_seen.len() > 4096 {
+        unresolved_first_seen.clear();
+    }
+    if unresolved_stuck_warned.len() > 4096 {
+        unresolved_stuck_warned.clear();
+    }
     for (tablet, group) in ctx.edge.hosted_groups() {
         let Some(table) = resolver_group_table(ctx, tablet, &group) else {
+            decided_cursor.remove(&tablet);
             continue;
         };
+        // Issue #1380: once `Gate::TxnSettled` is open the work-list is every
+        // decided record not yet settled (a local resolve does not retire it);
+        // before, it is the old "no local resolve yet" list, whose entries only
+        // a local resolve or a restart's rebuild change.
+        let settle_open = group.txn_settled_open();
+        let cursor = decided_cursor.get(&tablet).cloned();
+        let page = if settle_open {
+            group.unsettled_batch(cursor.as_ref(), TXN_DECIDED_BATCH)
+        } else {
+            group.unresolved_decided_batch(cursor.as_ref(), TXN_DECIDED_BATCH)
+        };
+        match page.last() {
+            Some((last, _)) if page.len() >= TXN_DECIDED_BATCH => {
+                decided_cursor.insert(tablet, last.clone());
+            }
+            _ => {
+                decided_cursor.remove(&tablet);
+            }
+        }
+        let mut to_settle: Vec<(TxnId, Vec<u8>)> = Vec::new();
 
-        for (txn_id, (record_key, outcome)) in group.unresolved_decided() {
-            unresolved_seen_this_tick.insert(txn_id.clone());
+        for (txn_id, (record_key, outcome)) in page {
             // `unresolved_decided` only carries `(record_key, outcome)`
             // — re-read the record's own `intent_spans` (every
             // participant table this transaction touched) rather than
@@ -14954,17 +15059,69 @@ async fn txn_resolver_decided_pass<E: Env, R: RelayClient>(
             };
             unresolved_first_seen.remove(&txn_id);
             unresolved_stuck_warned.remove(&txn_id);
+            if !settle_open {
+                ctx.recovery_resolve(
+                    txn_id,
+                    record_key,
+                    &view.intent_spans,
+                    &outcome_to_status(&outcome),
+                )
+                .await;
+                continue;
+            }
+            // Issue #1380. The tracker says "decided, not settled"; trust the
+            // record. A record that reads `Pending` (stale tracker entry) or
+            // already `Settled` owes nothing here.
+            let decided_at_ms = match &view.status {
+                TxnDecisionStatus::Pending => continue,
+                TxnDecisionStatus::Committed { commit_ts } => commit_ts.wall_ms,
+                TxnDecisionStatus::Aborted => view.created_ts.wall_ms,
+            };
+            if view.intent_spans.is_empty()
+                || ctx
+                    .txn_participants_clear(&txn_id, &view.intent_spans)
+                    .await
+            {
+                to_settle.push((txn_id, record_key));
+                continue;
+            }
+            // Some participant still holds an intent. A live coordinator's own
+            // async resolve gets `RECOVERY_GRACE` from the decision to land
+            // before this pass duplicates it; after that, resolve here and
+            // re-verify (the resolve is best-effort, only the verify is truth).
+            let now_ms = group.env().now().0 / 1_000_000;
+            if now_ms.saturating_sub(decided_at_ms)
+                < animus_cp_data::RECOVERY_GRACE.as_millis() as u64
+            {
+                continue;
+            }
             ctx.recovery_resolve(
-                txn_id,
-                record_key,
+                txn_id.clone(),
+                record_key.clone(),
                 &view.intent_spans,
-                &outcome_to_status(&outcome),
+                &view.status,
             )
             .await;
+            if ctx
+                .txn_participants_clear(&txn_id, &view.intent_spans)
+                .await
+            {
+                to_settle.push((txn_id, record_key));
+            }
+        }
+        if !to_settle.is_empty() {
+            let _ = group.txn_settle(to_settle).await;
+        }
+        if settle_open {
+            // The reaper (issue #1380): delete stubs old enough. Apply
+            // re-checks the age, so this only has to be roughly right.
+            let now_ms = group.env().now().0 / 1_000_000;
+            let reap = group.settled_reapable(now_ms, TXN_REAP_BATCH);
+            if !reap.is_empty() {
+                let _ = group.txn_reap(reap).await;
+            }
         }
     }
-    unresolved_first_seen.retain(|id, _| unresolved_seen_this_tick.contains(id));
-    unresolved_stuck_warned.retain(|id| unresolved_seen_this_tick.contains(id));
 }
 
 /// How often [`metrics_sample_loop`] takes a metrics snapshot for the
@@ -22944,6 +23101,11 @@ mod sim_cluster_txn_resolver_split;
 /// decided-record backlog sweep — see that module's own doc.
 #[cfg(test)]
 mod sim_cluster_txn_resolver_backlog;
+/// Issue #1380 (`Gate::TxnSettled`): settled txn records are not re-resolved
+/// after a restart, drain on every replica, let groups quiesce, and are reaped
+/// after `TXN_SETTLED_REAP_AGE`; the gate-closed control is the pre-fix shape.
+#[cfg(test)]
+mod sim_cluster_txn_settled;
 /// ADR 0073 Phase 1, P1-D tier 2: the whole-cluster upgrade-restart corpus over
 /// `SimCluster`'s `LsmEngine` backend and the DynamoDB wire. Run via `cargo
 /// test -p animusd --lib sim_cluster_upgrade_corpus`; depth knob

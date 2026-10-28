@@ -1103,6 +1103,28 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
         }
     }
 
+    /// **Has every participant of `txn_id` dropped its intent?** (issue #1380,
+    /// the precondition of settling a decided record): `true` only when every
+    /// `(table, span)` verified, at its tablet's leader, as holding no live
+    /// intent for `txn_id`. A verify that errors (route flap, moved leader)
+    /// counts as "not confirmed clear" -- conservative, like
+    /// [`txn_recover`](Self::txn_recover)'s `all_staged` -- so the record stays
+    /// unsettled and is retried. Stops at the first participant still holding
+    /// an intent.
+    pub(crate) async fn txn_participants_clear(
+        &self,
+        txn_id: &TxnId,
+        intent_spans: &[(String, KeyRange)],
+    ) -> bool {
+        for (table, span) in intent_spans {
+            match self.txn_verify(table, span, txn_id).await {
+                Ok(false) => {}
+                Ok(true) | Err(_) => return false,
+            }
+        }
+        true
+    }
+
     /// Resolve every `(table, span)` in `intent_spans` per `status`
     /// (best-effort, fire-and-forget on any individual routing failure —
     /// see [`txn_resolve_participant`](Self::txn_resolve_participant)'s own

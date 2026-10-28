@@ -59,6 +59,10 @@ impl GatedCommand for KvCommand {
             KvCommand::TxnCommitSealChecked { .. } | KvCommand::TxnAbortSealChecked { .. } => {
                 Gate::TxnSealChecked
             }
+            // ADR 0018 (2026-10-27, issue #1380): new variants an older voter
+            // cannot decode, which rewrite/delete a record into the Settled
+            // form (`txn-record` v2) it cannot read.
+            KvCommand::TxnSettle { .. } | KvCommand::TxnReap { .. } => Gate::TxnSettled,
         }
     }
 }

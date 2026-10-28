@@ -183,8 +183,39 @@ pub struct TxnId {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum TxnStatus {
     Pending,
-    Committed { commit_ts: HlcTimestamp },
+    Committed {
+        commit_ts: HlcTimestamp,
+    },
     Aborted,
+    /// **Settled** (`txn-record` v2, ADR 0018's 2026-10-27 amendment, issue
+    /// #1380; `Gate::TxnSettled`): a decided record whose every participant
+    /// was verified to hold no intent for it any more. A *stub*: it keeps the
+    /// decided `outcome` (a status lookup still answers `Committed`/`Aborted`,
+    /// never "absent"), drops `intent_spans` (nothing is left to resolve) and
+    /// stamps `settled_ts`, the HLC of the `TxnSettle` entry, which the
+    /// reaper (`KvCommand::TxnReap`) ages against. Never re-enters the
+    /// resolver's backlog: `rebuild_txn_tracker` files it under `settled`, not
+    /// `unresolved_decided`.
+    Settled {
+        outcome: TxnOutcome,
+        settled_ts: HlcTimestamp,
+    },
+}
+
+impl TxnStatus {
+    /// The decided outcome of a `Committed`/`Aborted`/`Settled` status, `None`
+    /// while `Pending`.
+    #[must_use]
+    pub(crate) fn decided_outcome(&self) -> Option<TxnOutcome> {
+        match self {
+            TxnStatus::Pending => None,
+            TxnStatus::Committed { commit_ts } => Some(TxnOutcome::Committed {
+                commit_ts: *commit_ts,
+            }),
+            TxnStatus::Aborted => Some(TxnOutcome::Aborted),
+            TxnStatus::Settled { outcome, .. } => Some(outcome.clone()),
+        }
+    }
 }
 
 /// The transaction-status record (ADR 0018 §3): the atomic commit point.
@@ -370,6 +401,13 @@ impl TxnStatus {
                 commit_ts: *commit_ts,
             },
             TxnStatus::Aborted => TxnDecisionStatus::Aborted,
+            // A stub answers exactly like the record it settled.
+            TxnStatus::Settled { outcome, .. } => match outcome {
+                TxnOutcome::Committed { commit_ts } => TxnDecisionStatus::Committed {
+                    commit_ts: *commit_ts,
+                },
+                TxnOutcome::Aborted => TxnDecisionStatus::Aborted,
+            },
         }
     }
 }
@@ -1138,6 +1176,40 @@ pub(crate) mod legacy {
     }
 }
 
+/// The `txn-record` v2 -> v1 row-value down-conversion the upgrade-restart
+/// harness applies (ADR 0073, `animus-test` `upgrade::transcode::ROW_TABLE`):
+/// `Some(v1 bytes)` iff `value` is exactly one well-formed v2 **Settled**
+/// record, rewritten as the `Committed`/`Aborted` record it settled (no
+/// `intent_spans`, which a stub dropped; the v1 reader's resolver then finds
+/// nothing to resolve). `None` (leave the row alone) for anything else.
+#[cfg(any(test, feature = "legacy-encoders"))]
+#[must_use]
+pub(crate) fn downgrade_record_to_v1(value: &[u8]) -> Option<Vec<u8>> {
+    let mut c = Cursor {
+        bytes: value,
+        pos: 0,
+    };
+    let _ = c.txn_id()?;
+    if !matches!(c.u8()?, 3 | 4) {
+        return None;
+    }
+    let record = decode_record(value)?;
+    let TxnStatus::Settled { outcome, .. } = &record.status else {
+        return None;
+    };
+    // `decode_record` stops after `created_ts`: refuse trailing bytes.
+    if encode_record(&record) != value {
+        return None;
+    }
+    let status = match outcome {
+        TxnOutcome::Committed { commit_ts } => TxnStatus::Committed {
+            commit_ts: *commit_ts,
+        },
+        TxnOutcome::Aborted => TxnStatus::Aborted,
+    };
+    Some(encode_record(&TxnRecord { status, ..record }))
+}
+
 /// Encode a [`TxnRecord`] for storage as an ordinary in-scope engine value
 /// (never envelope-tagged — a record is never read via the normal
 /// `Envelope` path, only via [`decode_record`] at the specific record key).
@@ -1152,6 +1224,23 @@ pub(crate) fn encode_record(r: &TxnRecord) -> Vec<u8> {
             put_ts(&mut out, *commit_ts);
         }
         TxnStatus::Aborted => put_u8(&mut out, 2),
+        // `txn-record` v2 (Settled stubs): status bytes 3 (committed, carries
+        // the commit ts) and 4 (aborted), each followed by `settled_ts`.
+        TxnStatus::Settled {
+            outcome: TxnOutcome::Committed { commit_ts },
+            settled_ts,
+        } => {
+            put_u8(&mut out, 3);
+            put_ts(&mut out, *commit_ts);
+            put_ts(&mut out, *settled_ts);
+        }
+        TxnStatus::Settled {
+            outcome: TxnOutcome::Aborted,
+            settled_ts,
+        } => {
+            put_u8(&mut out, 4);
+            put_ts(&mut out, *settled_ts);
+        }
     }
     put_u32(&mut out, r.intent_spans.len() as u32);
     for (table, span) in &r.intent_spans {
@@ -1172,6 +1261,14 @@ pub(crate) fn decode_record(bytes: &[u8]) -> Option<TxnRecord> {
         0 => TxnStatus::Pending,
         1 => TxnStatus::Committed { commit_ts: c.ts()? },
         2 => TxnStatus::Aborted,
+        3 => TxnStatus::Settled {
+            outcome: TxnOutcome::Committed { commit_ts: c.ts()? },
+            settled_ts: c.ts()?,
+        },
+        4 => TxnStatus::Settled {
+            outcome: TxnOutcome::Aborted,
+            settled_ts: c.ts()?,
+        },
         _ => return None,
     };
     let n = c.u32()?;
@@ -1470,6 +1567,16 @@ mod tests {
                 commit_ts: ts(5, 1),
             },
             TxnStatus::Aborted,
+            TxnStatus::Settled {
+                outcome: TxnOutcome::Committed {
+                    commit_ts: ts(5, 1),
+                },
+                settled_ts: ts(9, 2),
+            },
+            TxnStatus::Settled {
+                outcome: TxnOutcome::Aborted,
+                settled_ts: ts(9, 3),
+            },
         ] {
             let record = TxnRecord {
                 txn_id: txn(3),

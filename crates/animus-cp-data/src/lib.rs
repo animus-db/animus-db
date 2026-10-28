@@ -112,6 +112,15 @@ use ts_cache::TsCache;
 pub fn downgrade_txn_envelope_to_v1(value: &[u8]) -> Option<Vec<u8>> {
     txn::legacy::v1::downgrade_intent_to_v1(value)
 }
+/// The upgrade-restart harness's `txn-record` row-value transcode (ADR 0073,
+/// `animus-test`'s `upgrade::transcode`): the v1 down-conversion of one stored
+/// engine row value — `Some(v1 bytes)` iff `value` is exactly one well-formed
+/// v2 Settled record, `None` (leave the row alone) otherwise.
+#[cfg(any(test, feature = "legacy-encoders"))]
+#[must_use]
+pub fn downgrade_txn_record_to_v1(value: &[u8]) -> Option<Vec<u8>> {
+    txn::downgrade_record_to_v1(value)
+}
 pub use txn::{
     PendingTxnWrite, ResolveOutcome, StageOutcome, TxnDecisionStatus, TxnId, TxnOutcome, TxnWrite,
 };
@@ -1634,6 +1643,36 @@ pub enum KvCommand {
         outcome: txn::TxnOutcome,
         ts: HlcTimestamp,
     },
+    /// **Settle decided records** (ADR 0018's 2026-10-27 amendment, issue
+    /// #1380; `Gate::TxnSettled`, cluster version 10). For each
+    /// `(txn_id, record_key)` whose record on this group is decided
+    /// (`Committed`/`Aborted`), rewrite it as a **Settled stub**
+    /// ([`txn::TxnStatus::Settled`]: the decided outcome kept, `intent_spans`
+    /// dropped, `ts` stamped as `settled_ts`) and retire it from this
+    /// replica's tracker. The proposer (`animusd`'s decided pass) emits an
+    /// entry only after `txn_verify_staged` showed that no participant holds
+    /// an intent for the transaction any more, so nothing is left to resolve
+    /// and a restart never re-resolves it. Apply never branches on that
+    /// premise (it cannot see other tablets); per entry it is a deterministic
+    /// no-op when the record is absent, `Pending`, already `Settled`, belongs
+    /// to another transaction, or its key lies in a range this group has
+    /// sealed. Applying on every replica is what drains a follower's tracker.
+    TxnSettle {
+        entries: Vec<(TxnId, Vec<u8>)>,
+        ts: HlcTimestamp,
+    },
+    /// **Reap Settled stubs** (ADR 0018's 2026-10-27 amendment, issue #1380;
+    /// `Gate::TxnSettled`): delete the record of each `(txn_id, record_key)`
+    /// whose record is `Settled` and was settled at least
+    /// [`TXN_SETTLED_REAP_AGE`] (in HLC wall time) before this entry's `ts`.
+    /// The age test is part of apply, not the proposer's say-so, so a buggy or
+    /// stale proposer can never delete a young stub: any other entry (absent,
+    /// not `Settled`, too young, sealed range, other transaction) is a
+    /// deterministic no-op.
+    TxnReap {
+        entries: Vec<(TxnId, Vec<u8>)>,
+        ts: HlcTimestamp,
+    },
     /// The leader's no-op-on-election (Raft); applies nothing.
     NoOp,
 }
@@ -1722,6 +1761,20 @@ const INTENT_WAIT_POLL: Duration = Duration::from_millis(20);
 /// wins (see `apply_and_compact`'s `TxnCommit`/`TxnAbort` arms). Grace only
 /// affects *when* recovery may act, never *what* it decides.
 pub const RECOVERY_GRACE: Duration = Duration::from_secs(5);
+
+/// How long a **Settled** txn-record stub (`txn-record` v2, issue #1380) must
+/// have existed (HLC wall time, `TxnReap`'s `ts` minus the stub's
+/// `settled_ts`) before `KvCommand::TxnReap` may delete it. Deleting a stub
+/// turns later lookups of the txn into "no record", which a recovery pusher
+/// reads as "abort" (ADR 0018 §2/PR5): safe only once nothing can still ask.
+/// Twenty minutes is twice the Dynamo `ClientRequestToken` idempotency TTL
+/// (`TXN_IDEMPOTENCY_TTL_SECS`, 600 s: a retry within it is answered from the
+/// idempotency table, never by re-driving the txn) plus a margin far past the
+/// longest an in-flight stage/decision can be delayed (a client round trip is
+/// bounded by `CLIENT_TIMEOUT`, 10 s; a stage by the 5 s propose timeout);
+/// `animusd` asserts the inequality at compile time. ADR 0018's 2026-10-27
+/// amendment has the safety argument.
+pub const TXN_SETTLED_REAP_AGE: Duration = Duration::from_secs(20 * 60);
 
 /// Compact (snapshot the engine + truncate the Raft log prefix) once this many
 /// entries have been applied past the current snapshot base, bounding the WAL.
@@ -2348,6 +2401,33 @@ type StageOutcomes = TermOutcomes<StageOutcome>;
 /// the recorded outcome as this proposer's own.
 type ResolveOutcomes = TermOutcomes<ResolveOutcome>;
 
+/// Entry counts of a group's txn tracker ([`RaftKvNode::txn_tracker_counts`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TxnTrackerCounts {
+    /// Records held `Pending`.
+    pub pending: usize,
+    /// Decided records with no local `TxnResolve` applied yet.
+    pub unresolved_decided: usize,
+    /// Decided records not yet settled (`Gate::TxnSettled`).
+    pub unsettled: usize,
+    /// Settled stubs awaiting the reaper.
+    pub settled: usize,
+}
+
+/// Up to `limit` entries of `map` with a key strictly after `after`, cloned.
+fn batch_after(
+    map: &BTreeMap<TxnId, (Vec<u8>, txn::TxnOutcome)>,
+    after: Option<&TxnId>,
+    limit: usize,
+) -> Vec<(TxnId, (Vec<u8>, txn::TxnOutcome))> {
+    use std::ops::Bound::{Excluded, Unbounded};
+    let lower = after.map_or(Unbounded, Excluded);
+    map.range::<TxnId, _>((lower, Unbounded))
+        .take(limit)
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
+}
+
 /// This group's own in-memory index of the transaction records it holds
 /// (ADR 0018 §2/PR5) — populated **only** on a group that anchors at least
 /// one transaction (a non-anchor `TxnStage` never creates a record, so a
@@ -2394,6 +2474,23 @@ struct TxnTracker {
     /// read-path push, ADR 0018 §2/PR5 §3) — only background promptness is
     /// (very slightly) weaker in that residual case.
     unresolved_decided: BTreeMap<TxnId, (Vec<u8>, txn::TxnOutcome)>,
+    /// `txn_id -> (record_key, outcome)` for every record this group has
+    /// decided and that is **not yet `Settled`** (issue #1380; `Gate::
+    /// TxnSettled`). Unlike [`unresolved_decided`](Self::unresolved_decided)
+    /// a local `TxnResolve` apply does **not** retire an entry: only the
+    /// `TxnSettle` apply does (on every replica, so a follower drains too), and
+    /// `rebuild_txn_tracker` never inserts a `Settled` record. It is the
+    /// work-list of `animusd`'s decided pass once the gate is open: verify
+    /// that no participant holds an intent, then settle. It vetoes quiescence
+    /// only while the gate is open (a closed gate means nothing can ever
+    /// retire an entry).
+    unsettled: BTreeMap<TxnId, (Vec<u8>, txn::TxnOutcome)>,
+    /// `txn_id -> (record_key, settled_ts)` for every `Settled` stub this
+    /// group holds: the reaper's work-list (`KvCommand::TxnReap`), filled by
+    /// the `TxnSettle` apply and the rebuild, drained by the `TxnReap` apply.
+    /// Never a quiesce veto: a stub is inert, and reaping it can wait for the
+    /// group's next wake.
+    settled: BTreeMap<TxnId, (Vec<u8>, HlcTimestamp)>,
     /// Test-only model of the previous release (`f6709564`, "R-1"): decide a
     /// stale `TxnStage` from the in-memory `recently_resolved` map below
     /// instead of the durable resolved marker, write no marker and have no
@@ -2530,15 +2627,26 @@ async fn rebuild_txn_tracker<S: StorageEngine>(storage: &S, scope: &StorageScope
                         .insert(record.txn_id, (logical.to_vec(), record.created_ts));
                 }
                 txn::TxnStatus::Committed { commit_ts } => {
-                    tracker.unresolved_decided.insert(
-                        record.txn_id,
-                        (logical.to_vec(), txn::TxnOutcome::Committed { commit_ts }),
-                    );
-                }
-                txn::TxnStatus::Aborted => {
+                    let entry = (logical.to_vec(), txn::TxnOutcome::Committed { commit_ts });
                     tracker
                         .unresolved_decided
-                        .insert(record.txn_id, (logical.to_vec(), txn::TxnOutcome::Aborted));
+                        .insert(record.txn_id.clone(), entry.clone());
+                    tracker.unsettled.insert(record.txn_id, entry);
+                }
+                txn::TxnStatus::Aborted => {
+                    let entry = (logical.to_vec(), txn::TxnOutcome::Aborted);
+                    tracker
+                        .unresolved_decided
+                        .insert(record.txn_id.clone(), entry.clone());
+                    tracker.unsettled.insert(record.txn_id, entry);
+                }
+                // Issue #1380: a settled stub owes nothing -- it must NOT
+                // re-enter the resolver's backlog (the whole point), only the
+                // reaper's list.
+                txn::TxnStatus::Settled { settled_ts, .. } => {
+                    tracker
+                        .settled
+                        .insert(record.txn_id, (logical.to_vec(), settled_ts));
                 }
             }
         }
@@ -5445,6 +5553,118 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             .expect("txn tracker poisoned")
             .unresolved_decided
             .clone()
+    }
+
+    /// Up to `limit` of this group's decided-but-not-locally-resolved records
+    /// ([`unresolved_decided`](Self::unresolved_decided)) with a `TxnId`
+    /// strictly after `after` (`None` = from the start), in `TxnId` order. The
+    /// resolver pages through the map with this instead of cloning all of it
+    /// every tick (issue #1380: that map was the whole decided history after a
+    /// restart).
+    #[must_use]
+    pub fn unresolved_decided_batch(
+        &self,
+        after: Option<&TxnId>,
+        limit: usize,
+    ) -> Vec<(TxnId, (Vec<u8>, txn::TxnOutcome))> {
+        let t = self.txn_tracker.lock().expect("txn tracker poisoned");
+        batch_after(&t.unresolved_decided, after, limit)
+    }
+
+    /// As [`unresolved_decided_batch`](Self::unresolved_decided_batch) for the
+    /// decided-but-not-yet-**settled** records (issue #1380, `Gate::
+    /// TxnSettled`): the decided pass's work-list once the gate is open.
+    #[must_use]
+    pub fn unsettled_batch(
+        &self,
+        after: Option<&TxnId>,
+        limit: usize,
+    ) -> Vec<(TxnId, (Vec<u8>, txn::TxnOutcome))> {
+        let t = self.txn_tracker.lock().expect("txn tracker poisoned");
+        batch_after(&t.unsettled, after, limit)
+    }
+
+    /// Up to `limit` Settled stubs whose `settled_ts` is at least
+    /// [`TXN_SETTLED_REAP_AGE`] older than `now_wall_ms` (HLC wall
+    /// milliseconds), as `(txn_id, record_key)` ready for [`txn_reap`]
+    /// (Self::txn_reap). Apply re-checks the age against the entry's own `ts`.
+    #[must_use]
+    pub fn settled_reapable(&self, now_wall_ms: u64, limit: usize) -> Vec<(TxnId, Vec<u8>)> {
+        let age = TXN_SETTLED_REAP_AGE.as_millis() as u64;
+        self.txn_tracker
+            .lock()
+            .expect("txn tracker poisoned")
+            .settled
+            .iter()
+            .filter(|(_, (_, settled_ts))| now_wall_ms.saturating_sub(settled_ts.wall_ms) >= age)
+            .take(limit)
+            .map(|(id, (key, _))| (id.clone(), key.clone()))
+            .collect()
+    }
+
+    /// How many entries each of this group's txn-tracker maps holds (for
+    /// `/admin/txns` and the tests), without cloning any of them.
+    #[must_use]
+    pub fn txn_tracker_counts(&self) -> TxnTrackerCounts {
+        let t = self.txn_tracker.lock().expect("txn tracker poisoned");
+        TxnTrackerCounts {
+            pending: t.pending.len(),
+            unresolved_decided: t.unresolved_decided.len(),
+            unsettled: t.unsettled.len(),
+            settled: t.settled.len(),
+        }
+    }
+
+    /// **Settle** the decided records `entries` (`(txn_id, record_key)`) in one
+    /// `KvCommand::TxnSettle` entry (issue #1380). The caller must have just
+    /// verified that no participant holds an intent for any of them. `false`
+    /// when `Gate::TxnSettled` is closed (nothing is proposed: a mixed-version
+    /// cluster never sees the entry before finalize), this node is not the
+    /// leader, or the entry does not apply in time. Per-entry apply no-ops
+    /// (absent / pending / sealed) still return `true`; a caller re-reads the
+    /// tracker, not this return value, to learn what settled.
+    pub async fn txn_settle(&self, entries: Vec<(TxnId, Vec<u8>)>) -> bool {
+        if entries.is_empty() || !self.features.is_open(Gate::TxnSettled) {
+            return false;
+        }
+        let (result, _ts) = self.propose_ordered_aux(|_term| {
+            let ts = self.mint_at_least(HlcTimestamp::zero());
+            (
+                KvCommand::TxnSettle {
+                    entries: entries.clone(),
+                    ts,
+                },
+                ts,
+            )
+        });
+        match result {
+            ProposeResult::Accepted { index, .. } => self.wait_applied(index).await,
+            ProposeResult::NotLeader { .. } | ProposeResult::Busy { .. } => false,
+        }
+    }
+
+    /// **Reap** the Settled stubs `entries` in one `KvCommand::TxnReap` entry
+    /// (issue #1380); apply deletes only the ones at least
+    /// [`TXN_SETTLED_REAP_AGE`] old. Same return contract as
+    /// [`txn_settle`](Self::txn_settle).
+    pub async fn txn_reap(&self, entries: Vec<(TxnId, Vec<u8>)>) -> bool {
+        if entries.is_empty() || !self.features.is_open(Gate::TxnSettled) {
+            return false;
+        }
+        let (result, _ts) = self.propose_ordered_aux(|_term| {
+            let ts = self.mint_at_least(HlcTimestamp::zero());
+            (
+                KvCommand::TxnReap {
+                    entries: entries.clone(),
+                    ts,
+                },
+                ts,
+            )
+        });
+        match result {
+            ProposeResult::Accepted { index, .. } => self.wait_applied(index).await,
+            ProposeResult::NotLeader { .. } | ProposeResult::Busy { .. } => false,
+        }
     }
 
     /// Poll [`engine_applied_index`](Self::engine_applied_index) until it
@@ -8707,6 +8927,8 @@ fn kv_command_variant_name(c: &KvCommand) -> &'static str {
         KvCommand::TxnCommitSealChecked { .. } => "TxnCommitSealChecked",
         KvCommand::TxnAbortSealChecked { .. } => "TxnAbortSealChecked",
         KvCommand::TxnResolve { .. } => "TxnResolve",
+        KvCommand::TxnSettle { .. } => "TxnSettle",
+        KvCommand::TxnReap { .. } => "TxnReap",
         KvCommand::NoOp => "NoOp",
     }
 }
@@ -11225,10 +11447,9 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                             // loop to fan out.
                             let mut t = txn_tracker.lock().expect("txn tracker poisoned");
                             t.pending.remove(&txn_id);
-                            t.unresolved_decided.insert(
-                                txn_id,
-                                (record_key, txn::TxnOutcome::Committed { commit_ts: ts }),
-                            );
+                            let entry = (record_key, txn::TxnOutcome::Committed { commit_ts: ts });
+                            t.unresolved_decided.insert(txn_id.clone(), entry.clone());
+                            t.unsettled.insert(txn_id, entry);
                         }
                         // Idempotent WAL-replay re-application: identical
                         // decision, nothing to do (the tracker was already
@@ -11298,6 +11519,17 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                                 "raftkv: TxnCommit lost to a prior TxnAbort on the same record \
                                  (duelling decider — both outcomes are legal, log order is the \
                                  ballot); no-op"
+                            );
+                        }
+                        // Issue #1380: a decision arriving after the record
+                        // settled lost to the earlier decision exactly like
+                        // the two arms above; the stub keeps that outcome.
+                        txn::TxnStatus::Settled { .. } => {
+                            tracing::warn!(
+                                ?txn_id,
+                                commit_ts = ?ts,
+                                "raftkv: TxnCommit arrived after the record settled — no-op \
+                                 (the settled stub keeps the first decision)"
                             );
                         }
                     },
@@ -11390,8 +11622,9 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                                 .expect("raftkv apply txn abort");
                             let mut t = txn_tracker.lock().expect("txn tracker poisoned");
                             t.pending.remove(&txn_id);
-                            t.unresolved_decided
-                                .insert(txn_id, (record_key, txn::TxnOutcome::Aborted));
+                            let entry = (record_key, txn::TxnOutcome::Aborted);
+                            t.unresolved_decided.insert(txn_id.clone(), entry.clone());
+                            t.unsettled.insert(txn_id, entry);
                         }
                         // Idempotent WAL-replay re-application.
                         txn::TxnStatus::Aborted => {}
@@ -11408,6 +11641,15 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                                 "raftkv: TxnAbort lost to a prior TxnCommit on the same record \
                                  (duelling decider — both outcomes are legal, log order is the \
                                  ballot); no-op"
+                            );
+                        }
+                        // Issue #1380: see the matching `TxnCommit` arm.
+                        txn::TxnStatus::Settled { .. } => {
+                            tracing::warn!(
+                                ?txn_id,
+                                abort_ts = ?ts,
+                                "raftkv: TxnAbort arrived after the record settled — no-op \
+                                 (the settled stub keeps the first decision)"
                             );
                         }
                     },
@@ -11571,6 +11813,8 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                                 txn::TxnOutcome::Committed { commit_ts: out_ts },
                             ) => rec_ts != out_ts,
                             (txn::TxnStatus::Aborted, txn::TxnOutcome::Aborted) => false,
+                            // Issue #1380: a settled stub still knows the decision.
+                            (txn::TxnStatus::Settled { outcome: rec, .. }, out) => rec != out,
                             // Resolving before the record itself ever
                             // decided, or a flat Committed-vs-Aborted
                             // disagreement — either way, a mismatch.
@@ -11847,6 +12091,96 @@ async fn apply_and_compact<E: Env, S: StorageEngine>(
                         term,
                         resolve_outcome,
                     );
+                }
+            }
+            // Issue #1380 (`Gate::TxnSettled`): rewrite each decided record as
+            // a Settled stub. Per entry a deterministic no-op unless the record
+            // here is this transaction's own decided, not-yet-settled record
+            // outside any sealed range (see the variant's doc). The tracker
+            // update is on EVERY replica -- that is what drains a follower.
+            KvCommand::TxnSettle { entries, ts } => {
+                flush_pending(storage, &mut pending, metrics, halted).await;
+                for (txn_id, record_key) in entries {
+                    if is_sealed(sealed, &record_key) {
+                        continue;
+                    }
+                    let physical_record = scope.physical(&record_key);
+                    let Some(record) = storage
+                        .get(&physical_record)
+                        .await
+                        .expect("raftkv txn settle read")
+                        .and_then(|vv| txn::decode_record(&vv.value))
+                    else {
+                        continue;
+                    };
+                    if record.txn_id != txn_id {
+                        tracing::warn!(
+                            ?txn_id,
+                            found = ?record.txn_id,
+                            "raftkv: TxnSettle names a record that belongs to a different txn — \
+                             no-op"
+                        );
+                        continue;
+                    }
+                    let Some(outcome) = record.status.decided_outcome() else {
+                        continue; // Pending: nothing decided to settle
+                    };
+                    if matches!(record.status, txn::TxnStatus::Settled { .. }) {
+                        continue; // idempotent WAL-replay re-application
+                    }
+                    let stub = txn::TxnRecord {
+                        txn_id: txn_id.clone(),
+                        status: txn::TxnStatus::Settled {
+                            outcome,
+                            settled_ts: ts,
+                        },
+                        intent_spans: Vec::new(),
+                        created_ts: record.created_ts,
+                    };
+                    storage
+                        .merge(&physical_record, &txn::encode_record(&stub), hlc::pack(ts))
+                        .await
+                        .expect("raftkv apply txn settle");
+                    let mut t = txn_tracker.lock().expect("txn tracker poisoned");
+                    t.unresolved_decided.remove(&txn_id);
+                    t.unsettled.remove(&txn_id);
+                    t.settled.insert(txn_id, (record_key, ts));
+                }
+            }
+            // Issue #1380 (`Gate::TxnSettled`): delete Settled stubs old enough
+            // (`TXN_SETTLED_REAP_AGE` of HLC wall time between the stub's
+            // `settled_ts` and this entry's `ts`). The age test lives here, in
+            // the deterministic apply, so no proposer can delete a young stub.
+            KvCommand::TxnReap { entries, ts } => {
+                flush_pending(storage, &mut pending, metrics, halted).await;
+                for (txn_id, record_key) in entries {
+                    if is_sealed(sealed, &record_key) {
+                        continue;
+                    }
+                    let physical_record = scope.physical(&record_key);
+                    let Some(record) = storage
+                        .get(&physical_record)
+                        .await
+                        .expect("raftkv txn reap read")
+                        .and_then(|vv| txn::decode_record(&vv.value))
+                    else {
+                        continue;
+                    };
+                    let txn::TxnStatus::Settled { settled_ts, .. } = record.status else {
+                        continue;
+                    };
+                    let old_enough = record.txn_id == txn_id
+                        && ts.wall_ms.saturating_sub(settled_ts.wall_ms)
+                            >= TXN_SETTLED_REAP_AGE.as_millis() as u64;
+                    if !old_enough {
+                        continue;
+                    }
+                    pending.push(MergeOp::tombstone(physical_record, hlc::pack(ts)));
+                    txn_tracker
+                        .lock()
+                        .expect("txn tracker poisoned")
+                        .settled
+                        .remove(&txn_id);
                 }
             }
             // `NoOp` carries no `ts` (`command_ts` returns `None`), so the
@@ -13044,7 +13378,9 @@ fn command_ts(command: &KvCommand) -> Option<HlcTimestamp> {
         | KvCommand::TxnAbort { ts, .. }
         | KvCommand::TxnCommitSealChecked { ts, .. }
         | KvCommand::TxnAbortSealChecked { ts, .. }
-        | KvCommand::TxnResolve { ts, .. } => Some(*ts),
+        | KvCommand::TxnResolve { ts, .. }
+        | KvCommand::TxnSettle { ts, .. }
+        | KvCommand::TxnReap { ts, .. } => Some(*ts),
         KvCommand::NoOp => None,
     }
 }
@@ -13827,7 +14163,11 @@ async fn drive<E: Env, S: StorageEngine + 'static>(st: DriveState<E, S>) {
             // `quiesce_engine_caught_up` just above.
             let txn_veto = {
                 let t = txn_tracker.lock().expect("txn tracker poisoned");
-                !t.pending.is_empty() || !t.unresolved_decided.is_empty()
+                !t.pending.is_empty()
+                    || !t.unresolved_decided.is_empty()
+                    // Issue #1380: undecided-to-settle records owe a settle,
+                    // but only once the gate is open can anything retire them.
+                    || (features.is_open(Gate::TxnSettled) && !t.unsettled.is_empty())
             };
             // Freshness (issue #302 fix): `txn_veto`/`persist_veto` are both
             // computed synchronously right here from always-current
@@ -15967,14 +16307,17 @@ mod scan_chunk_tests {
                     t.pending.insert(r.txn_id, (logical.to_vec(), r.created_ts));
                 }
                 txn::TxnStatus::Committed { commit_ts } => {
-                    t.unresolved_decided.insert(
-                        r.txn_id,
-                        (logical.to_vec(), txn::TxnOutcome::Committed { commit_ts }),
-                    );
+                    let e = (logical.to_vec(), txn::TxnOutcome::Committed { commit_ts });
+                    t.unresolved_decided.insert(r.txn_id.clone(), e.clone());
+                    t.unsettled.insert(r.txn_id, e);
                 }
                 txn::TxnStatus::Aborted => {
-                    t.unresolved_decided
-                        .insert(r.txn_id, (logical.to_vec(), txn::TxnOutcome::Aborted));
+                    let e = (logical.to_vec(), txn::TxnOutcome::Aborted);
+                    t.unresolved_decided.insert(r.txn_id.clone(), e.clone());
+                    t.unsettled.insert(r.txn_id, e);
+                }
+                txn::TxnStatus::Settled { settled_ts, .. } => {
+                    t.settled.insert(r.txn_id, (logical.to_vec(), settled_ts));
                 }
             }
         }
@@ -16011,15 +16354,35 @@ mod scan_chunk_tests {
                     },
                     node: node.clone(),
                 };
-                let status = match i % 3 {
-                    0 => txn::TxnStatus::Pending,
+                let status = match i % 5 {
+                    0 | 3 => txn::TxnStatus::Pending,
                     1 => txn::TxnStatus::Committed {
                         commit_ts: HlcTimestamp {
                             wall_ms: 2_000 + i,
                             logical: 1,
                         },
                     },
-                    _ => txn::TxnStatus::Aborted,
+                    2 => txn::TxnStatus::Aborted,
+                    // Issue #1380: settled stubs mixed in (both outcomes).
+                    _ if i % 2 == 0 => txn::TxnStatus::Settled {
+                        outcome: txn::TxnOutcome::Aborted,
+                        settled_ts: HlcTimestamp {
+                            wall_ms: 3_000 + i,
+                            logical: 2,
+                        },
+                    },
+                    _ => txn::TxnStatus::Settled {
+                        outcome: txn::TxnOutcome::Committed {
+                            commit_ts: HlcTimestamp {
+                                wall_ms: 2_000 + i,
+                                logical: 1,
+                            },
+                        },
+                        settled_ts: HlcTimestamp {
+                            wall_ms: 3_000 + i,
+                            logical: 2,
+                        },
+                    },
                 };
                 let rec = txn::TxnRecord {
                     txn_id: txn_id.clone(),
@@ -16067,6 +16430,16 @@ mod scan_chunk_tests {
                 want.unresolved_decided,
                 "seed {}",
                 seed()
+            );
+            assert_eq!(got.unsettled, want.unsettled, "seed {}", seed());
+            assert_eq!(got.settled, want.settled, "seed {}", seed());
+            assert!(!want.settled.is_empty(), "the mix includes settled stubs");
+            // A settled stub never re-enters the resolver's backlog.
+            assert!(
+                got.settled
+                    .keys()
+                    .all(|id| !got.unresolved_decided.contains_key(id)
+                        && !got.unsettled.contains_key(id))
             );
         });
     }

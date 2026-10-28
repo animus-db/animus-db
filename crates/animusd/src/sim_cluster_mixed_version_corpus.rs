@@ -147,6 +147,13 @@
 //! - `negative_control_legacy_global_gate_emitted_early` (N11): the command is
 //!   proposed ungated at version 8; the Release(8) node's capped decode MUST
 //!   reject it and the "gate applied early" oracle MUST fire.
+//! - `release9_to_release10_txn_settle_gate`: the txn-settle gate
+//!   (`Gate::TxnSettled`, issue #1380): no `TxnSettle` is proposed below
+//!   version 10 (the record stays in its decided form on every replica) and the
+//!   identical call after the finalize rewrites it to the stub on every replica.
+//!   No emitted-early negative control: the data-plane apply is not capped, so
+//!   there is no per-voter rejection to observe; the emitter's gate check is
+//!   what this cell pins.
 //!
 //! # Not covered
 //!
@@ -255,6 +262,12 @@ enum Kind {
     /// N11: `ConvertTableToLegacyGlobal` emitted ungated with a Release(8)
     /// voter.
     LegacyGlobalGateNegative,
+    /// Release(9) -> Release(10) over `Gate::TxnSettled` (issue #1380): a
+    /// `TxnSettle` is never proposed below the gate (the data-plane apply never
+    /// branches on a gate, so the proposer's check is the whole protection) and
+    /// rewrites the decided record to its stub, identically on every replica,
+    /// once the finalize opened it.
+    TxnSettleGate,
 }
 
 /// The three ladder negative controls (ADR 0073 section 7).
@@ -384,6 +397,7 @@ fn cells() -> Vec<Cell> {
             "negative_control_legacy_global_gate_emitted_early",
             Kind::LegacyGlobalGateNegative,
         ),
+        cell("release9_to_release10_txn_settle_gate", Kind::TxnSettleGate),
     ]
 }
 
@@ -473,6 +487,7 @@ fn run(c: &Cell) -> Verdict {
         Kind::MrecOverridesGateNegative => run_mrec_overrides_negative(c),
         Kind::LegacyGlobalGate => run_legacy_global_gate(c),
         Kind::LegacyGlobalGateNegative => run_legacy_global_negative(c),
+        Kind::TxnSettleGate => run_txn_settle_gate(c),
         _ => run_roll(c),
     }
 }
@@ -840,7 +855,8 @@ fn run_roll(c: &Cell) -> Verdict {
         | Kind::MrecOverridesGate
         | Kind::MrecOverridesGateNegative
         | Kind::LegacyGlobalGate
-        | Kind::LegacyGlobalGateNegative => unreachable!(),
+        | Kind::LegacyGlobalGateNegative
+        | Kind::TxnSettleGate => unreachable!(),
     }
 
     // Liveness: the era starts once the last node is B2, every node recorded.
@@ -3128,6 +3144,144 @@ fn run_legacy_global_negative(c: &Cell) -> Verdict {
     verdict_of(c, v, cap_fired)
 }
 
+fn txn_settle_setup(cluster: &mut SimCluster, w: &mut Watch) {
+    legacy_setup(cluster, w);
+    roll_to_release(cluster, w, &[0, 1, 2, DATA], 9);
+    if !all_recorded_at(cluster, w, 9) {
+        w.violations
+            .push("the [1,9] records never landed on every node".into());
+    }
+    finalize_step(cluster, w, 9);
+}
+
+/// Roll `Release(9)` -> `Release(10)`. A decided transaction record sits on a
+/// table's tablet. Below the gate (half rolled, the finalize refused by name)
+/// a settle is not proposed: the call reports `false` and every replica's
+/// record bytes are unchanged and identical. After the finalize the identical
+/// call applies: every replica holds the same, different (stub) bytes, the
+/// tracker counts one settled record, and the decision is still readable.
+fn run_txn_settle_gate(c: &Cell) -> Verdict {
+    use animus_control::version::Gate;
+    use animus_cp_data::TxnDecisionStatus;
+    let mut cluster = light_cluster(c.seed);
+    let mut w = Watch::new(true);
+    txn_settle_setup(&mut cluster, &mut w);
+    if (0..NODES).any(|n| cluster.features(n).is_open(Gate::TxnSettled)) {
+        w.violations.push("TxnSettled open at version 9".into());
+    }
+    let _ = cluster.create_table("s1");
+    let Some((tablet, txn_id, record_key)) = stage_open_txn(&mut cluster, &mut w, "s1") else {
+        return verdict_of(c, w.violations, false);
+    };
+    let Some(leader) = (0..64).find_map(|_| {
+        w.run(&mut cluster, Duration::from_millis(200));
+        cluster.leader_index_of(tablet)
+    }) else {
+        w.violations
+            .push(format!("{tablet:?} never elected a leader"));
+        return verdict_of(c, w.violations, false);
+    };
+    let decided =
+        cluster.txn_decide_on_group(leader, tablet, txn_id.clone(), record_key.clone(), true);
+    if !matches!(decided, Some(TxnDecisionStatus::Committed { .. })) {
+        w.violations
+            .push(format!("the decision did not commit: {decided:?}"));
+    }
+    w.run(&mut cluster, Duration::from_secs(2));
+    let bytes_of = |cluster: &mut SimCluster| -> Vec<(u64, Vec<u8>)> {
+        (0..NODES)
+            .filter_map(|n| {
+                cluster
+                    .txn_record_bytes_on(n, tablet, record_key.clone())
+                    .map(|b| (n, b))
+            })
+            .collect()
+    };
+    let decided_bytes = bytes_of(&mut cluster);
+    if decided_bytes.len() < 2 || decided_bytes.iter().any(|(_, b)| b != &decided_bytes[0].1) {
+        w.violations.push(format!(
+            "the replicas disagree on the decided record: {decided_bytes:?}"
+        ));
+    }
+
+    // Half rolled: three nodes are Release(10), the finalize is refused.
+    roll_to_release(&mut cluster, &mut w, &[0, 1, DATA], 10);
+    let l = control_leader(&mut cluster);
+    let (status, body) = finalize(&mut cluster, l, r#"{"to":10,"expected":9}"#);
+    if status == 200 {
+        w.violations.push(format!(
+            "a finalize to 10 was accepted with a [1,9] node: {body}"
+        ));
+    }
+    let mut proposed_below = false;
+    for n in 0..NODES {
+        if let Some(true) =
+            cluster.txn_settle_on_group(n, tablet, txn_id.clone(), record_key.clone())
+        {
+            proposed_below = true;
+        }
+    }
+    if proposed_below {
+        w.violations
+            .push("a TxnSettle was proposed below the gate".into());
+    }
+    w.run(&mut cluster, Duration::from_secs(2));
+    if bytes_of(&mut cluster) != decided_bytes {
+        w.violations.push("a record changed below the gate".into());
+    }
+
+    roll_to_release(&mut cluster, &mut w, &[OLD], 10);
+    if !all_recorded_at(&mut cluster, &mut w, 10) {
+        w.violations
+            .push("the [1,10] records never landed on every node".into());
+    }
+    finalize_step(&mut cluster, &mut w, 10);
+    if !converge(&mut cluster, |c| {
+        w.sample(c);
+        (0..NODES).all(|n| c.features(n).is_open(Gate::TxnSettled))
+    }) {
+        w.violations
+            .push("TxnSettled never opened on every node".into());
+    }
+    let leader = (0..64)
+        .find_map(|_| {
+            w.run(&mut cluster, Duration::from_millis(200));
+            cluster.leader_index_of(tablet)
+        })
+        .unwrap_or(leader);
+    if cluster.txn_settle_on_group(leader, tablet, txn_id.clone(), record_key.clone()) != Some(true)
+    {
+        w.violations
+            .push("the post-finalize settle did not apply".into());
+    }
+    w.run(&mut cluster, Duration::from_secs(2));
+    let settled_bytes = bytes_of(&mut cluster);
+    if settled_bytes.len() < 2
+        || settled_bytes.iter().any(|(_, b)| b != &settled_bytes[0].1)
+        || settled_bytes.first().map(|(_, b)| b) == decided_bytes.first().map(|(_, b)| b)
+    {
+        w.violations.push(format!(
+            "after the gate every replica must hold the same, rewritten stub: {settled_bytes:?}"
+        ));
+    }
+    for (n, _) in &settled_bytes {
+        match cluster.txn_tracker_state(*n, tablet) {
+            Some((t, _)) if t.settled == 1 && t.unsettled == 0 => {}
+            other => w
+                .violations
+                .push(format!("node {n}'s tracker after the settle: {other:?}")),
+        }
+    }
+    let status =
+        cluster.txn_decide_on_group(leader, tablet, txn_id.clone(), record_key.clone(), true);
+    if !matches!(status, Some(TxnDecisionStatus::Committed { .. })) {
+        w.violations
+            .push(format!("the stub no longer answers Committed: {status:?}"));
+    }
+    w.sample(&cluster);
+    verdict_of(c, w.violations, false)
+}
+
 /// A Phase 1 binary joining after the era is refused at the seed's handshake
 /// (counted, never a member); the cluster is unaffected; a versioned joiner
 /// through the same seed is admitted and recorded. `via_data` dials the
@@ -3512,6 +3666,11 @@ fn sim_cluster_mixed_version_corpus_negative_control_legacy_global_gate() {
 }
 
 #[test]
+fn sim_cluster_mixed_version_corpus_txn_settle_gate() {
+    run_family("release9_to_release10_txn_settle_gate");
+}
+
+#[test]
 fn sim_cluster_mixed_version_cell_names_and_seeds_are_unique() {
     let cs = corpus::seed_expand(cells(), 3);
     let names: BTreeSet<_> = cs.iter().map(|c| c.name.clone()).collect();
@@ -3547,6 +3706,7 @@ fn sim_cluster_mixed_version_cell_names_and_seeds_are_unique() {
         "negative_control_mrec_overrides_gate_emitted_early",
         "release8_to_release9_legacy_global_gate",
         "negative_control_legacy_global_gate_emitted_early",
+        "release9_to_release10_txn_settle_gate",
     ] {
         assert!(
             cells().iter().any(|c| c.name.starts_with(prefix)),

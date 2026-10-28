@@ -3656,3 +3656,10 @@ whole kind scope must do the same (`scan_hot_change_max`, the seal-marker scan a
 ranges; they are small or erase-only today). Tests: `scan_chunk_tests` in `lib.rs`. The tracker itself still holds
 every decided record of the history (issue #1380, a design question). Lesson:
 `docs/lessons/code-patterns/2026-10-25-a-group-start-scan-that-materialises-the-whole-tablet-becomes-rss-proportional-to-history.md`.
+
+## Settled txn records (issue #1380, `Gate::TxnSettled`, ADR 0018's 2026-10-27 amendment)
+
+- `TxnStatus::Settled { outcome, settled_ts }` is the `txn-record` v2 form (status bytes 3 committed / 4 aborted, no spans); `decode_record` keeps v1 forever, `downgrade_record_to_v1` (legacy-encoders) feeds the upgrade-restart transcode.
+- `KvCommand::TxnSettle`/`TxnReap` (codec tags 20/21, `required_gate` = `TxnSettled`). Apply never branches on the gate; `RaftKvNode::txn_settle`/`txn_reap` check it before proposing. Settle is a per-entry no-op for absent/Pending/Settled/foreign/sealed records; reap checks the age against the entry's own `ts` (`TXN_SETTLED_REAP_AGE`), never the proposer's word.
+- `rebuild_txn_tracker` puts Settled records in `settled` only; decided ones go to `unresolved_decided` + `unsettled`. The settle apply drains both on every replica; with the gate open a non-empty `unsettled` vetoes quiescence. Any new tracker consumer or rebuild reference must handle the `settled` set (the chunked-rebuild test mixes stubs in).
+- Fixtures: `raftkv-wire/v1-txnsettle.bin`, `raftkv-wal/v2-txnsettle.bin`, `txn-record/v1.bin`+`v2.bin`. Never edit existing ones.

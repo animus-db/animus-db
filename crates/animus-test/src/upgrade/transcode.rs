@@ -371,15 +371,35 @@ fn txn_envelope_transcode(_key: &[u8], value: &[u8], target: u32) -> Option<Vec<
     }
 }
 
+/// `txn-record` v2 -> v1 (ADR 0018's 2026-10-27 amendment, issue #1380): a
+/// Settled stub becomes the `Committed`/`Aborted` record it settled (the
+/// stub's dropped `intent_spans` stay empty). Anything that is not exactly one
+/// v2 Settled record is left alone
+/// (`animus_cp_data::downgrade_txn_record_to_v1`).
+fn txn_record_transcode(_key: &[u8], value: &[u8], target: u32) -> Option<Vec<u8>> {
+    match target {
+        1 => animus_cp_data::downgrade_txn_record_to_v1(value),
+        t => unreachable!("txn-record: no transcode to v{t} (guarded by RowFormat::versions)"),
+    }
+}
+
 /// The row-value formats with a real transcode. Every entry names an
 /// [`EMBEDDED`] row of the same name and version (checked by
 /// `tests/it/upgrade_restart_tier0.rs`), so a bump of the format edits both.
-pub static ROW_TABLE: &[RowFormat] = &[RowFormat {
-    name: "txn-envelope",
-    current_version: 2,
-    versions: V1_V2,
-    transcode: txn_envelope_transcode,
-}];
+pub static ROW_TABLE: &[RowFormat] = &[
+    RowFormat {
+        name: "txn-envelope",
+        current_version: 2,
+        versions: V1_V2,
+        transcode: txn_envelope_transcode,
+    },
+    RowFormat {
+        name: "txn-record",
+        current_version: 2,
+        versions: V1_V2,
+        transcode: txn_record_transcode,
+    },
+];
 
 /// The row format named `name`.
 #[must_use]
@@ -594,6 +614,15 @@ pub static EMBEDDED: &[Embedded] = &[
     // apply writes beside each resolved intent (`txn::resolved_marker_key`).
     // An engine-resident row like the envelope; at its first version it
     // transcodes as the identity (a pre-marker state simply has no markers).
+    // v2 (issue #1380, `Gate::TxnSettled`): the anchor's per-transaction status
+    // record gains the Settled stub form. Engine-resident like the envelope:
+    // its v2 -> v1 transcode is the [`ROW_TABLE`] entry of the same name.
+    emb_v(
+        "txn-record",
+        Carrier::Table("lsm-sstable"),
+        "animus-cp-data",
+        2,
+    ),
     emb(
         "txn-resolved-marker",
         Carrier::Table("lsm-sstable"),

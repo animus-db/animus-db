@@ -308,8 +308,9 @@ pub trait AdminHost: Send + Sync {
     async fn raft_view(&self) -> Value;
     /// `GET /admin/raftkv?exact=`.
     async fn raftkv_view(&self, query: &str) -> Value;
-    /// `GET /admin/txns`.
-    async fn txns_view(&self) -> Value;
+    /// `GET /admin/txns?limit=` (issue #1380: the per-group decided list is
+    /// capped at `limit`, totals are always exact).
+    async fn txns_view(&self, query: &str) -> Value;
     /// `GET /admin/storage/lsm?tablet=`.
     async fn storage_lsm(&self, query: &str) -> (u16, Value);
     /// `GET /admin/storage/control`.

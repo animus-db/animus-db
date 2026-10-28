@@ -380,6 +380,53 @@ fn generate_fixture_raftkv_wire_txn_sealed() {
     std::fs::write(&path, txn_sealed_wire_bytes()).expect("write fixture");
 }
 
+fn txn_settled_wire_bytes() -> Vec<u8> {
+    let frames: Vec<Vec<u8>> = codec::tests::txn_settled_sample_wires()
+        .iter()
+        .map(|w| codec::encode_wire(w, &ClusterFeatures::new()))
+        .collect();
+    pack_frames(&frames)
+}
+
+/// ADR 0018 (2026-10-27, issue #1380): `raftkv-wire/v1-txnsettle.bin` -- the
+/// additive settle/reap variants (codec tags 20/21) inside wire v1. Decodes to
+/// the hand-built value, the current encoder reproduces its bytes, every frame
+/// is still v1, and the gate table classifies it `TxnSettled`.
+#[test]
+fn raftkv_wire_txn_settled_shape_fixture_decodes_and_round_trips() {
+    let bytes = std::fs::read(formats_dir("raftkv-wire").join("v1-txnsettle.bin"))
+        .expect("raftkv-wire/v1-txnsettle.bin is checked in");
+    let expected = codec::tests::txn_settled_sample_wires();
+    let frames = unpack_frames(&bytes);
+    assert_eq!(frames.len(), expected.len());
+    for (i, (frame, want)) in frames.iter().zip(&expected).enumerate() {
+        assert_eq!((frame[0], frame[1]), (0xCB, 1), "frame {i}: still wire v1");
+        let got = codec::decode_wire(frame).unwrap_or_else(|e| panic!("frame {i}: {e}"));
+        assert_eq!(format!("{got:?}"), format!("{want:?}"), "frame {i}");
+        assert_eq!(got.required_gate(), Gate::TxnSettled, "frame {i}");
+    }
+    assert_eq!(
+        txn_settled_wire_bytes(),
+        bytes,
+        "the current encoder emits the fixture"
+    );
+}
+
+/// `cargo test -p animus-cp-data --lib generate_fixture_raftkv_wire_txn_settled -- --ignored`.
+/// Refuses to overwrite an existing fixture.
+#[test]
+#[ignore]
+fn generate_fixture_raftkv_wire_txn_settled() {
+    let path = formats_dir("raftkv-wire").join("v1-txnsettle.bin");
+    if std::fs::metadata(&path).is_ok() {
+        panic!(
+            "{} already exists — never regenerated in place",
+            path.display()
+        );
+    }
+    std::fs::write(&path, txn_settled_wire_bytes()).expect("write fixture");
+}
+
 /// `cargo test -p animus-cp-data --lib generate_fixture_raftkv_wire -- --ignored`.
 /// Refuses to overwrite an existing fixture (ADR 0073 Phase 0).
 #[test]
@@ -752,6 +799,63 @@ fn generate_fixture_raftkv_wal_txn_sealed() {
     std::fs::write(&path, txn_sealed_wal_bytes()).expect("write fixture");
 }
 
+/// The settle/reap records of `raftkv-wal/v2-txnsettle.bin` (ADR 0018,
+/// 2026-10-27, issue #1380): the entries of
+/// [`codec::tests::txn_settled_sample_wires`] as `Append` records in one
+/// persist round plus its sync marker (the v2 layout).
+fn txn_settled_wal_records() -> Vec<Rec> {
+    let mut recs = vec![Rec::Hard {
+        term: 12,
+        voted_for: Some(nid(2)),
+    }];
+    for w in codec::tests::txn_settled_sample_wires() {
+        let KvWire::Raft(animus_control::raft::RaftMsg::AppendEntries { entries, .. }) = w else {
+            panic!("txn_settled_sample_wires is an AppendEntries frame");
+        };
+        recs.extend(entries.into_iter().map(Rec::Append));
+    }
+    recs
+}
+
+fn txn_settled_wal_bytes() -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for r in &txn_settled_wal_records() {
+        bytes.extend(PersistedState::<KvCommand, KvState>::encode_record(r));
+    }
+    bytes.extend(animus_control::format::encode_sync_marker(
+        &animus_control::persist::CONTROL_WAL,
+        bytes.len() as u64,
+    ));
+    bytes
+}
+
+#[test]
+fn raftkv_wal_txn_settled_shape_fixture_decodes_and_round_trips() {
+    let bytes = std::fs::read(formats_dir("raftkv-wal").join("v2-txnsettle.bin"))
+        .expect("raftkv-wal/v2-txnsettle.bin is checked in");
+    let got = PersistedState::<KvCommand, KvState>::decode(&bytes).expect("decodes");
+    assert_eq!(got, txn_settled_wal_records());
+    assert_eq!(
+        txn_settled_wal_bytes(),
+        bytes,
+        "the current encoder emits the fixture"
+    );
+}
+
+/// `cargo test -p animus-cp-data --lib generate_fixture_raftkv_wal_txn_settled -- --ignored`.
+#[test]
+#[ignore]
+fn generate_fixture_raftkv_wal_txn_settled() {
+    let path = formats_dir("raftkv-wal").join("v2-txnsettle.bin");
+    if std::fs::metadata(&path).is_ok() {
+        panic!(
+            "{} already exists — never regenerated in place",
+            path.display()
+        );
+    }
+    std::fs::write(&path, txn_settled_wal_bytes()).expect("write fixture");
+}
+
 /// The required fields of `TxnWrite` (ADR 0073 Phase 0 dropped their
 /// `#[serde(default)]`): a `TxnStage` JSON write missing `stage_marker` or
 /// `pending` is a loud decode error, not a silent `None`.
@@ -1055,6 +1159,186 @@ fn txn_envelope_v2_intents_downgrade_to_the_v1_fixture_bytes() {
     longer.push(0);
     assert_eq!(down(&longer), None);
     assert_eq!(down(&v2[2][..v2[2].len() - 1]), None);
+}
+
+// ---------------------------------------------------------------------------
+// txn-record (ADR 0018 §3; v2 = Settled stubs, issue #1380)
+//
+// The anchor tablet's per-transaction status record, an engine row value at
+// `txn::record_key`. Status byte 0..=2 is v1 (`Pending`/`Committed`/
+// `Aborted`); v2 adds 3 (`Settled` committed) and 4 (`Settled` aborted). v1
+// bytes decode unchanged. Container: `u32`-BE-length-prefixed frames, one
+// encoded record each.
+
+fn fixture_record(
+    status: crate::txn::TxnStatus,
+    spans: Vec<(String, animus_tablet::KeyRange)>,
+) -> crate::txn::TxnRecord {
+    crate::txn::TxnRecord {
+        txn_id: txn_fixture_id(),
+        status,
+        intent_spans: spans,
+        created_ts: HlcTimestamp {
+            wall_ms: 1_700_000_000_000,
+            logical: 1,
+        },
+    }
+}
+
+fn fixture_record_spans() -> Vec<(String, animus_tablet::KeyRange)> {
+    vec![
+        (
+            "orders".to_string(),
+            animus_tablet::KeyRange::new(b"a".to_vec(), Some(b"a\x00".to_vec())),
+        ),
+        (
+            "shipments".to_string(),
+            animus_tablet::KeyRange::new(b"m".to_vec(), None),
+        ),
+    ]
+}
+
+fn v1_txn_records() -> Vec<crate::txn::TxnRecord> {
+    use crate::txn::TxnStatus;
+    vec![
+        fixture_record(TxnStatus::Pending, fixture_record_spans()),
+        fixture_record(
+            TxnStatus::Committed {
+                commit_ts: HlcTimestamp {
+                    wall_ms: 1_700_000_000_200,
+                    logical: 3,
+                },
+            },
+            fixture_record_spans(),
+        ),
+        fixture_record(TxnStatus::Aborted, fixture_record_spans()),
+    ]
+}
+
+fn v2_txn_records() -> Vec<crate::txn::TxnRecord> {
+    use crate::txn::{TxnOutcome, TxnStatus};
+    let settled_ts = HlcTimestamp {
+        wall_ms: 1_700_000_005_000,
+        logical: 9,
+    };
+    vec![
+        fixture_record(
+            TxnStatus::Settled {
+                outcome: TxnOutcome::Committed {
+                    commit_ts: HlcTimestamp {
+                        wall_ms: 1_700_000_000_200,
+                        logical: 3,
+                    },
+                },
+                settled_ts,
+            },
+            Vec::new(),
+        ),
+        fixture_record(
+            TxnStatus::Settled {
+                outcome: TxnOutcome::Aborted,
+                settled_ts,
+            },
+            Vec::new(),
+        ),
+    ]
+}
+
+fn txn_record_fixture_bytes(records: &[crate::txn::TxnRecord]) -> Vec<u8> {
+    let frames: Vec<Vec<u8>> = records.iter().map(crate::txn::encode_record).collect();
+    pack_frames(&frames)
+}
+
+#[test]
+fn txn_record_decodes_every_checked_in_fixture() {
+    use crate::txn;
+    for (version, bytes) in fixture_files(&formats_dir("txn-record")) {
+        let want = match version {
+            1 => v1_txn_records(),
+            2 => v2_txn_records(),
+            other => panic!(
+                "txn-record fixture v{other} has no expected value — add one (ADR 0073 checklist step 4)"
+            ),
+        };
+        let frames = unpack_frames(&bytes);
+        assert_eq!(
+            frames.len(),
+            want.len(),
+            "txn-record v{version} frame count"
+        );
+        for (i, (frame, want)) in frames.iter().zip(&want).enumerate() {
+            assert_eq!(
+                txn::decode_record(frame).as_ref(),
+                Some(want),
+                "txn-record v{version} frame {i}"
+            );
+        }
+    }
+}
+
+#[test]
+fn txn_record_encoder_matches_the_fixture_bytes() {
+    for (version, bytes) in fixture_files(&formats_dir("txn-record")) {
+        let want = match version {
+            1 => txn_record_fixture_bytes(&v1_txn_records()),
+            2 => txn_record_fixture_bytes(&v2_txn_records()),
+            other => panic!("txn-record fixture v{other} has no encoder arm"),
+        };
+        assert_eq!(
+            want, bytes,
+            "txn-record v{version}: encoder emits the fixture"
+        );
+    }
+}
+
+/// The harness's engine-row transcode (`animus-test`'s `ROW_TABLE`): a v2
+/// Settled record down-converts to the v1 `Committed`/`Aborted` record it
+/// settled (spans were dropped by the stub), and anything that is not exactly
+/// one v2 Settled record is left alone.
+#[test]
+fn txn_record_v2_settled_records_downgrade_to_v1_decided_records() {
+    use crate::downgrade_txn_record_to_v1 as down;
+    use crate::txn::{self, TxnOutcome, TxnStatus};
+    for rec in v2_txn_records() {
+        let got = down(&txn::encode_record(&rec)).expect("a settled record downgrades");
+        let back = txn::decode_record(&got).expect("v1 bytes decode");
+        let TxnStatus::Settled { outcome, .. } = &rec.status else {
+            unreachable!()
+        };
+        match outcome {
+            TxnOutcome::Committed { commit_ts } => assert_eq!(
+                back.status,
+                TxnStatus::Committed {
+                    commit_ts: *commit_ts
+                }
+            ),
+            TxnOutcome::Aborted => assert_eq!(back.status, TxnStatus::Aborted),
+        }
+        assert_eq!(back.txn_id, rec.txn_id);
+        assert_eq!(back.created_ts, rec.created_ts);
+        assert!(back.intent_spans.is_empty());
+        // A trailing byte means it is not exactly one record.
+        let mut longer = txn::encode_record(&rec);
+        longer.push(0);
+        assert_eq!(down(&longer), None);
+    }
+    for v1 in v1_txn_records() {
+        assert_eq!(down(&txn::encode_record(&v1)), None, "v1 is left alone");
+    }
+    assert_eq!(down(&[]), None);
+    assert_eq!(down(&[1, 2, 3]), None);
+}
+
+/// `cargo test -p animus-cp-data --lib generate_fixture_txn_record -- --ignored`.
+/// Writes the missing versions only; refuses to overwrite one.
+#[test]
+#[ignore]
+fn generate_fixture_txn_record() {
+    let dir = formats_dir("txn-record");
+    if !dir.join("v1.bin").exists() {
+        write_new_fixture(&dir, 1, &txn_record_fixture_bytes(&v1_txn_records()));
+    }
+    write_new_fixture(&dir, 2, &txn_record_fixture_bytes(&v2_txn_records()));
 }
 
 // ---------------------------------------------------------------------------

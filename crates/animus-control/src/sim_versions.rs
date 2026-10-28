@@ -301,42 +301,50 @@ mod tests {
                 BinaryProfile::Release(7),
                 BinaryProfile::Release(8),
                 BinaryProfile::Release(9),
+                BinaryProfile::Release(10),
             ]
             .iter()
             .map(|p| p.accepts(g))
             .collect();
             let want = match g {
-                Gate::Base => [true, true, true, true, true, true, true, true, true, true],
-                Gate::Era => [false, true, true, true, true, true, true, true, true, true],
-                Gate::GlobalTables => {
-                    [false, false, true, true, true, true, true, true, true, true]
-                }
+                Gate::Base => [
+                    true, true, true, true, true, true, true, true, true, true, true,
+                ],
+                Gate::Era => [
+                    false, true, true, true, true, true, true, true, true, true, true,
+                ],
+                Gate::GlobalTables => [
+                    false, false, true, true, true, true, true, true, true, true, true,
+                ],
                 Gate::MrecReplication => [
-                    false, false, false, true, true, true, true, true, true, true,
+                    false, false, false, true, true, true, true, true, true, true, true,
                 ],
                 Gate::TxnSealChecked => [
-                    false, false, false, false, true, true, true, true, true, true,
+                    false, false, false, false, true, true, true, true, true, true, true,
                 ],
                 Gate::NodeCapacity => [
-                    false, false, false, false, false, true, true, true, true, true,
+                    false, false, false, false, false, true, true, true, true, true, true,
                 ],
                 Gate::FollowerAppliedIndex => [
-                    false, false, false, false, false, false, true, true, true, true,
+                    false, false, false, false, false, false, true, true, true, true, true,
                 ],
                 Gate::MrscReplicaRemoval => [
-                    false, false, false, false, false, false, false, true, true, true,
+                    false, false, false, false, false, false, false, true, true, true, true,
                 ],
                 Gate::MrecReplicaOverrides => [
-                    false, false, false, false, false, false, false, false, true, true,
+                    false, false, false, false, false, false, false, false, true, true, true,
                 ],
                 Gate::LegacyGlobalTables => [
-                    false, false, false, false, false, false, false, false, false, true,
+                    false, false, false, false, false, false, false, false, false, true, true,
                 ],
-                Gate::Synthetic(2) => {
-                    [false, false, true, true, true, true, true, true, true, true]
-                }
+                Gate::TxnSettled => [
+                    false, false, false, false, false, false, false, false, false, false, true,
+                ],
+                Gate::Synthetic(2) => [
+                    false, false, true, true, true, true, true, true, true, true, true,
+                ],
                 Gate::Synthetic(3) => [
-                    false, false, false, true, true, true, true, true, true, true,
+                    false, false, false, true, true, true, true, true, true, true, true,
                 ],
                 Gate::Synthetic(_) => unreachable!(),
             };

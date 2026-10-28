@@ -1995,6 +1995,20 @@ impl SimClusterHandle {
         group.txn_status_local(&record_key).await
     }
 
+    /// Issue #1380: propose a `TxnSettle` for one record on `node`'s replica
+    /// of `tablet` (the leader). `None` when `node` hosts no replica; otherwise
+    /// the group's own answer (`false`: gate closed, not leader or no apply).
+    pub(crate) async fn txn_settle_on_group(
+        &self,
+        node: u64,
+        tablet: TabletId,
+        txn_id: TxnId,
+        record_key: Vec<u8>,
+    ) -> Option<bool> {
+        let group = self.ctx(node).edge.local_cp(tablet)?;
+        Some(group.txn_settle(vec![(txn_id, record_key)]).await)
+    }
+
     /// The raw bytes of the txn record at `record_key` on `node`'s own replica
     /// of `tablet` (a plain local engine read: any replica, no read barrier),
     /// so a test can compare replicas byte for byte. `None` when `node` hosts
@@ -4005,6 +4019,19 @@ impl SimCluster {
         self.shared.group_states(node)
     }
 
+    /// Issue #1380: the txn-tracker entry counts and Raft commit index of
+    /// `node`'s replica of `tablet`, as a pure local read (no virtual time):
+    /// `None` when `node` hosts no replica.
+    pub(crate) fn txn_tracker_state(
+        &self,
+        node: u64,
+        tablet: TabletId,
+    ) -> Option<(animus_cp_data::TxnTrackerCounts, u64)> {
+        let groups = self.shared.ctx(node).edge.hosted_groups();
+        let (_, g) = groups.iter().find(|(t, _)| *t == tablet)?;
+        Some((g.txn_tracker_counts(), g.commit_index()))
+    }
+
     /// [`SimClusterHandle::hosted_tablets`]'s own driver-callable twin.
     pub(crate) fn hosted_tablets(&self, node: u64) -> BTreeSet<TabletId> {
         self.shared.hosted_tablets(node)
@@ -5379,6 +5406,24 @@ impl SimCluster {
         self.spawn_and_capture(node, async move {
             handle
                 .txn_decide_on_group(node, tablet, txn_id, record_key, commit)
+                .await
+        })
+        .flatten()
+    }
+
+    /// [`SimClusterHandle::txn_settle_on_group`], driven from a test's own
+    /// `&mut self` call.
+    pub(crate) fn txn_settle_on_group(
+        &mut self,
+        node: u64,
+        tablet: TabletId,
+        txn_id: TxnId,
+        record_key: Vec<u8>,
+    ) -> Option<bool> {
+        let handle = self.shared.clone();
+        self.spawn_and_capture(node, async move {
+            handle
+                .txn_settle_on_group(node, tablet, txn_id, record_key)
                 .await
         })
         .flatten()
