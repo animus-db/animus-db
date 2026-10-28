@@ -1135,6 +1135,59 @@ struct IncomingSnapshot {
     buf: Vec<u8>,
 }
 
+/// The issue #667 boot-time "wiped voter or genuine fresh bootstrap?" check
+/// (see `RaftCore::begin_cluster_check`). Volatile: never serialized or
+/// persisted. The three states are mutually exclusive by construction: a
+/// round starts `Pending`, and resolves to `Idle` (proceed) or, only after
+/// clearing the round, to `Refused`.
+enum ClusterCheck {
+    /// Not applicable (the default: `new`/`recovered` and most test
+    /// construction, or the caller never opted in, or the node's persisted
+    /// state was non-empty so its own term/`voted_for` are trustworthy), or
+    /// the round already resolved in favour of proceeding.
+    Idle,
+    /// A probe round is in flight; the node neither votes nor campaigns.
+    Pending {
+        /// Configured peers that have not yet answered the probe.
+        awaiting: BTreeSet<NodeId>,
+        /// When `tick()` next resends the probe. A SEPARATE deadline from
+        /// `election_deadline`, armed by `begin_cluster_check` and advanced
+        /// only by the dedicated resend check at the top of `tick_gated`
+        /// (issue #667 amendment): `handle_append_entries` legitimately
+        /// resets `election_deadline` on every valid leader contact, and a
+        /// still-pending founder does receive heartbeats from an
+        /// already-elected sibling, so sharing it would starve the resend
+        /// and stall bootstrap indefinitely. `next_deadline` also folds it
+        /// in so the driver wakes in time.
+        resend_at: Nanos,
+        /// Whether ANY peer has so far answered with real history
+        /// (`term > 0 || committed_index > 0`) that names this node in its
+        /// committed config AND has itself genuinely heard from this
+        /// identity (`ever_heard_from_prober`). Recorded, never acted on
+        /// until every peer has answered: a single such answer is not
+        /// trustworthy evidence of a wiped-voter restart (a genesis
+        /// bootstrap can look identical from a still-forming peer's view);
+        /// see `handle_cluster_probe_resp`.
+        saw_established: bool,
+    },
+    /// Sticky for this `RaftCore`'s whole lifetime, by design (ADR 0009's
+    /// amendment): every configured peer answered, at least one showed real
+    /// history naming this node as an established voter that has heard from
+    /// it, and none showed genuinely fresh (`0`/`0`) state, which is only
+    /// possible for a genuinely wiped, previously-established voter. Waiting
+    /// or catching up on replication never makes it safe to vote again; it
+    /// must be re-admitted through the learner/rejoin path (ADR 0032/0058).
+    Refused,
+}
+
+impl ClusterCheck {
+    /// Whether the node must not grant real votes or campaign: a round is in
+    /// flight, or it resolved to refusal.
+    fn blocks_voting(&self) -> bool {
+        !matches!(self, ClusterCheck::Idle)
+    }
+}
+
 /// The Raft state machine for one node, generic over the command type `C` and the
 /// applied state-machine `S` (defaults: the control plane's [`MetaCommand`] /
 /// [`Metadata`]). The consensus logic is identical for any `S: StateMachine<C>`;
@@ -1782,81 +1835,14 @@ pub struct RaftCore<C = MetaCommand, S = Metadata> {
 
     // Issue #667 (P0 Raft safety): boot-time "am I a wiped voter restarting
     // into an already-established cluster, or is this a genuine fresh
-    // bootstrap?" check. `None` (every existing construction path — `new`
-    // and `recovered` both set this `None`) means "not applicable": this
-    // core's own persisted state was non-empty at recovery (so its own
-    // term/`voted_for` are trustworthy), or the caller never opted into the
-    // check at all (most unit/test construction). Only the driver's own
-    // `begin_cluster_check` (called exactly when a node's WAL replayed to
-    // `PersistedState::is_empty()`, `node.rs`'s `drive`) ever populates
-    // this. See `begin_cluster_check`'s own doc for the full mechanism.
-    cluster_check_pending: Option<BTreeSet<NodeId>>,
-    // Issue #667 amendment (a second, real-`ProdEnv` regression, found via
-    // `dynamo_txn_idempotency.rs::same_token_same_fingerprint_retry_after_
-    // commit_is_cached` timing out under real CI load): the ORIGINAL
-    // design resent a still-pending probe round only from `start_pre_vote`'s
-    // own early-return arm, itself gated on `now >= election_deadline` —
-    // sharing `election_deadline` with the ordinary election timer. That
-    // sharing is unsound: `handle_append_entries` legitimately RESETS
-    // `election_deadline` on every valid leader contact (the standard Raft
-    // "don't campaign against a live leader" behavior), and a still-pending
-    // founder DOES receive ordinary `AppendEntries`/heartbeat traffic from
-    // an already-elected SIBLING founder (a real leader broadcasts to every
-    // configured peer, voter or not, resolved or not) the moment a majority
-    // of founders elect one among themselves. Once that starts, the pending
-    // founder's own `election_deadline` never again reaches its resend
-    // check — it is perpetually pushed back by legitimate heartbeats — so
-    // its own probe (lost, or answered by a peer that hadn't yet replied)
-    // is never retried, and the founder can wait past any real test/
-    // deployment timeout with no forward progress at all. This field is a
-    // SEPARATE deadline, armed by `begin_cluster_check` and advanced only
-    // by the dedicated resend check at the top of `tick()` — untouched by
-    // `handle_append_entries` or any other ordinary message handler, so it
-    // keeps firing on schedule regardless of how much legitimate leader
-    // traffic this node receives while still pending. `None` whenever
-    // `cluster_check_pending` is `None` (not applicable, or already
-    // resolved).
-    cluster_check_resend_deadline: Option<Nanos>,
-    // Issue #667 amendment (real-cluster bootstrap-race regression, found
-    // via `forward_to_tablet_leader_survives_a_dead_first_guess`'s own
-    // flaky failure under real `ProdEnv` threading): whether ANY peer has
-    // so far answered this boot's cluster check with real history
-    // (`term > 0 || committed_index > 0`) that also names this node in its
-    // own committed config **and** itself genuinely heard from this
-    // identity before (`ever_heard_from_prober`, added by the second
-    // amendment, folded into this same aggregated flag by the third —
-    // see `handle_cluster_probe_resp`'s doc for why a peer lacking that
-    // last part is not decisive either way on its own, and why requiring
-    // it from ANY one peer rather than ALL of them is what makes this
-    // sound for an ordinary follower-follower pair that never directly
-    // exchanged a message). Recorded, never acted on immediately — see
-    // `handle_cluster_probe_resp`'s own doc for why a SINGLE such answer is
-    // not, by itself, trustworthy evidence of a genuine wiped-voter restart
-    // (a real N-node genesis bootstrap can have a majority-of-peers elect a
-    // leader before every founding peer's own probe round has completed,
-    // which looks byte-identical to this signal from the still-forming
-    // peer's own point of view). Reset to `false` whenever a fresh
-    // `begin_cluster_check` round starts (there is only ever one per
-    // `RaftCore` lifetime today, but resetting is cheap and correct
-    // regardless).
-    cluster_check_saw_established_with_me: bool,
-    // Sticky: `cluster_check_pending` resolved with every configured peer
-    // accounted for, at least one showing real history that named this
-    // node as an established voter, and **none** showing genuinely fresh
-    // (`0`/`0`) state — the combination `handle_cluster_probe_resp`'s own
-    // doc explains is only possible for a genuinely wiped, previously-
-    // established voter, never an ordinary still-forming genesis bootstrap.
-    // Sticks for this `RaftCore`'s whole lifetime — there is no path that
-    // clears it, by design (ADR 0009's amendment): an already-established
-    // voter identity whose disk was wiped never becomes safe to
-    // vote/campaign as again just by waiting or catching up on
-    // replication; it must be re-admitted through the learner/rejoin path
-    // (ADR 0032/0058) as a genuinely new membership event.
-    cluster_check_refused: bool,
+    // bootstrap?" check, as one volatile in-memory state machine (never
+    // serialized or persisted). See [`ClusterCheck`] for the states and
+    // `begin_cluster_check`'s own doc for the full mechanism.
+    cluster_check: ClusterCheck,
     /// Optional human-readable label for the group this core serves (e.g.
     /// `"tablet 7"`), set by a multi-group driver (the CP-data tablet
     /// driver) so log lines that would otherwise be indistinguishable
-    /// across groups — the `cluster_check_refused` ERROR most of all — name
+    /// across groups — the cluster-check refusal ERROR most of all — name
     /// their group. Purely diagnostic: never read by any protocol decision.
     /// `None` for the control group itself.
     group_label: Option<String>,
@@ -1976,10 +1962,7 @@ where
             quiesce_engine_caught_up: true,
             quiesce_veto: false,
             quiesce_veto_fresh_through: u64::MAX,
-            cluster_check_pending: None,
-            cluster_check_resend_deadline: None,
-            cluster_check_saw_established_with_me: false,
-            cluster_check_refused: false,
+            cluster_check: ClusterCheck::Idle,
             group_label: None,
             log_omits_base: false,
             wal_records_install: false,
@@ -2410,12 +2393,6 @@ where
         self.snapshot_chunk_advances.get(peer).copied().unwrap_or(0)
     }
 
-    /// Applied entries not yet covered by the snapshot — the log prefix a
-    /// snapshot would truncate. The driver snapshots once this grows large.
-    pub fn applied_since_snapshot(&self) -> u64 {
-        self.last_applied.saturating_sub(self.snapshot_index)
-    }
-
     /// Number of log entries currently retained (the tail after the snapshot).
     pub fn log_len(&self) -> usize {
         self.log.len()
@@ -2619,14 +2596,14 @@ where
         } else {
             // Issue #667 amendment: while the boot-time cluster check is still
             // pending, this node ALSO needs to wake in time to resend its probe
-            // (`cluster_check_resend_deadline`, `tick()`'s own independent
+            // (`ClusterCheck::Pending::resend_at`, `tick()`'s own independent
             // resend check) — never only at `election_deadline`. The driver
             // loop (`node.rs`) sleeps exactly until whatever this function
             // returns and calls `tick()` only then; `election_deadline` is
             // legitimately reset far into the future by `handle_append_entries`
             // on every valid leader contact (a still-pending founder can start
             // receiving ordinary heartbeats from an already-elected sibling the
-            // moment any majority forms), and `cluster_check_resend_deadline`
+            // moment any majority forms), and `resend_at`
             // is deliberately never touched by that reset (see its own doc) —
             // so without this `min`, a real `ProdEnv` founder under real
             // staggered bring-up can oversleep past its own resend deadline
@@ -2643,13 +2620,9 @@ where
                 Some(retry_at) => Nanos(self.election_deadline.0.max(retry_at.0)),
                 None => self.election_deadline,
             };
-            match self.cluster_check_pending {
-                Some(_) => {
-                    Some(Nanos(election.0.min(
-                        self.cluster_check_resend_deadline.map_or(u64::MAX, |d| d.0),
-                    )))
-                }
-                None => Some(election),
+            match self.cluster_check {
+                ClusterCheck::Pending { resend_at, .. } => Some(Nanos(election.0.min(resend_at.0))),
+                ClusterCheck::Idle | ClusterCheck::Refused => Some(election),
             }
         }
     }
@@ -3521,8 +3494,7 @@ where
             self.role,
             Role::Follower | Role::PreCandidate | Role::Candidate
         ) && now.0 >= self.election_deadline.0
-            && !self.cluster_check_refused
-            && self.cluster_check_pending.is_none()
+            && !self.cluster_check.blocks_voting()
             && self.is_voter()
             && !self.state_machine_behind
             && !self.storage_full
@@ -3579,25 +3551,24 @@ where
     pub fn tick_gated(&mut self, now: Nanos, entropy: u64, admit: bool) -> Vec<Out<C>> {
         self.now_hint = now;
         // Issue #667 amendment: the boot-time cluster-check resend, on its
-        // OWN deadline (`cluster_check_resend_deadline`'s own doc explains
+        // OWN deadline (`ClusterCheck::Pending::resend_at`'s own doc explains
         // why this must never share `election_deadline`) — checked
         // unconditionally, every tick, regardless of role or of whatever
         // the match below does this same call. In practice this only ever
         // fires for a `Follower` still resolving `begin_cluster_check` (a
-        // `Leader`/other role can't have `cluster_check_pending` still
-        // `Some` — becoming either requires it already resolved), but
+        // `Leader`/other role can't still be
+        // `ClusterCheck::Pending` — becoming either requires it already resolved), but
         // checking it here rather than inside the `Follower` arm means a
         // future role-handling refactor can't silently reintroduce the
         // original election-timer coupling this exists to avoid.
         let mut out = Vec::new();
-        if self.cluster_check_pending.is_some() {
-            let due = self
-                .cluster_check_resend_deadline
-                .is_none_or(|deadline| now.0 >= deadline.0);
-            if due {
-                out.extend(self.broadcast_cluster_probe());
-                self.cluster_check_resend_deadline =
-                    Some(self.next_cluster_check_resend(now, entropy));
+        if let ClusterCheck::Pending { resend_at, .. } = &self.cluster_check
+            && now.0 >= resend_at.0
+        {
+            out.extend(self.broadcast_cluster_probe());
+            let next = self.next_cluster_check_resend(now, entropy);
+            if let ClusterCheck::Pending { resend_at, .. } = &mut self.cluster_check {
+                *resend_at = next;
             }
         }
         out.extend(match self.role {
@@ -4063,11 +4034,10 @@ where
     /// vote in a term it durably voted in before the wipe, since the vote it
     /// already cast is exactly what got lost. See `start_pre_vote`/
     /// `start_election`'s own guards and `handle_request_vote`'s grant
-    /// condition, all of which check `cluster_check_pending`/
-    /// `cluster_check_refused` below.
+    /// condition, all of which check [`ClusterCheck::blocks_voting`].
     ///
     /// Broadcasts [`RaftMsg::ClusterProbe`] to every configured peer and
-    /// parks in `cluster_check_pending` until either (a) any one peer
+    /// parks in [`ClusterCheck::Pending`] until either (a) any one peer
     /// answers unambiguously (real history naming a DIFFERENT node id than
     /// this one, or genuinely empty `0`/`0` state — either resolves this
     /// node's own check immediately, with no need to wait for the rest of
@@ -4078,26 +4048,35 @@ where
     /// fresh — a single-node group (`self.peers` empty) has nothing to
     /// wait for and resolves immediately. A never-answering peer is never
     /// assumed fresh: `tick()`'s own independent resend check
-    /// (`cluster_check_resend_deadline`, deliberately NOT tied to the
-    /// ordinary election timer — see that field's own doc for why) keeps
-    /// resending probes for as long as `cluster_check_pending` stays
-    /// `Some` — "peers unreachable" means keep probing, never vote.
+    /// (`ClusterCheck::Pending::resend_at`, deliberately NOT tied to the
+    /// ordinary election timer — see its own doc for why) keeps
+    /// resending probes for as long as the check stays
+    /// `Pending` — "peers unreachable" means keep probing, never vote.
+    ///
+    /// A no-op on a [`ClusterCheck::Refused`] core: refusal is sticky for the
+    /// core's lifetime and a later call must never resurrect a `Pending`
+    /// round.
     pub fn begin_cluster_check(&mut self, now: Nanos, entropy: u64) -> Vec<Out<C>> {
+        if matches!(self.cluster_check, ClusterCheck::Refused) {
+            return Vec::new();
+        }
         if self.peers.is_empty() {
             // Nothing to confirm with — a lone voter (or a peerless test
             // core) cannot possibly race anyone else for its own vote.
-            self.cluster_check_pending = None;
+            self.cluster_check = ClusterCheck::Idle;
             return Vec::new();
         }
-        self.cluster_check_pending = Some(self.peers.iter().cloned().collect());
-        self.cluster_check_saw_established_with_me = false;
         self.reset_election_timer(now, entropy);
-        self.cluster_check_resend_deadline = Some(self.next_cluster_check_resend(now, entropy));
+        self.cluster_check = ClusterCheck::Pending {
+            awaiting: self.peers.iter().cloned().collect(),
+            resend_at: self.next_cluster_check_resend(now, entropy),
+            saw_established: false,
+        };
         self.broadcast_cluster_probe()
     }
 
     /// The next deadline for `tick()`'s own independent cluster-check
-    /// resend check (`cluster_check_resend_deadline`'s own doc has the full
+    /// resend check (`ClusterCheck::Pending::resend_at`'s own doc has the full
     /// reasoning for why this must never share `election_deadline`). Same
     /// randomized `[election_base, 2*election_base)` shape
     /// `reset_election_timer` uses — there is no reason for this cadence to
@@ -4142,7 +4121,7 @@ where
     }
 
     /// Tally a [`RaftMsg::ClusterProbeResp`]. A no-op unless our own
-    /// `cluster_check_pending` is still `Some` (already resolved, or never
+    /// check is still `ClusterCheck::Pending` (already resolved, or never
     /// applicable — a stale/duplicate reply).
     ///
     /// `term > 0 || committed_index > 0` proves `from` (and thus the
@@ -4156,7 +4135,7 @@ where
     ///   id as one of its own voters, yet this node's own disk is empty.
     ///   That combination is only possible if this identity was already an
     ///   established voter and its disk was wiped — refuse permanently
-    ///   (`cluster_check_refused`, never cleared; see that field's own doc).
+    ///   (`ClusterCheck::Refused`, never cleared; see its own doc).
     /// - otherwise — `from` has real history but does not (yet) recognize
     ///   this node id as a voter at all, so this identity could never have
     ///   cast a real vote here to forget in the first place. Resolve
@@ -4184,7 +4163,7 @@ where
     /// captured run (see `docs/lessons/` for the reproduction).
     ///
     /// The fix: never decide refusal on a single reply. Evidence is
-    /// gathered from EVERY configured peer (`cluster_check_pending`'s
+    /// gathered from EVERY configured peer (`ClusterCheck::Pending`'s
     /// existing wait-for-all discipline, unchanged) before a refusal
     /// verdict is ever reached — except the two cases that are already
     /// unambiguous on a single reply, each resolving immediately without
@@ -4210,7 +4189,7 @@ where
     ///   `AppendEntries`/heartbeat traffic from an already-elected sibling,
     ///   since `handle_append_entries` legitimately resets
     ///   `election_deadline` on every such contact — see
-    ///   `cluster_check_resend_deadline`'s own doc for the companion fix
+    ///   `ClusterCheck::Pending::resend_at`'s own doc for the companion fix
     ///   this required).
     ///
     /// Only once every peer has answered with NEITHER of the two
@@ -4234,7 +4213,7 @@ where
     /// term/commit/config alone. `ever_heard_from_prober` breaks the tie: a
     /// founder still resolving its OWN cluster check has not campaigned or
     /// voted yet
-    /// (gated on `!cluster_check_pending`), so it has sent no peer any real
+    /// (gated on not being `ClusterCheck::Pending`), so it has sent no peer any real
     /// protocol message — every peer's honest answer is `false`.
     ///
     /// **Third amendment, same day**: the second amendment originally made
@@ -4271,14 +4250,19 @@ where
         config: BTreeSet<NodeId>,
         ever_heard_from_prober: bool,
     ) -> Vec<Out<C>> {
-        let Some(pending) = self.cluster_check_pending.as_mut() else {
+        let ClusterCheck::Pending {
+            awaiting,
+            saw_established,
+            ..
+        } = &mut self.cluster_check
+        else {
             return Vec::new();
         };
         if term == 0 && committed_index == 0 {
             // Unconditionally decisive the instant it's seen — see this
             // method's own doc for why waiting for the rest of the peer
             // set would only add latency, never change the outcome.
-            self.cluster_check_pending = None;
+            self.cluster_check = ClusterCheck::Idle;
             tracing::debug!(
                 node = %self.id,
                 peer = %from,
@@ -4298,7 +4282,7 @@ where
             // cluster (ADR 0060). `start_pre_vote`'s own log-check is
             // what already keeps this case safe, with no dependency on
             // this whole mechanism.
-            self.cluster_check_pending = None;
+            self.cluster_check = ClusterCheck::Idle;
             tracing::debug!(
                 node = %self.id,
                 peer = %from,
@@ -4355,12 +4339,17 @@ where
         // (nothing has been sent yet), so every reply shows `false` and
         // the aggregate below still resolves fresh.
         if ever_heard_from_prober {
-            self.cluster_check_saw_established_with_me = true;
+            *saw_established = true;
         }
-        pending.remove(&from);
-        if pending.is_empty() {
-            self.cluster_check_pending = None;
-            if self.cluster_check_saw_established_with_me {
+        awaiting.remove(&from);
+        if awaiting.is_empty() {
+            let refuse = *saw_established;
+            self.cluster_check = if refuse {
+                ClusterCheck::Refused
+            } else {
+                ClusterCheck::Idle
+            };
+            if refuse {
                 // Every peer answered, none was fresh and none denied
                 // recognizing this node (either branch always resolves
                 // and returns above), and at least one of them both named
@@ -4369,7 +4358,6 @@ where
                 // identity before — only possible for a genuinely
                 // established, previously-active voter whose disk was
                 // wiped.
-                self.cluster_check_refused = true;
                 tracing::error!(
                     node = %self.id,
                     group = self.group_label.as_deref().unwrap_or("control"),
@@ -4406,18 +4394,18 @@ where
     /// `begin_cluster_check`'s doc).
     #[must_use]
     pub fn cluster_check_pending(&self) -> bool {
-        self.cluster_check_pending.is_some()
+        matches!(self.cluster_check, ClusterCheck::Pending { .. })
     }
 
     /// Whether this node has permanently refused to act as a voter (issue
     /// #667): its persisted state replayed empty, and a peer's
     /// `ClusterProbeResp` proved the cluster it is configured into already
     /// exists. Sticky for this `RaftCore`'s lifetime — see
-    /// `cluster_check_refused`'s own field doc for why there is no path
+    /// [`ClusterCheck::Refused`]'s own doc for why there is no path
     /// back from this short of a restart through the learner/rejoin path.
     #[must_use]
     pub fn refused_as_voter(&self) -> bool {
-        self.cluster_check_refused
+        matches!(self.cluster_check, ClusterCheck::Refused)
     }
 
     /// Issue #1131: `true` while this node would refuse every vote and never
@@ -4438,7 +4426,7 @@ where
     /// toward a healthy quorum, and never promotes it as a learner.
     #[must_use]
     fn cannot_vote_yet(&self) -> bool {
-        self.cluster_check_pending.is_some() || self.cluster_check_refused || self.storage_full
+        self.cluster_check.blocks_voting() || self.storage_full
     }
 
     /// Label this core's group for diagnostics (see the `group_label`
@@ -4737,8 +4725,7 @@ where
             // real vote — `voted_for.is_none()` above is exactly the
             // locally-unreliable signal a wiped voter's own forgotten vote
             // would otherwise defeat. See `begin_cluster_check`'s doc.
-            let cluster_checked =
-                !self.cluster_check_refused && self.cluster_check_pending.is_none();
+            let cluster_checked = !self.cluster_check.blocks_voting();
             // Issue #1019 (2026-09-21 amendment to ADR 0058 Train 1): same
             // reasoning as `handle_pre_vote`'s identical amendment — the
             // RESPONDER must never gate granting on its own `is_voter()`
@@ -5474,25 +5461,9 @@ where
         // Issue #1061: identical reachability proof to `handle_append_resp`'s.
         self.note_departing_reply(&from, now);
         if last_index > 0 {
-            // Transfer complete: the follower installed the snapshot.
-            self.snapshot_send.remove(&from);
-            // Lazy-image discipline (`DRIVER_APPLIED`): once no transfer is in
-            // flight, drop the materialized image instead of retaining a
-            // whole-tablet copy in the core indefinitely — a later straggler
-            // triggers an on-demand rebuild from the engine. Kept while any
-            // other peer's transfer is mid-flight so its chunks stay
-            // byte-identical. In-core state machines keep their eager blob.
-            // Deliberately ignores peers that were sent a chunk but have not
-            // acked yet (unlike `forget_snapshot_transfer`, which keys on
-            // `snapshot_send.is_empty()`); kept as-is, so behaviour is unchanged.
-            if S::DRIVER_APPLIED
-                && !self
-                    .snapshot_send
-                    .values()
-                    .any(|r| r.acked_offset.is_some())
-            {
-                self.snapshot_blob = None;
-            }
+            // Transfer complete: the follower installed the snapshot. Drops
+            // the lazy image once no other transfer is in flight (issue #1392).
+            self.forget_snapshot_transfer(&from);
             let m = self.match_index.entry(from.clone()).or_insert(0);
             *m = (*m).max(last_index);
             // This used to be a bare `insert`, unconditionally overwriting
@@ -5779,11 +5750,11 @@ where
         // never campaign — see `begin_cluster_check`'s doc. While pending,
         // resend the probe instead of giving up on the round entirely, so a
         // transiently-unreachable peer's eventual reply still unblocks us.
-        if self.cluster_check_refused {
+        if matches!(self.cluster_check, ClusterCheck::Refused) {
             self.reset_election_timer(now, entropy);
             return Vec::new();
         }
-        if self.cluster_check_pending.is_some() {
+        if matches!(self.cluster_check, ClusterCheck::Pending { .. }) {
             self.reset_election_timer(now, entropy);
             return self.broadcast_cluster_probe();
         }
@@ -5915,7 +5886,7 @@ where
         // independent entry point (`handle_pre_vote_resp`'s own majority
         // check can reach here without going back through `start_pre_vote`),
         // so both need the check, not just one.
-        if self.cluster_check_refused || self.cluster_check_pending.is_some() {
+        if self.cluster_check.blocks_voting() {
             // Defense in depth (mirrors `start_pre_vote`'s own primary
             // guard): `handle_pre_vote_resp`/`handle_timeout_now` can reach
             // this function directly, bypassing `start_pre_vote`.
@@ -6390,10 +6361,15 @@ where
         self.forget_snapshot_transfer(peer);
     }
 
-    /// Forget any in-flight snapshot transfer bookkeeping for `peer` (see
-    /// [`drop_departing`](Self::drop_departing)); releases the cached image
-    /// when this was the last outstanding transfer, mirroring
-    /// `handle_install_snapshot_resp`'s lazy-image discipline.
+    /// Forget any in-flight snapshot transfer bookkeeping for `peer` (a
+    /// completed install, or [`drop_departing`](Self::drop_departing)).
+    /// Lazy-image discipline (`DRIVER_APPLIED`): once no transfer is in flight
+    /// ([`snapshot_transfer_in_flight`](Self::snapshot_transfer_in_flight)),
+    /// drop the materialized image instead of retaining a whole-tablet copy in
+    /// the core indefinitely; a later straggler triggers an on-demand rebuild
+    /// from the engine. Kept while any other peer's transfer is in flight,
+    /// acked or merely sent, so its chunks stay byte-identical and are not
+    /// rebuilt (issue #1392). In-core state machines keep their eager blob.
     fn forget_snapshot_transfer(&mut self, peer: &NodeId) {
         self.snapshot_send.remove(peer);
         if S::DRIVER_APPLIED && self.snapshot_send.is_empty() {

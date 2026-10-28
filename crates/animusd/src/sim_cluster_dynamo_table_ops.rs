@@ -66,25 +66,7 @@ use std::time::Duration;
 use animus_env::{NodeId, nid};
 
 use super::sim_cluster::SimCluster;
-
-fn env_seed(default: u64) -> u64 {
-    std::env::var("ANIMUS_SEED")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(default)
-}
-
-/// One DynamoDB wire `CreateTable` for a plain single-key (`pk`, string)
-/// table named `table`, issued from `node` — the shape every test in this
-/// file that just needs *a* table (not a particular key schema) reuses.
-fn create_table(cluster: &mut SimCluster, node: u64, table: &str) -> (u16, String) {
-    let body = format!(
-        r#"{{"TableName":"{table}",
-            "KeySchema":[{{"AttributeName":"pk","KeyType":"HASH"}}],
-            "AttributeDefinitions":[{{"AttributeName":"pk","AttributeType":"S"}}]}}"#
-    );
-    cluster.dynamo(node, "DynamoDB_20120810.CreateTable", body.as_bytes())
-}
+use super::sim_support::{create_table, env_seed};
 
 /// `TableNames` out of a `ListTables` response body, via `serde_json` —
 /// mirrors `tests/dynamo_table_ops.rs::table_names`.

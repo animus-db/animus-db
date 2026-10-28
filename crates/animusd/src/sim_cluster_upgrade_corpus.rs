@@ -95,6 +95,7 @@ use futures::executor::block_on;
 use serde_json::{Value, json};
 
 use super::sim_cluster::{SimCluster, SimClusterHandle};
+use super::sim_support::panic_message;
 use super::*;
 use crate::config::NodeRole;
 
@@ -195,32 +196,14 @@ fn cells() -> Vec<Cell> {
     out
 }
 
-fn seeds_per_cell() -> usize {
-    corpus::seeds_from_env("ANIMUS_UPGRADE_RESTART_SEEDS")
-}
-
 /// The cells after the depth knob, `ANIMUS_SEED` replay and the optional
 /// `ANIMUS_UPGRADE_RESTART_CELL` name filter.
 fn corpus_cells() -> Vec<Cell> {
-    let filter = std::env::var("ANIMUS_UPGRADE_RESTART_CELL").ok();
-    let expanded = if let Some(seed) = std::env::var("ANIMUS_SEED")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-    {
-        cells()
-            .into_iter()
-            .map(|c| {
-                let name = c.name.clone();
-                c.reseeded(name, seed)
-            })
-            .collect()
-    } else {
-        corpus::seed_expand(cells(), seeds_per_cell())
-    };
-    expanded
-        .into_iter()
-        .filter(|c| filter.as_ref().is_none_or(|f| c.name.contains(f.as_str())))
-        .collect()
+    corpus::corpus_cells(
+        cells(),
+        "ANIMUS_UPGRADE_RESTART_SEEDS",
+        "ANIMUS_UPGRADE_RESTART_CELL",
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -362,14 +345,6 @@ struct CellVerdict {
     transcode_summary: String,
     /// Virtual seconds the whole cell advanced (for the runtime table).
     history: String,
-}
-
-fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
-    payload
-        .downcast_ref::<&str>()
-        .map(|m| (*m).to_string())
-        .or_else(|| payload.downcast_ref::<String>().cloned())
-        .unwrap_or_else(|| "<non-string panic payload>".to_string())
 }
 
 /// Run one cell on its own thread under [`CELL_WATCHDOG`]. A panic out of the

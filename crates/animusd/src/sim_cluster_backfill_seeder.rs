@@ -99,13 +99,7 @@ use animus_control::{
 use animus_dynamo::wire::BATCH_WRITE_MAX_ITEMS;
 
 use super::sim_cluster::SimCluster;
-
-fn env_seed(default: u64) -> u64 {
-    std::env::var("ANIMUS_SEED")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(default)
-}
+use super::sim_support::{env_seed, index_status};
 
 /// A `Creating` GSI definition hashing on `hash_attribute` — duplicated from
 /// `tests/backfill_seeder.rs`'s own identically-named helper (this crate's
@@ -121,26 +115,6 @@ fn creating_index(name: &str, hash_attribute: &str) -> IndexDef {
         hash_attribute_type: None,
         sort_attribute_type: None,
     }
-}
-
-/// Pull `(IndexStatus, Backfilling)` for `index` out of a `DescribeTable`
-/// response body's `GlobalSecondaryIndexes` array — `None` if the index
-/// isn't listed at all. Duplicated from `sim_cluster_index_ddl.rs`'s own
-/// identically-named helper, per this crate's own per-file-fixture
-/// convention.
-fn index_status(body: &str, index: &str) -> Option<(String, bool)> {
-    let v: serde_json::Value = serde_json::from_str(body).ok()?;
-    let table = v.get("Table").or_else(|| v.get("TableDescription"))?;
-    let gsis = table.get("GlobalSecondaryIndexes")?.as_array()?;
-    let entry = gsis
-        .iter()
-        .find(|g| g.get("IndexName").and_then(|n| n.as_str()) == Some(index))?;
-    let status = entry.get("IndexStatus")?.as_str()?.to_owned();
-    let backfilling = entry
-        .get("Backfilling")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
-    Some((status, backfilling))
 }
 
 /// Find the tablet leader of `table`'s (sole) tablet, reading `Metadata`

@@ -20,46 +20,7 @@ use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
 
 mod support;
-
-/// One DynamoDB request over a fresh HTTP/1.1 connection → `(status, body)`.
-/// Mirrors every other `tests/dynamo_*.rs` file's identical helper.
-async fn dynamo(addr: SocketAddr, target: &str, body: &str) -> (u16, String) {
-    let mut stream = TcpStream::connect(addr).await.expect("connect to dynamo");
-    let request = format!(
-        "POST / HTTP/1.1\r\n\
-         Host: animus\r\n\
-         X-Amz-Target: {target}\r\n\
-         Content-Type: application/x-amz-json-1.0\r\n\
-         Content-Length: {}\r\n\
-         Connection: close\r\n\
-         \r\n\
-         {body}",
-        body.len(),
-    );
-    stream
-        .write_all(request.as_bytes())
-        .await
-        .expect("send request");
-    stream.flush().await.expect("flush");
-    let mut raw = Vec::new();
-    stream
-        .read_to_end(&mut raw)
-        .await
-        .expect("read full response");
-    let text = String::from_utf8(raw).expect("utf8 response");
-    let (head, payload) = text.split_once("\r\n\r\n").expect("response has a body");
-    let status: u16 = head
-        .lines()
-        .next()
-        .and_then(|line| line.split_whitespace().nth(1))
-        .and_then(|code| code.parse().ok())
-        .expect("status line");
-    (status, payload.to_string())
-}
-
-fn json(body: &str) -> serde_json::Value {
-    serde_json::from_str(body).unwrap_or_else(|e| panic!("invalid JSON ({e}): {body}"))
-}
+use support::{await_table_active, dynamo, error_code, json};
 
 /// A plain `GET` against the admin HTTP-JSON endpoint (ADR 0020) →
 /// `(status, decoded body)` — mirrors `admin_endpoint.rs`'s own identical
@@ -86,13 +47,6 @@ async fn admin_get(addr: SocketAddr, path: &str) -> (u16, serde_json::Value) {
         .and_then(|code| code.parse().ok())
         .expect("status line");
     (status, json(payload))
-}
-
-fn error_code(body: &str) -> String {
-    json(body)["__type"]
-        .as_str()
-        .map(|t| t.rsplit('#').next().unwrap_or(t).to_owned())
-        .unwrap_or_else(|| panic!("no __type in error body: {body}"))
 }
 
 async fn delete_backup(addr: SocketAddr, backup_arn: &str) -> (u16, String) {
@@ -153,26 +107,6 @@ async fn restore_table(
         &format!(r#"{{"BackupArn":"{backup_arn}","TargetTableName":"{target_table_name}"}}"#),
     )
     .await
-}
-
-/// Poll `DescribeTable` converged-or-timeout to `TableStatus: ACTIVE`.
-async fn await_table_active(addr: SocketAddr, table: &str) {
-    timeout(Duration::from_secs(20), async {
-        loop {
-            let (status, body) = dynamo(
-                addr,
-                "DynamoDB_20120810.DescribeTable",
-                &format!(r#"{{"TableName":"{table}"}}"#),
-            )
-            .await;
-            if status == 200 && json(&body)["Table"]["TableStatus"] == "ACTIVE" {
-                return;
-            }
-            sleep(Duration::from_millis(100)).await;
-        }
-    })
-    .await
-    .unwrap_or_else(|_| panic!("table `{table}` did not converge to ACTIVE in 20s"));
 }
 
 /// The full round trip: populate a table with a GSI, back it up, write MORE

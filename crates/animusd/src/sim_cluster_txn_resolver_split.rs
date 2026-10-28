@@ -52,6 +52,7 @@ use animus_tablet::{KeyRange, TabletId, TabletState};
 use super::dynamo::item_key;
 use super::sim_cluster::SimCluster;
 use super::sim_cluster_grow_retired::leader_node;
+use super::sim_support::{Tick, env_seed, spawn_driver_ticks};
 use crate::{
     CpGroup, TXN_RESOLVER_INTERVAL, TxnResolverState, txn_resolver_decided_pass,
     txn_resolver_pending_pass,
@@ -63,35 +64,6 @@ const STEP: Duration = Duration::from_millis(250);
 /// `RECOVERY_GRACE` is 5 s; a decision plus its resolves follows within a
 /// few sweeps.
 const RECOVER_BOUND: Duration = Duration::from_secs(40);
-
-fn env_seed(default: u64) -> u64 {
-    std::env::var("ANIMUS_SEED")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(default)
-}
-
-type Tick = std::sync::Arc<std::sync::Mutex<Option<Result<(), String>>>>;
-
-/// One `inplace_split_driver_tick` per `Splitting` tablet `node` leads.
-fn spawn_driver_ticks(cluster: &SimCluster, node: u64) -> Tick {
-    cluster.spawn_detached(node, move |ctx| async move {
-        let meta = ctx.effective_metadata();
-        for (tablet, group) in ctx.edge.hosted_groups() {
-            if !group.is_leader() {
-                continue;
-            }
-            let splitting = meta
-                .tablets
-                .get(&tablet)
-                .is_some_and(|t| t.state == TabletState::Splitting);
-            if splitting {
-                crate::index_drain::inplace_split_driver_tick(&ctx, &meta, tablet, &group).await?;
-            }
-        }
-        Ok(())
-    })
-}
 
 /// The production sweep on `node`: the in-doubt pass and the decided-record
 /// pass, each every `TXN_RESOLVER_INTERVAL` on a task of its own, forever

@@ -23,19 +23,17 @@
 //! Run explicitly: `cargo test -p animusd --test inplace_split_bench --
 //! --ignored --nocapture`.
 
-use std::net::SocketAddr;
 use std::time::Duration;
 
 use animusd::{
     ClientRequest, ClientResponse, ClusterConfig, Node, RoleAddrs, SegmentStoreConfig,
     StorageBackend, StreamSealKnobs, read_frame, write_frame,
 };
-use serde_json::Value;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
 
 mod support;
+use support::{admin, kickoff_tablet, sole_tablet_of};
 
 /// Bring up an `n`-node cluster, one process-shaped node per index —
 /// byte-for-byte the same bring-up shape (including quiescence disabled,
@@ -105,33 +103,6 @@ async fn bring_up_inplace(n: usize, dir: &std::path::Path) -> (Vec<Node>, Cluste
     );
 }
 
-/// One HTTP/1.0 request to the admin endpoint; returns `(status, parsed JSON)`.
-async fn admin(addr: SocketAddr, method: &str, path: &str, body: Option<&str>) -> (u16, Value) {
-    let mut stream = TcpStream::connect(addr).await.expect("connect to admin");
-    let body = body.unwrap_or("");
-    let request = format!(
-        "{method} {path} HTTP/1.0\r\nHost: animus\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len(),
-    );
-    stream
-        .write_all(request.as_bytes())
-        .await
-        .expect("send request");
-    stream.flush().await.expect("flush");
-    let mut raw = Vec::new();
-    stream.read_to_end(&mut raw).await.expect("read response");
-    let text = String::from_utf8(raw).expect("utf8 response");
-    let (head, payload) = text.split_once("\r\n\r\n").expect("response has a body");
-    let status: u16 = head
-        .lines()
-        .next()
-        .and_then(|line| line.split_whitespace().nth(1))
-        .and_then(|code| code.parse().ok())
-        .expect("status line");
-    let json: Value = serde_json::from_str(payload.trim()).unwrap_or(Value::Null);
-    (status, json)
-}
-
 /// [`split_build.rs::put_in`]'s twin, but reporting how many frames it took
 /// to land (1 = no retry) instead of discarding that count — the "retry
 /// counts" half of the ADR's own requested blip-shape measurement. Same
@@ -190,39 +161,6 @@ async fn get_in(stream: &mut TcpStream, table: &str, key: Vec<u8>) -> Option<Vec
             other => panic!("get({table}) failed: {other:?}"),
         }
     }
-}
-
-/// [`split_build.rs::sole_tablet_of`], identical.
-fn sole_tablet_of(node: &Node, table: &str) -> u64 {
-    let meta = node.metadata();
-    let ids: Vec<u64> = meta
-        .tablets
-        .iter()
-        .filter(|(_, t)| t.table.as_deref() == Some(table))
-        .map(|(id, _)| id.0)
-        .collect();
-    assert_eq!(
-        ids.len(),
-        1,
-        "expected exactly one tablet of {table}: {ids:?}"
-    );
-    ids[0]
-}
-
-/// The `POST /admin/tablet/split` endpoint — always the in-place workflow
-/// now (the copy-based one and its `SplitMode` selector were deleted in
-/// Layer B1).
-async fn kickoff_tablet(node: &Node, tablet: u64, split_key: &str) {
-    let (status, body) = admin(
-        node.admin_addr(),
-        "POST",
-        "/admin/tablet/split",
-        Some(&format!(
-            "{{\"tablet\":{tablet},\"split_key\":\"{split_key}\"}}"
-        )),
-    )
-    .await;
-    assert_eq!(status, 200, "kickoff of tablet {tablet} failed: {body}");
 }
 
 /// [`split_build.rs::await_cutover_of`], identical — `CutoverSplit`'s

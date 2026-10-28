@@ -160,7 +160,9 @@
 use std::time::Duration;
 
 use super::sim_cluster::SimCluster;
-use super::sim_cluster_console::{create_table_via_wire, env_seed, tablet_of_table};
+use super::sim_support::{
+    create_table_pk_via_wire as create_table, env_seed, poll_until, tablet_of_table,
+};
 use crate::config::NodeRole;
 
 /// A 6-node cluster: 3 control-only (`NodeRole::Control`, indices 0-2) + 3
@@ -180,44 +182,6 @@ fn new_mixed_cluster(seed: u64) -> SimCluster {
         NodeRole::Data,
     ];
     SimCluster::new_with_roles(seed, &roles, 3)
-}
-
-/// A single-hash-key (`pk`, string) `CreateTable`, issued from `node` —
-/// mirrors `sim_cluster_control_only.rs`'s identically-named helper.
-fn create_table(cluster: &mut SimCluster, node: u64, table: &str) -> (u16, String) {
-    let body = format!(
-        r#"{{"TableName":"{table}",
-            "KeySchema":[{{"AttributeName":"pk","KeyType":"HASH"}}],
-            "AttributeDefinitions":[{{"AttributeName":"pk","AttributeType":"S"}}]}}"#
-    );
-    create_table_via_wire(cluster, node, &body)
-}
-
-/// Converged-or-timeout poll on `cond(cluster)` — the shared shape every
-/// `sim_cluster_*` module's own scenario-local convergence checks use,
-/// mirrored (not reached into) from `sim_cluster_control_only.rs`'s
-/// identically-named helper per this crate's own "small fixtures
-/// duplicated per test module" convention.
-fn poll_until(
-    cluster: &mut SimCluster,
-    budget: Duration,
-    seed: u64,
-    what: &str,
-    mut cond: impl FnMut(&mut SimCluster) -> bool,
-) {
-    const STEP: Duration = Duration::from_millis(100);
-    let mut elapsed = Duration::ZERO;
-    loop {
-        if cond(cluster) {
-            return;
-        }
-        assert!(
-            elapsed < budget,
-            "seed={seed}: {what} never converged within {budget:?}"
-        );
-        cluster.run_for(STEP);
-        elapsed += STEP;
-    }
 }
 
 // ---------------------------------------------------------------------------

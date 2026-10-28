@@ -100,14 +100,6 @@ impl Credentials {
         self
     }
 
-    /// Set only the expiry (a credential with an expiry but no session token
-    /// is unusual but harmless — used by tests).
-    #[must_use]
-    pub fn with_expiry(mut self, expiry_epoch_ms: Option<u64>) -> Self {
-        self.expiry_epoch_ms = expiry_epoch_ms;
-        self
-    }
-
     /// The raw secret bytes — the one legitimate reason to look inside this
     /// type: feeding the HMAC chain. Never log, print, or format this value.
     #[must_use]

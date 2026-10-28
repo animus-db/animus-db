@@ -162,14 +162,6 @@ impl WorkloadKind {
             },
         }
     }
-
-    /// Does this workload contain any read-class operation (and so honour
-    /// the `ConsistentRead` setting)?
-    #[must_use]
-    pub fn has_reads(self) -> bool {
-        let m = self.mix();
-        m.read + m.scan + m.read_modify_write > 0
-    }
 }
 
 /// What a workload run looks like, independent of seed and timing.

@@ -24,21 +24,13 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use animusd::{ClientRequest, ClientResponse, read_frame};
+use animusd::{ClientRequest, ClientResponse};
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
 
 mod support;
+use support::call;
 use support::{await_data_nodes_active, await_leader, bring_up_split};
-
-async fn call(addr: SocketAddr, req: ClientRequest) -> ClientResponse {
-    let mut stream = animusd::connect_client(addr).await.expect("connect");
-    animusd::write_frame(&mut stream, &req).await.expect("send");
-    read_frame(&mut stream)
-        .await
-        .expect("read")
-        .expect("a reply")
-}
 
 /// One HTTP/1.0 GET to the admin endpoint; returns `(status, parsed JSON)`.
 async fn admin_get(addr: SocketAddr, path: &str) -> (u16, serde_json::Value) {

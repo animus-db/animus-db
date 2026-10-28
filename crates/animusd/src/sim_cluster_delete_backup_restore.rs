@@ -57,20 +57,10 @@ use animus_control::{ColumnType, MetaCommand, ProposeResult, TableSchema};
 use animus_tablet::TabletId;
 
 use super::sim_cluster::SimCluster;
-
-fn env_seed(default: u64) -> u64 {
-    std::env::var("ANIMUS_SEED")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(default)
-}
+use super::sim_support::{env_seed, json};
 
 fn accepted(r: ProposeResult) -> bool {
     matches!(r, ProposeResult::Accepted { .. })
-}
-
-fn json(body: &str) -> serde_json::Value {
-    serde_json::from_str(body).unwrap_or_else(|e| panic!("invalid JSON ({e}): {body}"))
 }
 
 fn error_code(body: &str) -> String {

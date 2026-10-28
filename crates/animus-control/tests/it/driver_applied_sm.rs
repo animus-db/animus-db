@@ -321,3 +321,107 @@ fn caught_up_node_reships_non_empty_snapshot() {
         "node 2 received the original image intact"
     );
 }
+
+/// Regression (issue #1392): one peer's completed install must not drop the
+/// lazy image another peer's transfer is still being sent from. Node 1 and
+/// node 2 both need a snapshot; node 1 installs it while node 2 has only been
+/// sent chunk 0 (never acked). The image must survive, so node 2's retry
+/// ships from it instead of raising another on-demand rebuild.
+#[test]
+fn completed_install_keeps_image_for_unacked_transfer() {
+    let group: [NodeId; 3] = [nid(0), nid(1), nid(2)];
+    let now = Nanos(1_000_000_000);
+    let mut leader = elect_sole_leader(&group);
+    for i in 0..5u64 {
+        if let ProposeResult::Accepted { index, .. } =
+            leader.propose(KvCommand::Put { key: i, value: i })
+        {
+            let _ = leader.handle(
+                nid(1),
+                RaftMsg::AppendEntriesResp {
+                    term: leader.term(),
+                    success: true,
+                    match_index: index,
+                    needs_snapshot: false,
+                    check_pending: false,
+                    applied_index: 0,
+                },
+                now,
+                7,
+            );
+        }
+    }
+    leader.mark_durable_through(leader.last_log_index());
+    leader.snapshot();
+    let image: Vec<u8> = serde_json::to_vec(&[("k", 1u64)]).unwrap();
+
+    let mut followers: [KvCore; 2] = [
+        RaftCore::new(nid(1), &group, Nanos(0), 7),
+        RaftCore::new(nid(2), &group, Nanos(0), 7),
+    ];
+    // Route messages between the leader and both followers, optionally
+    // dropping every `InstallSnapshot` addressed to node 2 (sent, never acked).
+    let pump = |leader: &mut KvCore,
+                followers: &mut [KvCore; 2],
+                mut pending: Vec<(NodeId, RaftMsg<KvCommand>)>,
+                drop_node2_install: bool| {
+        let mut steps = 0;
+        while !pending.is_empty() {
+            steps += 1;
+            assert!(steps < 1000, "message exchange did not terminate");
+            let mut next = Vec::new();
+            for (to, msg) in pending {
+                let slot = if to == nid(1) {
+                    0
+                } else if to == nid(2) {
+                    if drop_node2_install && matches!(msg, RaftMsg::InstallSnapshot { .. }) {
+                        continue;
+                    }
+                    1
+                } else {
+                    continue;
+                };
+                let from = to.clone();
+                for (back_to, reply) in followers[slot].handle(nid(0), msg, now, 7) {
+                    assert_eq!(back_to, nid(0));
+                    next.extend(leader.handle(from.clone(), reply, now, 7));
+                }
+            }
+            pending = next;
+        }
+    };
+
+    // Both followers backtrack into the compacted prefix: the leader requests
+    // an on-demand image, which the driver then supplies.
+    let mut t = Nanos(now.0 + 1_000_000_000);
+    let pending = leader.tick(t, 7);
+    pump(&mut leader, &mut followers, pending, false);
+    assert!(leader.take_snapshot_needed(), "an image must be requested");
+    leader.set_snapshot_blob(image.clone());
+
+    // Node 1 installs the (single-chunk) image; node 2's chunk 0 is lost.
+    t = Nanos(t.0 + 1_000_000_000);
+    let pending = leader.tick(t, 7);
+    pump(&mut leader, &mut followers, pending, true);
+    assert_eq!(followers[0].snapshot_index(), leader.snapshot_index());
+    assert!(
+        leader.snapshot_transfer_peers().contains(&nid(2)),
+        "node 2's transfer is still in flight (sent, unacked)"
+    );
+    assert_eq!(leader.snapshot_chunk_progress(&nid(2)), None);
+
+    // Node 2's retry ships from the retained image: no rebuild request.
+    t = Nanos(t.0 + 1_000_000_000);
+    let pending = leader.tick(t, 7);
+    pump(&mut leader, &mut followers, pending, false);
+    assert!(
+        !leader.take_snapshot_needed(),
+        "node 1's completed install dropped the image node 2's transfer needed"
+    );
+    assert_eq!(followers[1].snapshot_index(), leader.snapshot_index());
+    let installed = followers[1]
+        .drain_pending_install()
+        .expect("node 2 installed an image");
+    assert_eq!(installed.1, image);
+    assert!(!leader.snapshot_transfer_in_flight());
+}

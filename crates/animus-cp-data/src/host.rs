@@ -1527,14 +1527,6 @@ impl<E: Env, S: StorageEngine + 'static> Reconciler<E, S> {
         self.state.host_order_seed = seed;
     }
 
-    /// A handle onto this reconciler's latest [`HostingRamp`] reading, for an
-    /// observer on another task (`/admin/health`). Updated at the end of every
-    /// [`tick`](Self::tick).
-    #[must_use]
-    pub fn ramp_gauge(&self) -> HostingRampGauge {
-        self.ramp.clone()
-    }
-
     /// Replace the gauge this reconciler publishes to with `gauge` (so the
     /// assembly can hand it a gauge it already shared with its observer).
     pub fn set_ramp_gauge(&mut self, gauge: HostingRampGauge) {

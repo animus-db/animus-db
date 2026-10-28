@@ -214,15 +214,10 @@ use animus_env::{NodeId, nid};
 use animus_tablet::TabletId;
 
 use super::sim_cluster::SimCluster;
-use super::sim_cluster_console::{create_table_via_wire, tablet_of_table};
+use super::sim_support::{
+    create_table_pk_via_wire as create_table, env_seed, poll_until, tablet_of_table,
+};
 use crate::config::NodeRole;
-
-fn env_seed(default: u64) -> u64 {
-    std::env::var("ANIMUS_SEED")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(default)
-}
 
 const PRIMARY_SEED_A: u64 = 0xC13E_0001;
 const OVER_SEEDS_A: [u64; 5] = [
@@ -510,47 +505,6 @@ const OVER_SEEDS_C: [u64; 5] = [
 /// a single table already suffices here, since `MAX_REPLICATION_FACTOR` is
 /// always the recorded *target*, not a point-in-time observation).
 const DATA_JOIN_TABLES: [&str; 3] = ["datajoin0", "datajoin1", "datajoin2"];
-
-/// One hash-key (`pk`, string) `CreateTable`, issued from `node` — mirrors
-/// every other `sim_cluster_*` module's identically-named helper (this
-/// crate's own "small fixtures duplicated per test module" convention;
-/// `sim_cluster_control_data_split.rs`/`sim_cluster_split_cluster.rs` carry
-/// the identical copy).
-fn create_table(cluster: &mut SimCluster, node: u64, table: &str) -> (u16, String) {
-    let body = format!(
-        r#"{{"TableName":"{table}",
-            "KeySchema":[{{"AttributeName":"pk","KeyType":"HASH"}}],
-            "AttributeDefinitions":[{{"AttributeName":"pk","AttributeType":"S"}}]}}"#
-    );
-    create_table_via_wire(cluster, node, &body)
-}
-
-/// Converged-or-timeout poll on `cond(cluster)` — the shared shape every
-/// `sim_cluster_*` module's own scenario-local convergence check uses
-/// (duplicated, not reached into, per this crate's own convention —
-/// `sim_cluster_control_data_split.rs`/`sim_cluster_split_cluster.rs` carry
-/// the identical copy).
-fn poll_until(
-    cluster: &mut SimCluster,
-    budget: Duration,
-    seed: u64,
-    what: &str,
-    mut cond: impl FnMut(&mut SimCluster) -> bool,
-) {
-    const STEP: Duration = Duration::from_millis(100);
-    let mut elapsed = Duration::ZERO;
-    loop {
-        if cond(cluster) {
-            return;
-        }
-        assert!(
-            elapsed < budget,
-            "seed={seed}: {what} never converged within {budget:?}"
-        );
-        cluster.run_for(STEP);
-        elapsed += STEP;
-    }
-}
 
 /// Retry a single-joiner forwarding proof (a `put`/`get` issued through the
 /// joined node, or against a pre-existing node reading back what the

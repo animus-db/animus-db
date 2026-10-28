@@ -206,18 +206,8 @@ use animus_env::nid;
 use animus_tablet::TabletId;
 
 use super::sim_cluster::SimCluster;
+use super::sim_support::{env_seed, json, leader_of_table, tablet_of_table};
 use crate::config::NodeRole;
-
-fn env_seed(default: u64) -> u64 {
-    std::env::var("ANIMUS_SEED")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(default)
-}
-
-fn json(body: &str) -> serde_json::Value {
-    serde_json::from_str(body).unwrap_or_else(|e| panic!("invalid JSON ({e}): {body}"))
-}
 
 /// A single-hash-key (`pk`, string), streamed `CreateTable` — mirrors every
 /// other `sim_cluster_*` module's identically-named helper, plus a
@@ -259,26 +249,6 @@ fn update_table_stream(
         format!(r#"{{"TableName":"{table}","StreamSpecification":{{"StreamEnabled":false}}}}"#)
     };
     cluster.dynamo(node, "DynamoDB_20120810.UpdateTable", body.as_bytes())
-}
-
-/// `table`'s own tablet id, resolved from the replicated catalog — every
-/// table in this module is created over the real wire, never via
-/// `SimCluster::create_table` itself, mirroring `sim_cluster_dynamo_
-/// streams.rs`'s own identically-named helper.
-fn tablet_of_table(cluster: &SimCluster, table: &str) -> TabletId {
-    *cluster
-        .metadata(0)
-        .tablets_for_table(table)
-        .next()
-        .unwrap_or_else(|| panic!("table `{table}` has no tablet"))
-        .0
-}
-
-fn leader_of_table(cluster: &SimCluster, table: &str) -> u64 {
-    let tablet = tablet_of_table(cluster, table);
-    cluster
-        .leader_index_of(tablet)
-        .unwrap_or_else(|| panic!("tablet {} has no leader", tablet.0))
 }
 
 /// The first sealed `(tablet, epoch)` row's own key, for `table`'s tablet —

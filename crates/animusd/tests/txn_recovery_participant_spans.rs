@@ -56,22 +56,14 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use animus_tablet::KeyRange;
-use animusd::{ClientRequest, ClientResponse, Node, read_frame};
+use animusd::{ClientRequest, ClientResponse, Node};
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
 
 mod support;
-
-async fn call(addr: SocketAddr, req: ClientRequest) -> ClientResponse {
-    let mut stream = animusd::connect_client(addr).await.expect("connect");
-    animusd::write_frame(&mut stream, &req).await.expect("send");
-    read_frame(&mut stream)
-        .await
-        .expect("read")
-        .expect("a reply")
-}
+use support::{call, put_until_ok};
 
 /// Mirrors `cp_txn.rs`'s identical helper: send `request` wrapped in
 /// `ClientRequest::Forwarded` directly — the shape `ClientCtx::cp_forward`
@@ -195,29 +187,6 @@ async fn bring_up(n: usize, dir: &std::path::Path) -> (Vec<Node>, animusd::Clust
         sleep(Duration::from_millis(50)).await;
     }
     panic!("could not bring up cluster after retries (ports kept getting stolen)");
-}
-
-async fn put_until_ok(addr: SocketAddr, table: &str, key: &[u8], value: &[u8]) {
-    timeout(Duration::from_secs(25), async {
-        loop {
-            match call(
-                addr,
-                ClientRequest::Put {
-                    key: key.to_vec(),
-                    value: value.to_vec(),
-                    table: table.to_string(),
-                },
-            )
-            .await
-            {
-                ClientResponse::PutOk => return,
-                ClientResponse::Error(_) => sleep(Duration::from_millis(150)).await,
-                other => panic!("unexpected put response: {other:?}"),
-            }
-        }
-    })
-    .await
-    .unwrap_or_else(|_| panic!("put {table}/{key:?} did not succeed in 25s"));
 }
 
 /// Mirrors `cp_txn.rs`'s identical helper.

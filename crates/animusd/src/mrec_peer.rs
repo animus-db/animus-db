@@ -243,14 +243,6 @@ impl MrecConfig {
         self
     }
 
-    /// Override the retention cap (tests; `cluster_settings` knob is M6).
-    #[must_use]
-    #[allow(dead_code)] // used by the sim tests
-    pub(crate) fn with_max_backlog(mut self, cap: Duration) -> Self {
-        self.max_backlog = cap;
-        self
-    }
-
     /// Whether any shipping is configured at all (a region and a peer).
     pub(crate) fn enabled(&self) -> bool {
         self.region.is_some() && !self.peers.is_empty()

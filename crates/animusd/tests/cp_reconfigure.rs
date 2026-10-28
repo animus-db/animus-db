@@ -28,12 +28,11 @@ use animusd::{
     ClientRequest, ClientResponse, ClusterConfig, MetaCommand, Node, NodeStatus, RoleAddrs,
     bind_cluster, read_frame, start_cluster,
 };
-use serde_json::Value;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
 
 mod support;
+use support::admin_get;
 
 const BOOTSTRAP_TABLET: TabletId = TabletId(1);
 
@@ -93,28 +92,6 @@ async fn data_node_failure_is_detected() {
 }
 
 // ---- Test 2: CP group follows the replicated replica set --------------------
-
-async fn admin_get(addr: SocketAddr, path: &str) -> (u16, Value) {
-    let mut stream = TcpStream::connect(addr).await.expect("connect to admin");
-    let request = format!("GET {path} HTTP/1.0\r\nHost: animus\r\nConnection: close\r\n\r\n");
-    stream
-        .write_all(request.as_bytes())
-        .await
-        .expect("send request");
-    stream.flush().await.expect("flush");
-    let mut raw = Vec::new();
-    stream.read_to_end(&mut raw).await.expect("read response");
-    let text = String::from_utf8(raw).expect("utf8 response");
-    let (head, payload) = text.split_once("\r\n\r\n").expect("response has a body");
-    let status: u16 = head
-        .lines()
-        .next()
-        .and_then(|line| line.split_whitespace().nth(1))
-        .and_then(|code| code.parse().ok())
-        .expect("status line");
-    let value: Value = serde_json::from_str(payload).expect("admin body is JSON");
-    (status, value)
-}
 
 /// The local group's `(is_leader, voters)` for the bootstrap tablet, from this
 /// node's node-local admin view (per-process: one group per node).

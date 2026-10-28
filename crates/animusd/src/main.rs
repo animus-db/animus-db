@@ -349,7 +349,7 @@ fn otel_instance_label(args: &[String]) -> String {
 const USAGE: &str = "usage:\n  \
     animusd gen-config --nodes N [--host H] [--base-port P] [--region NAME] [--peer REGION=host:port[,..]]... [--allow-insecure-peers] [--mrec-max-clock-skew-ms MS]\n  \
     animusd gen-config --control-nodes N --data-nodes M [--host H] [--base-port P]\n  \
-    animusd --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3] [--quiesce-after SECS] [--heartbeat-batch|--no-heartbeat-batch] [--shared-wal|--no-shared-wal] [--throttle-read-units N] [--throttle-write-units N] [--max-region-rtt-ms MS] [--campaign-max-inflight N] [--lag-stretch-max N] [--host-unsettled-max N] [--host-settle-timeout-ms MS] [--node-weight N] [--node-max-replicas N] [--cores N] [--awake-max-per-core N] [--bg-snapshot-streams N] [--bg-catchup-learners N] [--bg-splits N] [--bg-compactions N] [--compaction-io-bytes-per-sec N] [--region NAME] [--peer REGION=host:port[,host:port...]]... [--allow-insecure-peers] [--mrec-max-clock-skew-ms MS] [--dynamo-auth PATH] [--tls-cert PATH --tls-key PATH --tls-ca PATH] [--encryption-key PATH] [--max-connections N] [--max-inflight N] [--queued-bytes-budget BYTES]\n  \
+    animusd --config FILE --node I [--dir DIR] [--ephemeral] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3] [--quiesce-after SECS] [--heartbeat-batch|--no-heartbeat-batch] [--shared-wal|--no-shared-wal] [--throttle-read-units N] [--throttle-write-units N] [--max-region-rtt-ms MS] [--campaign-max-inflight N] [--lag-stretch-max N] [--host-unsettled-max N] [--host-settle-timeout-ms MS] [--node-weight N] [--node-max-replicas N] [--cores N] [--awake-max-per-core N] [--bg-snapshot-streams N] [--bg-catchup-learners N] [--bg-splits N] [--bg-compactions N] [--compaction-io-bytes-per-sec N] [--memtable-budget-bytes N] [--region NAME] [--peer REGION=host:port[,host:port...]]... [--allow-insecure-peers] [--mrec-max-clock-skew-ms MS] [--dynamo-auth PATH] [--tls-cert PATH --tls-key PATH --tls-ca PATH] [--encryption-key PATH] [--max-connections N] [--max-inflight N] [--queued-bytes-budget BYTES]\n  \
     animusd --cluster N [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--auto-split-ops-rate RATE] [--orphan-sweep-after SECS] [--stream-seal-bytes B] [--stream-seal-age SECS] [--stream-retention SECS] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3] [--quiesce-after SECS] [--heartbeat-batch|--no-heartbeat-batch] [--shared-wal|--no-shared-wal] [--throttle-read-units N] [--throttle-write-units N] [--dynamo-auth PATH] [--encryption-key PATH]\n  \
     animusd --cluster-control N --cluster-data M [--dir DIR] [--ip ADDR] [--ephemeral] [--auto-split-bytes B] [--auto-split-change-rate RATE] [--auto-split-ops-rate RATE] [--orphan-sweep-after SECS] [--quiesce-after SECS] [--heartbeat-batch|--no-heartbeat-batch] [--shared-wal|--no-shared-wal] [--dynamo-auth PATH]\n  \
     animusd join --seed ADDR[,ADDR...] [--id NAME] --base-port P [--ip A] [--dir D] [--ephemeral] [--advertise-host NAME] [--label K=V]... [--labels-file PATH [--labels-file-annotations]] [--labels-wait-secs N] [--encryption-key PATH] [--quiesce-after SECS] [--heartbeat-batch|--no-heartbeat-batch] [--shared-wal|--no-shared-wal] [--segment-store dir:PATH|s3://...] [--backup-store cluster|fs:PATH|s3://...] [--s3-credentials PATH] [--allow-insecure-s3]\n  \
@@ -611,6 +611,8 @@ async fn run(args: &[String]) -> Result<(), String> {
     let mut bg_compactions: Option<usize> = None;
     // ADR 0081: the node-wide compaction write budget; same reach and rule.
     let mut bg_compaction_io_bytes_per_sec: Option<u64> = None;
+    // Issue #1389: the node-wide memtable budget sizing each engine's flush.
+    let mut memtable_budget_bytes: Option<u64> = None;
     // ADR 0079 step 6: control-leader repair pacing; same reach and conflict rule.
     let mut repair_proposals_per_tick: Option<usize> = None;
     let mut repair_inflight_max: Option<usize> = None;
@@ -813,6 +815,9 @@ async fn run(args: &[String]) -> Result<(), String> {
                 bg_compaction_io_bytes_per_sec =
                     Some(parse_next(&mut it, "--compaction-io-bytes-per-sec")?);
             }
+            "--memtable-budget-bytes" => {
+                memtable_budget_bytes = Some(parse_next(&mut it, "--memtable-budget-bytes")?);
+            }
             "--repair-proposals-per-tick" => {
                 repair_proposals_per_tick =
                     Some(parse_next(&mut it, "--repair-proposals-per-tick")?);
@@ -921,6 +926,7 @@ async fn run(args: &[String]) -> Result<(), String> {
         bg_splits,
         bg_compactions,
         bg_compaction_io_bytes_per_sec,
+        memtable_budget_bytes,
         repair_proposals_per_tick,
         repair_inflight_max,
     };
@@ -995,13 +1001,14 @@ async fn run(args: &[String]) -> Result<(), String> {
         || bg_splits.is_some()
         || bg_compactions.is_some()
         || bg_compaction_io_bytes_per_sec.is_some()
+        || memtable_budget_bytes.is_some()
         || repair_proposals_per_tick.is_some()
         || repair_inflight_max.is_some())
         && config_path.is_none()
     {
         return Err(
             "--bg-snapshot-streams/--bg-catchup-learners/--bg-splits/--bg-compactions/\
-             --compaction-io-bytes-per-sec/--repair-proposals-per-tick/--repair-inflight-max are only \
+             --compaction-io-bytes-per-sec/--memtable-budget-bytes/--repair-proposals-per-tick/--repair-inflight-max are only \
              supported with --config/--node (set the matching cluster_settings keys in the \
              config file for the other shapes)"
                 .into(),
@@ -1853,6 +1860,34 @@ fn load_dynamo_auth_file(path: &str) -> Result<animusd::DynamoAuthConfig, String
     Ok(cfg)
 }
 
+/// The one "flag and config both set it" rule: a flag value (`flag`) is
+/// stored into `slot` when the config left it unset, is a no-op when the flag
+/// is absent, and is a hard error (`conflict()`'s message, so each call site
+/// keeps its own wording) when both sides set it — no silent precedence.
+fn set_once<T>(
+    slot: &mut Option<T>,
+    flag: Option<T>,
+    conflict: impl FnOnce() -> String,
+) -> Result<(), String> {
+    match (slot.is_some(), flag) {
+        (true, Some(_)) => Err(conflict()),
+        (false, Some(v)) => {
+            *slot = Some(v);
+            Ok(())
+        }
+        (_, None) => Ok(()),
+    }
+}
+
+/// `config.nodes[index]`, or the "out of range" message every per-node flag
+/// merge shares.
+fn node_entry(config: &mut ClusterConfig, index: usize) -> Result<&mut animusd::RoleAddrs, String> {
+    config
+        .nodes
+        .get_mut(index)
+        .ok_or_else(|| format!("node index {index} out of range"))
+}
+
 /// Merge a `--dynamo-auth PATH` flag into a loaded [`ClusterConfig`] (ADR
 /// 0057): if the config file's own `dynamo_auth` section is also present,
 /// that is a hard startup error — no silent precedence between the two
@@ -1862,18 +1897,11 @@ fn apply_dynamo_auth_flag(
     config: &mut ClusterConfig,
     flag: Option<animusd::DynamoAuthConfig>,
 ) -> Result<(), String> {
-    match (&config.dynamo_auth, flag) {
-        (Some(_), Some(_)) => Err(
-            "dynamo_auth is set both in the config file and via --dynamo-auth — specify it \
-             one way, not both"
-                .to_string(),
-        ),
-        (None, Some(flag)) => {
-            config.dynamo_auth = Some(flag);
-            Ok(())
-        }
-        (_, None) => Ok(()),
-    }
+    set_once(&mut config.dynamo_auth, flag, || {
+        "dynamo_auth is set both in the config file and via --dynamo-auth — specify it \
+         one way, not both"
+            .to_string()
+    })
 }
 
 /// Parse `--tls-cert PATH --tls-key PATH --tls-ca PATH` (ADR 0064, S-01
@@ -1938,10 +1966,7 @@ fn apply_overload_flag(
     flag: Option<animusd::config::OverloadSection>,
 ) -> Result<(), String> {
     let Some(flag) = flag else { return Ok(()) };
-    let entry = config
-        .nodes
-        .get_mut(index)
-        .ok_or_else(|| format!("node index {index} out of range"))?;
+    let entry = node_entry(config, index)?;
     let merged = entry.overload.get_or_insert_with(Default::default);
     for (name, file, cli) in [
         (
@@ -1955,28 +1980,23 @@ fn apply_overload_flag(
             flag.max_inflight_requests,
         ),
     ] {
-        match (*file, cli) {
-            (Some(_), Some(_)) => {
-                return Err(format!(
-                    "node {index}'s overload.{name} is set both in the config file and via a \
-                     flag — specify it one way, not both"
-                ));
-            }
-            (None, Some(v)) => *file = Some(v),
-            _ => {}
-        }
+        set_once(file, cli, || {
+            format!(
+                "node {index}'s overload.{name} is set both in the config file and via a \
+                 flag — specify it one way, not both"
+            )
+        })?;
     }
-    match (merged.queued_bytes_budget, flag.queued_bytes_budget) {
-        (Some(_), Some(_)) => {
-            return Err(format!(
+    set_once(
+        &mut merged.queued_bytes_budget,
+        flag.queued_bytes_budget,
+        || {
+            format!(
                 "node {index}'s overload.queued_bytes_budget is set both in the config file and \
                  via a flag — specify it one way, not both"
-            ));
-        }
-        (None, Some(v)) => merged.queued_bytes_budget = Some(v),
-        _ => {}
-    }
-    Ok(())
+            )
+        },
+    )
 }
 
 /// Apply a parsed `--tls-*` flag (ADR 0064, S-01 commit 2) onto
@@ -2000,21 +2020,13 @@ fn apply_tls_flag(
     index: usize,
     flag: Option<TlsSection>,
 ) -> Result<(), String> {
-    let entry = config
-        .nodes
-        .get_mut(index)
-        .ok_or_else(|| format!("node index {index} out of range"))?;
-    match (&entry.tls, flag) {
-        (Some(_), Some(_)) => Err(format!(
+    let entry = node_entry(config, index)?;
+    set_once(&mut entry.tls, flag, || {
+        format!(
             "node {index}'s tls section is set both in the config file and via --tls-* — \
              specify it one way, not both"
-        )),
-        (None, Some(flag)) => {
-            entry.tls = Some(flag);
-            Ok(())
-        }
-        (_, None) => Ok(()),
-    }
+        )
+    })
 }
 
 /// Merge `--encryption-key PATH` (ADR 0069, S-03 PR 1) onto
@@ -2025,21 +2037,13 @@ fn apply_encryption_key_flag(
     index: usize,
     flag: Option<String>,
 ) -> Result<(), String> {
-    let entry = config
-        .nodes
-        .get_mut(index)
-        .ok_or_else(|| format!("node index {index} out of range"))?;
-    match (&entry.encryption_key_path, flag) {
-        (Some(_), Some(_)) => Err(format!(
+    let entry = node_entry(config, index)?;
+    set_once(&mut entry.encryption_key_path, flag, || {
+        format!(
             "node {index}'s encryption_key_path is set both in the config file and via \
              --encryption-key — specify it one way, not both"
-        )),
-        (None, Some(flag)) => {
-            entry.encryption_key_path = Some(flag);
-            Ok(())
-        }
-        (_, None) => Ok(()),
-    }
+        )
+    })
 }
 
 /// The URL scheme a startup banner should print for a port this node bound
@@ -2065,21 +2069,13 @@ fn apply_advertise_host_flag(
     index: usize,
     flag: Option<String>,
 ) -> Result<(), String> {
-    let entry = config
-        .nodes
-        .get_mut(index)
-        .ok_or_else(|| format!("node index {index} out of range"))?;
-    match (&entry.advertise_host, flag) {
-        (Some(_), Some(_)) => Err(format!(
+    let entry = node_entry(config, index)?;
+    set_once(&mut entry.advertise_host, flag, || {
+        format!(
             "node {index}'s advertise_host is set both in the config file and via \
              --advertise-host — specify it one way, not both"
-        )),
-        (None, Some(flag)) => {
-            entry.advertise_host = Some(flag);
-            Ok(())
-        }
-        (_, None) => Ok(()),
-    }
+        )
+    })
 }
 
 /// G-01 stage G-a: resolve this process's own node labels — the config
@@ -2092,10 +2088,7 @@ async fn apply_label_flags(
     index: usize,
     flags: &animusd::node_labels::LabelFlags,
 ) -> Result<(), String> {
-    let entry = config
-        .nodes
-        .get_mut(index)
-        .ok_or_else(|| format!("node index {index} out of range"))?;
+    let entry = node_entry(config, index)?;
     entry.labels = flags.resolve(&entry.labels).await?;
     Ok(())
 }
@@ -2126,17 +2119,14 @@ fn resolve_cluster_settings(
     let mut effective = config_settings.clone();
     macro_rules! merge_field {
         ($field:ident, $flag_name:literal) => {
-            if let Some(v) = cli.$field {
-                if config_settings.$field.is_some() {
-                    return Err(format!(
-                        "cluster_settings.{} is set both in the config file and via {} — \
-                         specify it one way, not both",
-                        stringify!($field),
-                        $flag_name
-                    ));
-                }
-                effective.$field = Some(v);
-            }
+            set_once(&mut effective.$field, cli.$field, || {
+                format!(
+                    "cluster_settings.{} is set both in the config file and via {} — \
+                     specify it one way, not both",
+                    stringify!($field),
+                    $flag_name
+                )
+            })?;
         };
     }
     merge_field!(auto_split_bytes, "--auto-split-bytes");
@@ -2170,20 +2160,16 @@ fn resolve_cluster_settings(
         bg_compaction_io_bytes_per_sec,
         "--compaction-io-bytes-per-sec"
     );
+    merge_field!(memtable_budget_bytes, "--memtable-budget-bytes");
     merge_field!(repair_proposals_per_tick, "--repair-proposals-per-tick");
     merge_field!(repair_inflight_max, "--repair-inflight-max");
     merge_field!(allow_insecure_peers, "--allow-insecure-peers");
     merge_field!(mrec_max_clock_skew_ms, "--mrec-max-clock-skew-ms");
-    if let Some(r) = &cli.region {
-        if config_settings.region.is_some() {
-            return Err(
-                "cluster_settings.region is set both in the config file and via \
-                        --region — specify it one way, not both"
-                    .into(),
-            );
-        }
-        effective.region = Some(r.clone());
-    }
+    set_once(&mut effective.region, cli.region.clone(), || {
+        "cluster_settings.region is set both in the config file and via \
+         --region — specify it one way, not both"
+            .into()
+    })?;
     // `--peer` adds to the config file's list; a region named on both sides
     // surfaces as `validate_mrec`'s duplicate-region error.
     effective.peers.extend(cli.peers.iter().cloned());
@@ -2314,6 +2300,7 @@ async fn run_single(
         || settings.bg_splits.is_some()
         || settings.bg_compactions.is_some()
         || settings.bg_compaction_io_bytes_per_sec.is_some()
+        || settings.memtable_budget_bytes.is_some()
         || settings.repair_proposals_per_tick.is_some()
         || settings.repair_inflight_max.is_some()
     {
@@ -2323,6 +2310,7 @@ async fn run_single(
         cs.bg_splits = settings.bg_splits;
         cs.bg_compactions = settings.bg_compactions;
         cs.bg_compaction_io_bytes_per_sec = settings.bg_compaction_io_bytes_per_sec;
+        cs.memtable_budget_bytes = settings.memtable_budget_bytes;
         cs.repair_proposals_per_tick = settings.repair_proposals_per_tick;
         cs.repair_inflight_max = settings.repair_inflight_max;
     }
@@ -4255,6 +4243,124 @@ mod tests {
             return;
         }
         assert!(resolve_s3_credentials(None).expect("no error").is_none());
+    }
+
+    // --- `set_once` and its call sites ------------------------------------
+
+    #[test]
+    fn set_once_stores_only_when_the_slot_is_unset() {
+        let mut slot: Option<u32> = None;
+        set_once(&mut slot, None, || unreachable!()).unwrap();
+        assert_eq!(slot, None);
+        set_once(&mut slot, Some(1), || unreachable!()).unwrap();
+        assert_eq!(slot, Some(1));
+        set_once(&mut slot, None, || unreachable!()).unwrap();
+        assert_eq!(slot, Some(1));
+        let err = set_once(&mut slot, Some(2), || "clash".to_string()).unwrap_err();
+        assert_eq!(err, "clash");
+        assert_eq!(slot, Some(1), "a conflict leaves the config's value alone");
+    }
+
+    #[test]
+    fn dynamo_auth_flag_conflicts_with_a_config_supplied_section() {
+        let auth = || animusd::DynamoAuthConfig {
+            credentials: [("k".to_string(), "s".to_string())].into(),
+        };
+        let mut config = ClusterConfig::generate(1, "127.0.0.1".parse().unwrap(), 7000);
+        apply_dynamo_auth_flag(&mut config, None).unwrap();
+        assert!(config.dynamo_auth.is_none());
+        apply_dynamo_auth_flag(&mut config, Some(auth())).unwrap();
+        assert!(config.dynamo_auth.is_some());
+        let err = apply_dynamo_auth_flag(&mut config, Some(auth())).unwrap_err();
+        assert_eq!(
+            err,
+            "dynamo_auth is set both in the config file and via --dynamo-auth — specify it \
+             one way, not both"
+        );
+    }
+
+    #[test]
+    fn advertise_host_flag_conflicts_with_a_config_supplied_value() {
+        let mut config = ClusterConfig::generate(1, "127.0.0.1".parse().unwrap(), 7000);
+        apply_advertise_host_flag(&mut config, 0, Some("a".into())).unwrap();
+        assert_eq!(config.nodes[0].advertise_host.as_deref(), Some("a"));
+        let err = apply_advertise_host_flag(&mut config, 0, Some("b".into())).unwrap_err();
+        assert_eq!(
+            err,
+            "node 0's advertise_host is set both in the config file and via \
+             --advertise-host — specify it one way, not both"
+        );
+        let err = apply_advertise_host_flag(&mut config, 3, Some("b".into())).unwrap_err();
+        assert_eq!(err, "node index 3 out of range");
+    }
+
+    #[test]
+    fn overload_flag_conflicts_are_reported_per_field_in_order() {
+        let section = |c, i, q| animusd::config::OverloadSection {
+            max_connections: c,
+            max_inflight_requests: i,
+            queued_bytes_budget: q,
+            ..Default::default()
+        };
+        // Disjoint fields merge.
+        let mut config = ClusterConfig::generate(1, "127.0.0.1".parse().unwrap(), 7000);
+        config.nodes[0].overload = Some(section(Some(5), None, None));
+        apply_overload_flag(&mut config, 0, Some(section(None, Some(6), Some(7)))).unwrap();
+        let merged = config.nodes[0].overload.clone().unwrap();
+        assert_eq!(
+            (
+                merged.max_connections,
+                merged.max_inflight_requests,
+                merged.queued_bytes_budget
+            ),
+            (Some(5), Some(6), Some(7))
+        );
+        // Each field names itself; max_connections is reported before the
+        // later ones when several clash.
+        for (file, flag, name) in [
+            (
+                section(Some(1), Some(1), Some(1)),
+                section(Some(2), Some(2), Some(2)),
+                "max_connections",
+            ),
+            (
+                section(None, Some(1), Some(1)),
+                section(None, Some(2), Some(2)),
+                "max_inflight_requests",
+            ),
+            (
+                section(None, None, Some(1)),
+                section(None, None, Some(2)),
+                "queued_bytes_budget",
+            ),
+        ] {
+            let mut config = ClusterConfig::generate(1, "127.0.0.1".parse().unwrap(), 7000);
+            config.nodes[0].overload = Some(file);
+            let err = apply_overload_flag(&mut config, 0, Some(flag)).unwrap_err();
+            assert!(
+                err.contains(&format!("node 0's overload.{name} is set both")),
+                "{err}"
+            );
+            assert!(err.contains("one way, not both"), "{err}");
+        }
+    }
+
+    #[test]
+    fn cluster_settings_region_on_both_sides_is_a_hard_error() {
+        let config = animusd::config::ClusterSettings {
+            region: Some("eu".into()),
+            ..Default::default()
+        };
+        let cli = animusd::config::ClusterSettings {
+            region: Some("us".into()),
+            ..Default::default()
+        };
+        let err = resolve_cluster_settings(Some(&config), &cli).unwrap_err();
+        assert_eq!(
+            err,
+            "cluster_settings.region is set both in the config file and via --region — \
+             specify it one way, not both"
+        );
     }
 
     // --- `resolve_cluster_settings` (S-06) --------------------------------

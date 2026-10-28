@@ -1461,6 +1461,20 @@ impl SimClusterHandle {
         (groups.len(), quiesced)
     }
 
+    /// Issue #1389: `(hosted LSM groups, groups with a non-empty memtable,
+    /// total memtable bytes)` on `node`, a pure local read.
+    pub(crate) fn lsm_memtable_totals(&self, node: u64) -> (usize, usize, usize) {
+        let (mut groups, mut dirty, mut bytes) = (0, 0, 0);
+        for (_, g) in self.ctx(node).edge.hosted_groups() {
+            if let Some((_, b)) = g.lsm_memtable() {
+                groups += 1;
+                dirty += usize::from(b > 0);
+                bytes += b;
+            }
+        }
+        (groups, dirty, bytes)
+    }
+
     /// Each CP group `node` hosts as `(tablet, believes it leads, term)`: a
     /// pure local read (no virtual time), for C-17 Tier 2's election
     /// metrics (ADR 0078).
@@ -3968,6 +3982,11 @@ impl SimCluster {
             "{what}: replicas never caught up to their tablet's commit index (seed={}): {last}",
             self.seed()
         );
+    }
+
+    /// [`SimClusterHandle::lsm_memtable_totals`]'s driver-callable twin.
+    pub(crate) fn lsm_memtable_totals(&self, node: u64) -> (usize, usize, usize) {
+        self.shared.lsm_memtable_totals(node)
     }
 
     /// [`SimClusterHandle::quiesced_counts`]'s driver-callable twin

@@ -47,11 +47,11 @@ use animusd::{
     StorageBackend, StreamSealKnobs, read_frame, write_frame,
 };
 use serde_json::Value;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
 
 mod support;
+use support::{admin, dynamo, field, kickoff_tablet, sole_tablet_of};
 
 /// Bring up an `n`-node cluster, one process-shaped node per index (real
 /// TCP, real ports — `support::free_addrs`' bind-then-drop TOCTOU-retry
@@ -125,33 +125,6 @@ async fn bring_up_inplace(
     );
 }
 
-/// One HTTP/1.0 request to the admin endpoint; returns `(status, parsed JSON)`.
-async fn admin(addr: SocketAddr, method: &str, path: &str, body: Option<&str>) -> (u16, Value) {
-    let mut stream = TcpStream::connect(addr).await.expect("connect to admin");
-    let body = body.unwrap_or("");
-    let request = format!(
-        "{method} {path} HTTP/1.0\r\nHost: animus\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len(),
-    );
-    stream
-        .write_all(request.as_bytes())
-        .await
-        .expect("send request");
-    stream.flush().await.expect("flush");
-    let mut raw = Vec::new();
-    stream.read_to_end(&mut raw).await.expect("read response");
-    let text = String::from_utf8(raw).expect("utf8 response");
-    let (head, payload) = text.split_once("\r\n\r\n").expect("response has a body");
-    let status: u16 = head
-        .lines()
-        .next()
-        .and_then(|line| line.split_whitespace().nth(1))
-        .and_then(|code| code.parse().ok())
-        .expect("status line");
-    let json: Value = serde_json::from_str(payload.trim()).unwrap_or(Value::Null);
-    (status, json)
-}
-
 /// A `put` through the plain client protocol with a bounded retry on ANY
 /// error reply — a put is idempotent, and both early-cluster transients AND
 /// an in-place split's own (expected near-zero, ADR 0058's "Stale routing")
@@ -207,41 +180,6 @@ async fn get(stream: &mut TcpStream, key: Vec<u8>) -> Option<Vec<u8>> {
             other => panic!("get failed: {other:?}"),
         }
     }
-}
-
-/// The single tablet id currently serving `table` (asserts exactly one —
-/// callers use this before any split).
-fn sole_tablet_of(node: &Node, table: &str) -> u64 {
-    let meta = node.metadata();
-    let ids: Vec<u64> = meta
-        .tablets
-        .iter()
-        .filter(|(_, t)| t.table.as_deref() == Some(table))
-        .map(|(id, _)| id.0)
-        .collect();
-    assert_eq!(
-        ids.len(),
-        1,
-        "expected exactly one tablet of {table}: {ids:?}"
-    );
-    ids[0]
-}
-
-/// Kick off an **in-place** split of `tablet` at `split_key` via `node`'s
-/// admin surface — the `POST /admin/tablet/split` endpoint, which now
-/// always proposes `MetaCommand::BeginSplitInPlace` (`ClientCtx::
-/// trigger_split`'s only workflow since Layer B1).
-async fn kickoff_tablet(node: &Node, tablet: u64, split_key: &str) {
-    let (status, body) = admin(
-        node.admin_addr(),
-        "POST",
-        "/admin/tablet/split",
-        Some(&format!(
-            "{{\"tablet\":{tablet},\"split_key\":\"{split_key}\"}}"
-        )),
-    )
-    .await;
-    assert_eq!(status, 200, "kickoff of tablet {tablet} failed: {body}");
 }
 
 /// Poll `/admin/status` until `table`'s split of `parent` has cut over
@@ -464,55 +402,6 @@ async fn inplace_split_survives_a_paced_continuous_writer_across_fork_and_cutove
     })
     .await
     .expect("test timed out");
-}
-
-/// `field()`: extract a top-level `"name":"..."` string field from a raw
-/// JSON response body by substring search — the same tiny, deliberately
-/// non-structural helper `dynamo_streams.rs`/`streams_e2e.rs` each keep
-/// their own copy of (this crate's own stated "small fixtures are
-/// duplicated, not shared" convention).
-fn field(body: &str, name: &str) -> String {
-    let needle = format!("\"{name}\":\"");
-    let start = body
-        .find(&needle)
-        .unwrap_or_else(|| panic!("field `{name}` not found in: {body}"))
-        + needle.len();
-    let end = body[start..].find('"').expect("closing quote") + start;
-    body[start..end].to_owned()
-}
-
-async fn dynamo(addr: SocketAddr, target: &str, body: &str) -> (u16, String) {
-    let mut stream = TcpStream::connect(addr).await.expect("connect to dynamo");
-    let request = format!(
-        "POST / HTTP/1.1\r\n\
-         Host: animus\r\n\
-         X-Amz-Target: {target}\r\n\
-         Content-Type: application/x-amz-json-1.0\r\n\
-         Content-Length: {}\r\n\
-         Connection: close\r\n\
-         \r\n\
-         {body}",
-        body.len(),
-    );
-    stream
-        .write_all(request.as_bytes())
-        .await
-        .expect("send request");
-    stream.flush().await.expect("flush");
-    let mut raw = Vec::new();
-    stream
-        .read_to_end(&mut raw)
-        .await
-        .expect("read full response");
-    let text = String::from_utf8(raw).expect("utf8 response");
-    let (head, payload) = text.split_once("\r\n\r\n").expect("response has a body");
-    let status: u16 = head
-        .lines()
-        .next()
-        .and_then(|line| line.split_whitespace().nth(1))
-        .and_then(|code| code.parse().ok())
-        .expect("status line");
-    (status, payload.to_string())
 }
 
 /// [`dynamo`], retried on a transient 500 — the identical rationale

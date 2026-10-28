@@ -20,6 +20,7 @@ use std::time::Duration;
 
 use super::sim_cluster::{SimCluster, SimOverload};
 use super::sim_cluster_lsm::SimStall;
+use super::sim_support::error_type_lenient as error_type;
 use animus_cp_data::admission::BacklogLimits;
 use animus_storage::{LsmOptions, StallFault};
 
@@ -36,13 +37,6 @@ fn seeds() -> Vec<u64> {
         .unwrap_or(1)
         .max(1);
     (0..k).map(|i| 0x0081_2000 + i).collect()
-}
-
-fn error_type(body: &str) -> String {
-    serde_json::from_str::<serde_json::Value>(body)
-        .ok()
-        .and_then(|j| j["__type"].as_str().map(str::to_owned))
-        .unwrap_or_default()
 }
 
 fn put_body(id: &str) -> String {

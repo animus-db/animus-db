@@ -119,6 +119,10 @@ impl BgPool {
     }
 }
 
+/// Default `--memtable-budget-bytes` (issue #1389): 256 MiB per node.
+pub const DEFAULT_MEMTABLE_BUDGET_BYTES: u64 =
+    animus_storage::DEFAULT_NODE_MEMTABLE_BUDGET_BYTES as u64;
+
 /// The resolved pool sizes; `None` = the pool is off (unbounded).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BudgetSizes {
@@ -135,6 +139,9 @@ pub struct BudgetSizes {
     /// ADR 0081 decision 3: the node-wide compaction write budget in bytes/s;
     /// `0` is **off** (the default), never derived from CPU or disk.
     pub compaction_io_bytes_per_sec: u64,
+    /// Issue #1389: the node-wide memtable budget in bytes that sizes each
+    /// engine's flush threshold; `0` is **off** (fixed per-engine threshold).
+    pub memtable_budget_bytes: u64,
 }
 
 impl BudgetSizes {
@@ -166,6 +173,7 @@ impl BudgetSizes {
                 None => cores.map(|c| (c / 2).max(1)),
             },
             compaction_io_bytes_per_sec: 0,
+            memtable_budget_bytes: DEFAULT_MEMTABLE_BUDGET_BYTES,
         }
     }
 
@@ -174,6 +182,14 @@ impl BudgetSizes {
     #[must_use]
     pub const fn with_compaction_io(mut self, bytes_per_sec: u64) -> Self {
         self.compaction_io_bytes_per_sec = bytes_per_sec;
+        self
+    }
+
+    /// Set the node memtable budget (`--memtable-budget-bytes`, issue #1389);
+    /// `0` turns the adaptive flush off.
+    #[must_use]
+    pub const fn with_memtable_budget(mut self, bytes: u64) -> Self {
+        self.memtable_budget_bytes = bytes;
         self
     }
 
@@ -187,6 +203,7 @@ impl BudgetSizes {
             splits: None,
             compactions: None,
             compaction_io_bytes_per_sec: 0,
+            memtable_budget_bytes: 0,
         }
     }
 
@@ -272,6 +289,8 @@ impl State {
 struct Shared {
     state: Mutex<State>,
     metrics: MetricsHandle,
+    /// Issue #1389: the node memtable budget, if on.
+    flush: Option<animus_storage::FlushBudget>,
 }
 
 impl Shared {
@@ -396,8 +415,20 @@ impl BackgroundBudget {
                     io: crate::compaction_io::IoBucket::new(sizes.compaction_io_bytes_per_sec),
                 }),
                 metrics,
+                flush: (sizes.memtable_budget_bytes > 0).then(|| {
+                    animus_storage::FlushBudget::production(
+                        usize::try_from(sizes.memtable_budget_bytes).unwrap_or(usize::MAX),
+                    )
+                }),
             }),
         }
+    }
+
+    /// The node's memtable budget (issue #1389), `None` when off. Each tablet
+    /// engine joins it via `LsmEngine::set_flush_budget`.
+    #[must_use]
+    pub fn flush_budget(&self) -> Option<animus_storage::FlushBudget> {
+        self.shared.flush.clone()
     }
 
     /// Feed the node's smoothed scheduling lag (nanoseconds), from the
@@ -1182,6 +1213,19 @@ mod tests {
         BackgroundBudget::new(sizes, MetricsHandle::recording())
     }
 
+    #[test]
+    fn memtable_budget_is_on_by_default_shared_per_node_and_off_at_zero() {
+        let on = budget(BudgetSizes::resolve(None, None, None, None, None));
+        let fb = on.flush_budget().expect("default on");
+        assert_eq!(fb.budget() as u64, DEFAULT_MEMTABLE_BUDGET_BYTES);
+        // Clones of the node budget share one FlushBudget.
+        on.clone().flush_budget().unwrap().set_budget(1 << 20);
+        assert_eq!(fb.budget(), 1 << 20);
+        assert!(budget(BudgetSizes::off()).flush_budget().is_none());
+        let zero = BudgetSizes::resolve(None, None, None, None, None).with_memtable_budget(0);
+        assert!(budget(zero).flush_budget().is_none());
+    }
+
     fn one(pool: BgPool, n: usize) -> BudgetSizes {
         let mut s = BudgetSizes::off();
         match pool {
@@ -1211,7 +1255,8 @@ mod tests {
             Some(4)
         );
         // An explicit flag wins over cores; 0 turns a pool off.
-        let s = BudgetSizes::resolve(Some(0), Some(0), Some(0), Some(0), Some(8));
+        let s = BudgetSizes::resolve(Some(0), Some(0), Some(0), Some(0), Some(8))
+            .with_memtable_budget(0);
         assert_eq!(s, BudgetSizes::off());
         assert_eq!(
             BudgetSizes::resolve(None, None, None, Some(3), Some(8)).compactions,

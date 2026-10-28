@@ -47,6 +47,7 @@ use tokio::net::TcpStream;
 use tokio::time::sleep;
 
 mod support;
+use support::{create_table, dynamo};
 
 // ---------------------------------------------------------------------------
 // Shared bring-up + protocol helpers (mirrors dynamo_throttling.rs /
@@ -160,41 +161,6 @@ async fn await_cluster_bootstrap(nodes: &[animusd::Node]) {
     .expect("cluster did not bootstrap within 30s");
 }
 
-/// One DynamoDB request over a fresh HTTP/1.1 connection → `(status, body)`.
-async fn dynamo(addr: SocketAddr, target: &str, body: &str) -> (u16, String) {
-    let mut stream = TcpStream::connect(addr).await.expect("connect to dynamo");
-    let request = format!(
-        "POST / HTTP/1.1\r\n\
-         Host: animus\r\n\
-         X-Amz-Target: {target}\r\n\
-         Content-Type: application/x-amz-json-1.0\r\n\
-         Content-Length: {}\r\n\
-         Connection: close\r\n\
-         \r\n\
-         {body}",
-        body.len(),
-    );
-    stream
-        .write_all(request.as_bytes())
-        .await
-        .expect("send request");
-    stream.flush().await.expect("flush");
-    let mut raw = Vec::new();
-    stream
-        .read_to_end(&mut raw)
-        .await
-        .expect("read full response");
-    let text = String::from_utf8(raw).expect("utf8 response");
-    let (head, payload) = text.split_once("\r\n\r\n").expect("response has a body");
-    let status: u16 = head
-        .lines()
-        .next()
-        .and_then(|line| line.split_whitespace().nth(1))
-        .and_then(|code| code.parse().ok())
-        .expect("status line");
-    (status, payload.to_string())
-}
-
 /// One HTTP/1.0 GET to the admin endpoint; returns `(status, parsed JSON)`
 /// — mirrors `create_table_ready.rs`'s identical helper.
 async fn admin_get(addr: SocketAddr, path: &str) -> (u16, serde_json::Value) {
@@ -217,20 +183,6 @@ async fn admin_get(addr: SocketAddr, path: &str) -> (u16, serde_json::Value) {
         .expect("status line");
     let value: serde_json::Value = serde_json::from_str(payload).expect("admin body is JSON");
     (status, value)
-}
-
-async fn create_table(dynamo_addr: SocketAddr, table: &str) {
-    let (status, body) = dynamo(
-        dynamo_addr,
-        "DynamoDB_20120810.CreateTable",
-        &format!(
-            r#"{{"TableName":"{table}",
-                "KeySchema":[{{"AttributeName":"id","KeyType":"HASH"}}],
-                "AttributeDefinitions":[{{"AttributeName":"id","AttributeType":"S"}}]}}"#
-        ),
-    )
-    .await;
-    assert_eq!(status, 200, "CreateTable({table}) failed: {body}");
 }
 
 /// A large (~256 KiB), JSON-safe attribute value — mirrors

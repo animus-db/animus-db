@@ -83,13 +83,7 @@ use animus_tablet::{TabletId, TabletState};
 
 use super::AutoSplitThresholds;
 use super::sim_cluster::SimCluster;
-
-fn env_seed(default: u64) -> u64 {
-    std::env::var("ANIMUS_SEED")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(default)
-}
+use super::sim_support::env_seed;
 
 // ---------------------------------------------------------------------------
 // (1) cp_member_addresses_register_and_replicate

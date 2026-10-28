@@ -1,6 +1,7 @@
 //! Single merged integration-test binary for this crate (one link instead of 17).
 //! Real-thread / `ProdEnv` binaries stay separate `tests/*.rs` targets — see the crate's CLAUDE.md.
 
+mod lsm_adaptive_flush;
 mod lsm_approx_bytes;
 mod lsm_clone;
 mod lsm_clone_filtered;

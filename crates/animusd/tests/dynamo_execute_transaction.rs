@@ -26,11 +26,10 @@ use std::time::Duration;
 
 use animusd::{ClusterConfig, Node, RoleAddrs};
 use serde_json::Value;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tokio::time::sleep;
 
 mod support;
+use support::dynamo;
 
 // ---------------------------------------------------------------------------
 // Shared bring-up + protocol helpers (mirrors dynamo_txn_cancellation.rs).
@@ -82,41 +81,6 @@ async fn bring_up(n: usize, dir: &std::path::Path) -> (Vec<Node>, ClusterConfig)
         sleep(Duration::from_millis(50)).await;
     }
     panic!("could not bring up cluster after retries (ports kept getting stolen)");
-}
-
-/// One DynamoDB request over a fresh HTTP/1.1 connection → `(status, body)`.
-async fn dynamo(addr: SocketAddr, target: &str, body: &str) -> (u16, String) {
-    let mut stream = TcpStream::connect(addr).await.expect("connect to dynamo");
-    let request = format!(
-        "POST / HTTP/1.1\r\n\
-         Host: animus\r\n\
-         X-Amz-Target: {target}\r\n\
-         Content-Type: application/x-amz-json-1.0\r\n\
-         Content-Length: {}\r\n\
-         Connection: close\r\n\
-         \r\n\
-         {body}",
-        body.len(),
-    );
-    stream
-        .write_all(request.as_bytes())
-        .await
-        .expect("send request");
-    stream.flush().await.expect("flush");
-    let mut raw = Vec::new();
-    stream
-        .read_to_end(&mut raw)
-        .await
-        .expect("read full response");
-    let text = String::from_utf8(raw).expect("utf8 response");
-    let (head, payload) = text.split_once("\r\n\r\n").expect("response has a body");
-    let status: u16 = head
-        .lines()
-        .next()
-        .and_then(|line| line.split_whitespace().nth(1))
-        .and_then(|code| code.parse().ok())
-        .expect("status line");
-    (status, payload.to_string())
 }
 
 /// `dynamo`, retried on a transient `500` — the identical helper every

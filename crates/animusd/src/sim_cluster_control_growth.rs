@@ -43,7 +43,7 @@ use std::time::Duration;
 use animus_env::{NodeId, nid};
 
 use super::sim_cluster::SimCluster;
-use super::sim_cluster_console::{env_seed, json};
+use super::sim_support::{env_seed, json, poll_until};
 use crate::config::NodeRole;
 
 /// The current control-bearing node id set, as real node ids — derived
@@ -65,31 +65,6 @@ fn every_control_node_sees_voter(cluster: &SimCluster, target: u64) -> bool {
             .control_voters(n)
             .is_some_and(|v: std::collections::BTreeSet<NodeId>| v.contains(&target_id))
     })
-}
-
-/// Converged-or-timeout poll on `cond(cluster)` — the shared shape every
-/// `sim_cluster_*` module's own scenario-local convergence checks use
-/// (duplicated, not reached into, per this crate's own convention).
-fn poll_until(
-    cluster: &mut SimCluster,
-    budget: Duration,
-    seed: u64,
-    what: &str,
-    mut cond: impl FnMut(&mut SimCluster) -> bool,
-) {
-    const STEP: Duration = Duration::from_millis(100);
-    let mut elapsed = Duration::ZERO;
-    loop {
-        if cond(cluster) {
-            return;
-        }
-        assert!(
-            elapsed < budget,
-            "seed={seed}: {what} never converged within {budget:?}"
-        );
-        cluster.run_for(STEP);
-        elapsed += STEP;
-    }
 }
 
 /// The shared "REAL catch-up proof" both scenarios run once `grown` is a

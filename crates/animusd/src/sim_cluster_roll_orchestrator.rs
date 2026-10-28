@@ -91,6 +91,7 @@ use super::sim_cluster_upgrade_corpus::{
     decode_items_attr, final_state, get_body, live_replicas, ok_appends, pk_sk,
     run_until_clients_done, tablet_of,
 };
+use super::sim_support::panic_message;
 
 const ROUNDS: u64 = 150;
 const ROUNDS_PHASE2: u64 = 6;
@@ -204,25 +205,7 @@ fn cells() -> Vec<Cell> {
 }
 
 fn corpus_cells() -> Vec<Cell> {
-    let filter = std::env::var("ANIMUS_UPGRADE_CELL").ok();
-    let expanded = if let Some(seed) = std::env::var("ANIMUS_SEED")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-    {
-        cells()
-            .into_iter()
-            .map(|c| {
-                let name = c.name.clone();
-                c.reseeded(name, seed)
-            })
-            .collect()
-    } else {
-        corpus::seed_expand(cells(), corpus::seeds_from_env("ANIMUS_UPGRADE_SEEDS"))
-    };
-    expanded
-        .into_iter()
-        .filter(|c| filter.as_ref().is_none_or(|f| c.name.contains(f.as_str())))
-        .collect()
+    corpus::corpus_cells(cells(), "ANIMUS_UPGRADE_SEEDS", "ANIMUS_UPGRADE_CELL")
 }
 
 #[derive(Clone, Debug)]
@@ -233,14 +216,6 @@ struct Verdict {
     /// `(restarts, transfers, blocked ticks, stalled ticks, finalizes)`.
     stats: (usize, usize, usize, usize, usize),
     trace: Vec<String>,
-}
-
-fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
-    payload
-        .downcast_ref::<&str>()
-        .map(|m| (*m).to_string())
-        .or_else(|| payload.downcast_ref::<String>().cloned())
-        .unwrap_or_else(|| "<non-string panic payload>".to_string())
 }
 
 fn run_cell(c: &Cell) -> Verdict {

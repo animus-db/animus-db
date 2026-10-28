@@ -70,38 +70,9 @@ use std::time::Duration;
 use animus_control::{BackupStatus, MetaCommand, ProposeResult};
 use animus_cp_data::backup as backup_codec;
 use animus_node::backup_janitor::JanitorPhase;
-use animus_tablet::TabletId;
 
 use super::sim_cluster::SimCluster;
-
-fn env_seed(default: u64) -> u64 {
-    std::env::var("ANIMUS_SEED")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(default)
-}
-
-/// A single-hash-key (`pk`, string) `CreateTable`, issued from `node` —
-/// mirrors every other `sim_cluster_*` module's identically-named helper.
-fn create_table(cluster: &mut SimCluster, node: u64, table: &str) -> (u16, String) {
-    let body = format!(
-        r#"{{"TableName":"{table}",
-            "KeySchema":[{{"AttributeName":"pk","KeyType":"HASH"}}],
-            "AttributeDefinitions":[{{"AttributeName":"pk","AttributeType":"S"}}]}}"#
-    );
-    cluster.dynamo(node, "DynamoDB_20120810.CreateTable", body.as_bytes())
-}
-
-/// `table`'s own tablet id, per `node`'s own view of `Metadata` — mirrors
-/// every other `sim_cluster_*` module's identically-named helper.
-fn tablet_of(cluster: &SimCluster, node: u64, table: &str) -> TabletId {
-    let meta = cluster.metadata(node);
-    *meta
-        .tablets_for_table(table)
-        .next()
-        .unwrap_or_else(|| panic!("table {table} has no tablet on node {node}'s own view"))
-        .0
-}
+use super::sim_support::{create_table, env_seed, tablet_of};
 
 fn accepted(r: ProposeResult) -> bool {
     matches!(r, ProposeResult::Accepted { .. })

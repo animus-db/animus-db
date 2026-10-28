@@ -12,7 +12,6 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use animus_control::Metadata;
 use animus_env::SegmentStore;
 use animus_s3::client::{HttpRequest, HttpResponse, S3Config, Transport, TransportError};
 use animus_s3::fake::FakeS3;
@@ -21,11 +20,10 @@ use animus_tablet::{TabletId, partition_token};
 use animusd::{ClientRequest, ClientResponse, ExportStoreFactory, Node, read_frame, write_frame};
 use async_trait::async_trait;
 use serde_json::Value;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
 
 mod support;
+use support::{dynamo, tablets_for};
 
 const FAKE_BUCKET: &str = "export-test-bucket";
 const FAKE_ENDPOINT: &str = "http://fake.export.example:9000";
@@ -128,42 +126,6 @@ async fn bring_up(n: usize, dir: &std::path::Path) -> (Vec<Node>, Arc<FakeS3>) {
     panic!("could not bring up cluster after retries (ports kept getting stolen)");
 }
 
-/// One DynamoDB request over a fresh HTTP/1.1 connection → `(status,
-/// body)`. Mirrors every other `tests/dynamo_*.rs` file's identical helper.
-async fn dynamo(addr: SocketAddr, target: &str, body: &str) -> (u16, String) {
-    let mut stream = TcpStream::connect(addr).await.expect("connect to dynamo");
-    let request = format!(
-        "POST / HTTP/1.1\r\n\
-         Host: animus\r\n\
-         X-Amz-Target: {target}\r\n\
-         Content-Type: application/x-amz-json-1.0\r\n\
-         Content-Length: {}\r\n\
-         Connection: close\r\n\
-         \r\n\
-         {body}",
-        body.len(),
-    );
-    stream
-        .write_all(request.as_bytes())
-        .await
-        .expect("send request");
-    stream.flush().await.expect("flush");
-    let mut raw = Vec::new();
-    stream
-        .read_to_end(&mut raw)
-        .await
-        .expect("read full response");
-    let text = String::from_utf8(raw).expect("utf8 response");
-    let (head, payload) = text.split_once("\r\n\r\n").expect("response has a body");
-    let status: u16 = head
-        .lines()
-        .next()
-        .and_then(|line| line.split_whitespace().nth(1))
-        .and_then(|code| code.parse().ok())
-        .expect("status line");
-    (status, payload.to_string())
-}
-
 fn json(body: &str) -> Value {
     serde_json::from_str(body).unwrap_or_else(|e| panic!("invalid JSON ({e}): {body}"))
 }
@@ -176,10 +138,6 @@ fn field(body: &str, name: &str) -> String {
         .and_then(Value::as_str)
         .unwrap_or_else(|| panic!("missing string field `ExportDescription.{name}` in {body}"))
         .to_string()
-}
-
-fn tablets_for(meta: &Metadata, table: &str) -> Vec<TabletId> {
-    meta.tablets_for_table(table).map(|(&t, _)| t).collect()
 }
 
 /// A plain-client-protocol `SplitTablet` call — an **arbitrary binary**

@@ -64,11 +64,11 @@ use animusd::{
     StorageBackend, StreamSealKnobs, read_frame, write_frame,
 };
 use serde_json::Value;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
 
 mod support;
+use support::{admin, kickoff_tablet, sole_tablet_of};
 
 /// [`inplace_split_bench.rs::bring_up_inplace`], unchanged.
 async fn bring_up_inplace(n: usize, dir: &Path) -> (Vec<Node>, ClusterConfig) {
@@ -134,33 +134,6 @@ async fn bring_up_inplace(n: usize, dir: &Path) -> (Vec<Node>, ClusterConfig) {
     );
 }
 
-/// One HTTP/1.0 request to the admin endpoint; returns `(status, parsed JSON)`.
-async fn admin(addr: SocketAddr, method: &str, path: &str, body: Option<&str>) -> (u16, Value) {
-    let mut stream = TcpStream::connect(addr).await.expect("connect to admin");
-    let body = body.unwrap_or("");
-    let request = format!(
-        "{method} {path} HTTP/1.0\r\nHost: animus\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len(),
-    );
-    stream
-        .write_all(request.as_bytes())
-        .await
-        .expect("send request");
-    stream.flush().await.expect("flush");
-    let mut raw = Vec::new();
-    stream.read_to_end(&mut raw).await.expect("read response");
-    let text = String::from_utf8(raw).expect("utf8 response");
-    let (head, payload) = text.split_once("\r\n\r\n").expect("response has a body");
-    let status: u16 = head
-        .lines()
-        .next()
-        .and_then(|line| line.split_whitespace().nth(1))
-        .and_then(|code| code.parse().ok())
-        .expect("status line");
-    let json: Value = serde_json::from_str(payload.trim()).unwrap_or(Value::Null);
-    (status, json)
-}
-
 /// [`inplace_split_bench.rs::put_in_counting`], unchanged.
 async fn put_in_counting(stream: &mut TcpStream, table: &str, key: Vec<u8>, value: Vec<u8>) -> u32 {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
@@ -190,35 +163,6 @@ async fn put_in_counting(stream: &mut TcpStream, table: &str, key: Vec<u8>, valu
 /// [`inplace_split_bench.rs::put_in`], unchanged.
 async fn put_in(stream: &mut TcpStream, table: &str, key: Vec<u8>, value: Vec<u8>) {
     put_in_counting(stream, table, key, value).await;
-}
-
-fn sole_tablet_of(node: &Node, table: &str) -> u64 {
-    let meta = node.metadata();
-    let ids: Vec<u64> = meta
-        .tablets
-        .iter()
-        .filter(|(_, t)| t.table.as_deref() == Some(table))
-        .map(|(id, _)| id.0)
-        .collect();
-    assert_eq!(
-        ids.len(),
-        1,
-        "expected exactly one tablet of {table}: {ids:?}"
-    );
-    ids[0]
-}
-
-async fn kickoff_tablet(node: &Node, tablet: u64, split_key: &str) {
-    let (status, body) = admin(
-        node.admin_addr(),
-        "POST",
-        "/admin/tablet/split",
-        Some(&format!(
-            "{{\"tablet\":{tablet},\"split_key\":\"{split_key}\"}}"
-        )),
-    )
-    .await;
-    assert_eq!(status, 200, "kickoff of tablet {tablet} failed: {body}");
 }
 
 /// [`split_placing_completion.rs::join_extra`], unchanged: joins `ids.len()`
