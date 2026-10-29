@@ -654,11 +654,18 @@ impl<E: Env> CpGroup<E> {
     /// order** (token-then-pk-then-HLC), NOT commit order. See
     /// [`RaftKvNode::pending_changes_key_order`]'s own doc for the full account and
     /// ADR 0043 §A3.
-    pub(crate) async fn pending_changes_key_order(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
+    ///
+    /// A scan error is an `Err`, never an empty `Ok` (issue #1419): every
+    /// caller that seals, trims or advances a watermark from this view skips
+    /// or retries its tick on it.
+    pub(crate) async fn pending_changes_key_order(
+        &self,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, String> {
         match self {
             CpGroup::Lsm(n) => n.pending_changes_key_order().await,
             CpGroup::Mem(n) => n.pending_changes_key_order().await,
         }
+        .map_err(|e| format!("change-log scan failed: {e}; retry"))
     }
 
     /// This tablet's own highest-materialized `KIND_CHANGE` `(ts, ordinal)`

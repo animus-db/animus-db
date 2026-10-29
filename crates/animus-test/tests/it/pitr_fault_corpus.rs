@@ -213,6 +213,7 @@ fn pitr_seal_now(
     let watermark = meta.pitr_segment_watermark(group.id).unwrap_or(0);
     let mut filtered: Vec<(Vec<u8>, u64, u32, Vec<u8>)> =
         block_on(group.nodes[leader].pending_changes_key_order())
+            .expect("change-log scan")
             .into_iter()
             .filter_map(|(k, v)| {
                 let (hlc, ordinal) = record_seqno_suffix(&k)?;
@@ -307,6 +308,7 @@ fn collect_pitr_records(
     let watermark = meta.pitr_segment_watermark(group.id).unwrap_or(0);
     let mut hot: Vec<(Vec<u8>, u64, u32, Vec<u8>)> =
         block_on(group.nodes[leader].pending_changes_key_order())
+            .expect("change-log scan")
             .into_iter()
             .filter_map(|(k, v)| {
                 let (hlc, ordinal) = record_seqno_suffix(&k)?;

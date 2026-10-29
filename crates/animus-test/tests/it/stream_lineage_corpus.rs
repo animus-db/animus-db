@@ -348,6 +348,7 @@ fn seal_now(
     let declared_range = meta.tablets.get(&group.id).map(|t| t.range.clone());
     let mut filtered: Vec<(Vec<u8>, u64, u32, Vec<u8>)> =
         block_on(group.nodes[leader].pending_changes_key_order())
+            .expect("change-log scan")
             .into_iter()
             .filter_map(|(k, v)| {
                 let (hlc, ordinal) = record_seqno_suffix(&k)?;
@@ -463,6 +464,7 @@ fn collect_tablet_records(
     let watermark = meta.stream_shard_watermark(group.id).unwrap_or(0);
     let mut hot: Vec<(Vec<u8>, u64, u32, Vec<u8>)> =
         block_on(group.nodes[leader].pending_changes_key_order())
+            .expect("change-log scan")
             .into_iter()
             .filter_map(|(k, v)| {
                 let (hlc, ordinal) = record_seqno_suffix(&k)?;
@@ -745,7 +747,7 @@ fn scenario_store_outage_then_heal(seed: u64) {
         "[seed={seed}] no catalog row may exist while the store never acked a put"
     );
     // Every write is still recoverable straight from the hot log.
-    let hot = block_on(group.nodes[leader].pending_changes_key_order());
+    let hot = block_on(group.nodes[leader].pending_changes_key_order()).expect("change-log scan");
     assert_eq!(
         hot.len(),
         4,
@@ -798,6 +800,7 @@ fn scenario_disable_grace_drain(seed: u64) {
     assert_eq!(sealed, Some(0), "[seed={seed}] the final seal must commit");
     assert!(
         block_on(group.nodes[leader].pending_changes_key_order())
+            .expect("change-log scan")
             .into_iter()
             .filter_map(|(k, _)| record_hlc_suffix(&k))
             .all(|hlc| hlc <= meta.stream_shard_watermark(group.id).unwrap_or(0)),
@@ -1105,6 +1108,7 @@ fn scenario_dueling_seals_orphan_hot_range(seed: u64) {
     let watermark_slow = meta.stream_shard_watermark(group.id).unwrap_or(0);
     let mut slow_records: Vec<(Vec<u8>, u64, u32, Vec<u8>)> =
         block_on(group.nodes[slow_leader].pending_changes_key_order())
+            .expect("change-log scan")
             .into_iter()
             .filter_map(|(k, v)| {
                 let (hlc, ordinal) = record_seqno_suffix(&k)?;
@@ -2072,11 +2076,15 @@ fn scenario_inplace_split_lineage_frozen_at_fork(seed: u64) {
     let ll = elect(&mut sim, &left, &live, seed);
     let rl = elect(&mut sim, &right, &live, seed);
     assert!(
-        block_on(left.nodes[ll].pending_changes_key_order()).is_empty(),
+        block_on(left.nodes[ll].pending_changes_key_order())
+            .expect("change-log scan")
+            .is_empty(),
         "[seed={seed}] the LEFT child must be born with an EMPTY change log"
     );
     assert!(
-        block_on(right.nodes[rl].pending_changes_key_order()).is_empty(),
+        block_on(right.nodes[rl].pending_changes_key_order())
+            .expect("change-log scan")
+            .is_empty(),
         "[seed={seed}] the RIGHT child must be born with an EMPTY change log"
     );
 
@@ -2395,6 +2403,7 @@ fn get_records_page(
         // OPEN shard: mirrors `index_drain::hot_read` exactly.
         let mut records: Vec<(Vec<u8>, u64, u32, Vec<u8>)> =
             block_on(group.nodes[leader].pending_changes_key_order())
+                .expect("change-log scan")
                 .into_iter()
                 .filter_map(|(k, v)| {
                     let (hlc, ordinal) = record_seqno_suffix(&k)?;
@@ -2767,7 +2776,8 @@ fn scenario_kind_eval_batch_delivers_every_item_exactly_once_in_order(seed: u64)
     // primitive `get_records_page`'s own open-shard arm uses), mirroring
     // cell 17's own `assert_tied_delivery_is_sound` property but for the
     // newer, apply-evaluated variant.
-    let records = block_on(group.nodes[leader].pending_changes_key_order());
+    let records =
+        block_on(group.nodes[leader].pending_changes_key_order()).expect("change-log scan");
     let mut seqnos: Vec<(u64, u32)> = records
         .iter()
         .filter_map(|(k, _)| record_seqno_suffix(k))

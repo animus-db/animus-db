@@ -626,7 +626,15 @@ async fn log_step<E: Env, R: RelayClient>(
 ) -> ShipOutcome {
     // (hlc, ordinal, base key) of every record past the watermark.
     let mut dirty: Vec<(HlcTimestamp, u32, Vec<u8>)> = Vec::new();
-    for (k, v) in group.pending_changes_key_order().await {
+    // A scan error is a failed tick, not "caught up" (issue #1419).
+    let pending = match group.pending_changes_key_order().await {
+        Ok(pending) => pending,
+        Err(e) => {
+            fail(ctx, key, e, false);
+            return ShipOutcome::Waiting;
+        }
+    };
+    for (k, v) in pending {
         let Some((ts, ord)) = record_hlc_ordinal(&k) else {
             continue;
         };

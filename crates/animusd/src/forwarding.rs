@@ -1465,15 +1465,21 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 // scope (ADR 0050 rung 7): ranges are immutable and a split
                 // retires the parent whole, so there is no transition window
                 // left to latch.
-                let pairs = index_drain::hot_read(
+                let pairs = match index_drain::hot_read(
                     &leader,
                     (from_position_hlc, from_position_ordinal),
                     limit,
                 )
                 .await
-                .into_iter()
-                .map(|(key, _, _, value)| (key, value))
-                .collect();
+                {
+                    Ok(rows) => rows
+                        .into_iter()
+                        .map(|(key, _, _, value)| (key, value))
+                        .collect(),
+                    // Issue #1419: a scan error is an error reply, never an
+                    // empty page (which would read as "caught up").
+                    Err(e) => return ClientResponse::Error(e),
+                };
                 ClientResponse::Pairs(pairs)
             }
             // Issue #859: the open-shard max-position RPC — addressed by

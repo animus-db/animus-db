@@ -10967,7 +10967,14 @@ mod stream_write_path_tests {
         let node = single_node(dir.path()).await;
         create_streamed_table(node.dynamo_addr(), "tbs1").await;
         let group = await_group(&node, "tbs1").await;
-        assert_eq!(group.pending_changes_key_order().await.len(), 0);
+        assert_eq!(
+            group
+                .pending_changes_key_order()
+                .await
+                .expect("change-log scan")
+                .len(),
+            0
+        );
 
         let (status, body) = dynamo(
             node.dynamo_addr(),
@@ -10977,7 +10984,11 @@ mod stream_write_path_tests {
         .await;
         assert_eq!(status, 200, "PutItem failed: {body}");
         assert_eq!(
-            group.pending_changes_key_order().await.len(),
+            group
+                .pending_changes_key_order()
+                .await
+                .expect("change-log scan")
+                .len(),
             1,
             "PutItem must leave exactly one change record"
         );
@@ -11013,7 +11024,14 @@ mod stream_write_path_tests {
         )
         .await;
         assert_eq!(status, 200, "UpdateItem failed: {body}");
-        assert_eq!(group.pending_changes_key_order().await.len(), 2);
+        assert_eq!(
+            group
+                .pending_changes_key_order()
+                .await
+                .expect("change-log scan")
+                .len(),
+            2
+        );
 
         let (status, body) = dynamo(
             node.dynamo_addr(),
@@ -11022,7 +11040,14 @@ mod stream_write_path_tests {
         )
         .await;
         assert_eq!(status, 200, "DeleteItem failed: {body}");
-        assert_eq!(group.pending_changes_key_order().await.len(), 3);
+        assert_eq!(
+            group
+                .pending_changes_key_order()
+                .await
+                .expect("change-log scan")
+                .len(),
+            3
+        );
         assert!(
             group
                 .local_scan_kind_bounded(KIND_LSI, &[], None)
@@ -11089,7 +11114,10 @@ mod stream_write_path_tests {
         // which under a BATCH_WRITE_MAX_ITEMS-item batch they essentially
         // always do; a fully-trimmed-before-observation batch skips only
         // this half, never the count).
-        let records = group.pending_changes_key_order().await;
+        let records = group
+            .pending_changes_key_order()
+            .await
+            .expect("change-log scan");
         let trimmed = metrics_value(node.dynamo_addr(), "change_log_trimmed_total").await;
         assert_eq!(
             records.len() as u64 + trimmed,
@@ -11299,7 +11327,10 @@ mod stream_write_path_tests {
         // per mutation — 4 total (put + 2 batched + delete), live or
         // already trimmed.
         let group = await_group(&node, "rawt").await;
-        let records = group.pending_changes_key_order().await;
+        let records = group
+            .pending_changes_key_order()
+            .await
+            .expect("change-log scan");
         let trimmed = metrics_value(node.dynamo_addr(), "change_log_trimmed_total").await;
         assert_eq!(
             records.len() as u64 + trimmed,
@@ -11369,7 +11400,10 @@ mod stream_write_path_tests {
         // still pending or counted by `change_log_trimmed_total` (the
         // union a trim cannot erase; both zero would mean emission itself
         // regressed).
-        let records = group.pending_changes_key_order().await;
+        let records = group
+            .pending_changes_key_order()
+            .await
+            .expect("change-log scan");
         let trimmed = metrics_value(node.dynamo_addr(), "change_log_trimmed_total").await;
         assert_eq!(
             records.len() as u64 + trimmed,
@@ -11449,7 +11483,10 @@ mod stream_write_path_tests {
         .await;
         assert_eq!(status, 200, "BatchWriteItem failed: {body}");
 
-        let records = group.pending_changes_key_order().await;
+        let records = group
+            .pending_changes_key_order()
+            .await
+            .expect("change-log scan");
         assert_eq!(
             records.len(),
             2,
@@ -11493,7 +11530,10 @@ mod stream_write_path_tests {
         .await;
         assert_eq!(status, 200, "second PutItem failed: {body}");
 
-        let records = group.pending_changes_key_order().await;
+        let records = group
+            .pending_changes_key_order()
+            .await
+            .expect("change-log scan");
         assert_eq!(records.len(), 2, "one record per write");
         let (_, second) = &records[1];
         let record = ChangeRecord::decode(second).expect("change record decodes as Some");
@@ -11534,7 +11574,11 @@ mod stream_write_path_tests {
         // missing "copier" cursor.
         sleep(Duration::from_millis(500)).await;
         assert_eq!(
-            group.pending_changes_key_order().await.len(),
+            group
+                .pending_changes_key_order()
+                .await
+                .expect("change-log scan")
+                .len(),
             5,
             "every change record must survive — the streamed table's \
              expected \"copier\" tag has no cursor row yet"

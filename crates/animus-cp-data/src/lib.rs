@@ -7376,18 +7376,28 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// `(packed_hlc, ordinal)` pair, exactly as `seal_now`/`hot_read`
     /// (`animusd::index_drain`) already do; don't rely on this method's own
     /// return order for that.
-    pub async fn pending_changes_key_order(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
+    ///
+    /// # Errors
+    ///
+    /// The engine's own scan error, **propagated, never read as "no
+    /// records"** (issue #1419). An empty `Ok` means the log is genuinely
+    /// empty; every consumer that seals, trims, disables or advances a
+    /// watermark from this view must treat an `Err` as "unknown" and skip or
+    /// retry its tick, or a transient read failure would let it act on a
+    /// false empty log and lose or skip acked change records.
+    pub async fn pending_changes_key_order(
+        &self,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, animus_storage::StorageError> {
         let scope = &self.kind_scopes[KIND_CHANGE as usize];
         let (start, end) = scope.physical_bounds();
         let Some(end) = end else {
-            return Vec::new(); // only `StorageScope::whole()`; no real tablet
+            return Ok(Vec::new()); // only `StorageScope::whole()`; no real tablet
         };
-        self.storage
+        Ok(self
+            .storage
             .scan(&start, &end)
-            .await
-            .ok()
+            .await?
             .into_iter()
-            .flatten()
             .filter_map(|(k, vv)| {
                 let logical = scope.strip_in_range(&k)?.to_vec();
                 match txn::decode_envelope(&vv.value) {
@@ -7395,7 +7405,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
                     txn::Envelope::Intent { .. } => None,
                 }
             })
-            .collect()
+            .collect())
     }
 
     /// The `(commit ts, ordinal)` of this group's own highest-committed

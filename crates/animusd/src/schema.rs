@@ -1687,7 +1687,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                     // mutable scope (ADR 0050 rung 7) — immutable ranges
                     // leave no transition window to latch.
                     return Ok(index_drain::hot_read(&leader, from_position, limit)
-                        .await
+                        .await?
                         .into_iter()
                         .map(|(key, _, _, value)| (key, value))
                         .collect());
