@@ -1102,3 +1102,60 @@ Tests: `tests/it/pipelined_replication.rs` (the burst is bounded, the ack
 answers with one batch, shallow windows are unchanged, empty heartbeats until
 the retransmit window, a reject resends at once; the follower commit cap is `tests/it/follower_commit_cap.rs`, split out as its own PR #1318).
 
+
+## 2026-10-29 amendment: a leader lease on the real vote, check-quorum, and conceding a stale candidacy
+
+**Trigger.** The nightly `density_admission_corpus` cell 3 (`cell_3_awake_overload_capped`,
+seed `0x1c49137310331dab`, `ANIMUS_DENSITY_SEEDS=20`) failed deterministically with
+`monotone: the led count fell after the fault`. Chain, on a 3-node group with one node
+killed and the survivors CPU-saturated (ADR 0078's starvation model): n1 is a `Candidate`
+at term 2 whose vote responses sit about a second in its own CPU queue; n2's timer fires
+and its pre-vote round reaches n1, which grants it (its candidacy's deadline has lapsed;
+being deferred by the campaign governor it keeps granting by design); n2 becomes
+`Candidate` at term 3; n1 then processes its own pending vote, becomes `Leader` at term 2,
+and n2's term-3 `RequestVote` deposes it through `handle`'s step-down on any higher term.
+Pre-vote only guards the pre-vote phase; nothing guarded the real vote.
+
+**Decision (three parts, all node-local; no wire change, so no `Gate`, ADR 0073 class L).**
+
+1. **Leader lease on `RequestVote`** (Raft thesis 4.2.3; etcd `inLease`). A leader that
+   holds its lease (`RaftCore::leader_lease`) ignores a higher-term `RequestVote`: no term
+   adoption, no step-down, no reply (a removed node still gets its removal notice). The
+   candidate's durable self-vote is still recorded in `heard_from`. The lease needs a
+   quorum of voters (self counted) heard from, through the existing per-peer
+   `last_contact`, within the stretched election base; a quiesced leader keeps it, and a
+   fresh leader or one waking from quiescence holds it for one stretched base
+   (`lease_grace_until`) because its `last_contact` is stale by construction. Counter:
+   `CampaignStats::rv_ignored_lease`.
+2. **Check-quorum is the lease's validity, not an active step-down.** A leader cut off from
+   its quorum stops claiming the lease within an election timeout and from then on behaves
+   as before: it adopts the higher term, steps down and grants. It is deliberately not
+   deposed on its own initiative: under CPU starvation a leader's acks sit in its own queue
+   past any window, and stepping down for that is the churn the lease exists to prevent.
+   For the same reason a leader **always** refuses a pre-vote, lease or not (unchanged):
+   making the pre-vote follow the lapsed lease regressed corpus seeds (a starved leader
+   waved off by its followers). The shared "a live leader exists" predicate is
+   `live_leader`; only the real vote consults the quorum lease.
+3. **Conceding a stale candidacy.** A `Candidate` that grants a pre-vote for a later term
+   steps back to `Follower` (same term, `voted_for` kept, votes cleared;
+   `CampaignStats::candidacies_conceded`). Without it the candidacy can still win a moment
+   later, into a term the node it just waved through is already leaving; the lease alone
+   cannot fix that interleaving, because the higher-term node's `AppendEntriesResp`
+   (at its term) deposes the new leader anyway (the oracle's dip is the same). A lapsed
+   candidacy restarts through the pre-vote path on its next tick exactly as before; late
+   `RequestVoteResp`s no longer count.
+
+**Leadership transfer** bypasses the lease without a wire field: the leader recognises a
+`RequestVote` from its own `transfer_target` (local state) and honours it. A follower never
+applies the lease, which is why no flag is needed (a flag would have to reach every
+follower and change the raftkv-wire binary codec, i.e. a new frame version and a `Gate`).
+**Known limit:** because only the leader holds the lease, a stale real vote that reaches a
+*follower* in lease is still granted (etcd's follower-side `inLease`). Closing that needs
+the transfer flag on the wire, gated on the cluster version; not done here.
+
+**Compatibility.** No message, field, fixture or format changed. A mixed-version cluster
+simply has some replicas applying the lease and some not.
+
+**Tests.** `animus-control` `tests/it/leader_lease.rs` (stale vote leaves the leader in
+place; lapsed lease; transfer target bypass and election; non-target still ignored; a
+leader refuses a pre-vote on a lapsed lease), plus the density cell at 20 seeds.
