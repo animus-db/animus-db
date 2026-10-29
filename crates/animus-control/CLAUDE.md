@@ -1820,6 +1820,12 @@ freezes that type's absent-field semantics once merged.**
   stop. Tests: `tests/it/leader_lease.rs`. Any test that wants a disruptive
   higher-term candidate to depose a leader must first let the lease lapse (no
   acks for `election_timeout()`).
+  **The pre-vote grant (`handle_pre_vote`) also requires
+  `!cluster_check.blocks_voting()`**, exactly like the real vote (issue #667): a
+  wiped, check-pending voter must not help form a pre-vote majority that sends a
+  live follower into a real higher-term election (`pv_refused_unchecked`; test
+  `wiped_voter_with_pending_check_refuses_pre_vote`). Any new grant path must
+  consult the same gate.
 
 - **Learner (non-voting) membership class (ADR 0058 Train 1).** `RaftCore`
   gains a per-member `role`: alongside the existing voter `config`, a

@@ -709,10 +709,41 @@ async fn wiped_voter_refuses_and_the_rest_of_the_cluster_keeps_serving() {
             ),
             "a write must still commit through the surviving majority after the wipe"
         );
-        sleep(Duration::from_millis(500)).await;
+        // Converged-or-timeout poll inside the SAME 500 ms budget the fixed
+        // sleep had (no wider deadline); the failure message dumps every
+        // node's election state so a one-off CI flake is diagnosable.
+        let mut committed = false;
+        for _ in 0..20 {
+            if nodes[cur_leader].metadata().members.contains_key(&nid(200)) {
+                committed = true;
+                break;
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+        let dump = nodes
+            .iter()
+            .enumerate()
+            .map(|(i, n)| {
+                let s = n.campaign_stats();
+                format!(
+                    "n{i}: role={:?} term={} leader_id={:?} rv_ignored_lease={} \
+                     candidacies_conceded={} pv_granted={} pv_refused_unchecked={} \
+                     elections_started={}",
+                    n.role(),
+                    n.term(),
+                    n.leader(),
+                    s.rv_ignored_lease,
+                    s.candidacies_conceded,
+                    s.pv_granted,
+                    s.pv_refused_unchecked,
+                    s.elections_started,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(
-            nodes[cur_leader].metadata().members.contains_key(&nid(200)),
-            "the post-wipe write must actually commit"
+            committed,
+            "the post-wipe write must actually commit (victim=n{victim}, leader=n{cur_leader})\n{dump}"
         );
 
         for e in &envs {

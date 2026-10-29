@@ -254,3 +254,101 @@ fn fresh_leader_holds_the_lease_before_any_ack() {
     let core = elect_leader();
     assert!(core.leader_lease(after(NOW, Duration::from_millis(1))));
 }
+
+/// Deliver `msgs` (sent by `from`) to the cores named by their destination,
+/// returning every message those cores answered with (as `(to, from, msg)`).
+fn deliver(
+    from: &NodeId,
+    msgs: Vec<(NodeId, RaftMsg)>,
+    cores: &mut [(NodeId, &mut RaftCore)],
+    now: Nanos,
+) -> Vec<(NodeId, NodeId, RaftMsg)> {
+    let mut answers = Vec::new();
+    for (to, msg) in msgs {
+        for (id, c) in cores.iter_mut() {
+            if *id == to {
+                for (back, m) in c.handle(from.clone(), msg.clone(), now, 7) {
+                    answers.push((back, to.clone(), m));
+                }
+            }
+        }
+    }
+    answers
+}
+
+/// ADR 0009 (2026-10-29 amendment, pre-vote cluster check): a voter wiped and
+/// restarted under the same id has a pending boot-time cluster check. It refuses
+/// real votes (issue #667) and must refuse pre-votes the same way; otherwise,
+/// until its first AppendEntries, it hands a live follower a pre-vote majority,
+/// the follower sends a real higher-term `RequestVote`, and the leader (or the
+/// write proposed in the gap) is disturbed.
+#[test]
+fn wiped_voter_with_pending_check_refuses_pre_vote() {
+    let mut leader = elect_leader();
+    let mut follower: RaftCore = RaftCore::new(nid(1), &group(), Nanos(0), 7);
+    let t0 = after(NOW, Duration::from_millis(5));
+    // The follower hears the leader, then the leader learns it is caught up.
+    let hb = leader.replicate_now(t0);
+    let answers = deliver(&nid(0), hb, &mut [(nid(1), &mut follower)], t0);
+    for (_, from, m) in answers {
+        let _ = leader.handle(from, m, t0, 7);
+    }
+    assert_eq!(follower.leader(), Some(nid(0)));
+    let term = leader.term();
+
+    // The wiped voter: fresh core, check pending, has not heard the leader.
+    let mut wiped: RaftCore = RaftCore::new(nid(2), &group(), Nanos(0), 7);
+    let _probes = wiped.begin_cluster_check(t0, 7);
+    assert!(wiped.cluster_check_pending());
+
+    // The follower's election timer fires before the wiped node hears anyone.
+    let fire = follower.next_deadline().expect("follower has a timer");
+    let outs = follower.tick(fire, 7);
+    assert!(
+        outs.iter()
+            .any(|(_, m)| matches!(m, RaftMsg::PreVote { .. })),
+        "the follower starts a pre-vote round: {outs:?}"
+    );
+    let resps = deliver(
+        &nid(1),
+        outs,
+        &mut [(nid(0), &mut leader), (nid(2), &mut wiped)],
+        fire,
+    );
+    assert_eq!(resps.len(), 2, "{resps:?}");
+    let mut sent = Vec::new();
+    for (_, from, m) in resps {
+        assert!(
+            matches!(m, RaftMsg::PreVoteResp { granted: false, .. }),
+            "node {from} must refuse the pre-vote: {m:?}"
+        );
+        sent.extend(follower.handle(from, m, fire, 7));
+    }
+    assert!(
+        !sent
+            .iter()
+            .any(|(_, m)| matches!(m, RaftMsg::RequestVote { .. })),
+        "no real higher-term RequestVote may be sent: {sent:?}"
+    );
+    assert_eq!(wiped.campaign_stats().pv_refused_unchecked, 1);
+    assert_eq!(wiped.campaign_stats().pv_granted, 0);
+
+    // The leader is undisturbed and a write proposed to it commits.
+    assert_eq!(leader.role(), Role::Leader);
+    assert_eq!(leader.term(), term);
+    let before = leader.commit_index();
+    assert!(matches!(
+        leader.propose(animus_control::MetaCommand::UpsertMember {
+            node: nid(200),
+            labels: Default::default(),
+            status: animus_control::NodeStatus::Active,
+        }),
+        animus_control::ProposeResult::Accepted { .. }
+    ));
+    let hb = leader.replicate_now(fire);
+    let answers = deliver(&nid(0), hb, &mut [(nid(1), &mut follower)], fire);
+    for (_, from, m) in answers {
+        let _ = leader.handle(from, m, fire, 7);
+    }
+    assert!(leader.commit_index() > before, "the write commits");
+}

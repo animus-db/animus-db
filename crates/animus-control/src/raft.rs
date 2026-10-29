@@ -422,6 +422,9 @@ pub struct CampaignStats {
     pub pv_refused_lease: u64,
     /// Refused: the candidate's term is behind, or its log is.
     pub pv_refused_term_or_log: u64,
+    /// Refused: this node's boot-time cluster check is pending or resolved to
+    /// refused (ADR 0009's 2026-10-29 amendment), the same gate as a real vote.
+    pub pv_refused_unchecked: u64,
     /// Higher-term real `RequestVote`s ignored because this node was a leader
     /// holding its lease (ADR 0009's 2026-10-29 amendment).
     pub rv_ignored_lease: u64,
@@ -4710,7 +4713,12 @@ where
         // all when `!is_voter()`. A stray/injected `PreVote` reaching a
         // learner can therefore still be granted here without any safety
         // consequence — it simply won't count toward anyone's majority.
-        let granted = !has_live_leader && term >= self.current_term && log_ok;
+        // ADR 0009 (2026-10-29 amendment): the same gate as the real vote
+        // (issue #667). A wiped voter's forgotten `voted_for` and empty log make
+        // it look like a willing, up-to-date-enough granter; a pre-vote majority
+        // it helps form sends a live follower into a real higher-term election.
+        let cluster_checked = !self.cluster_check.blocks_voting();
+        let granted = !has_live_leader && term >= self.current_term && log_ok && cluster_checked;
         if granted && self.role == Role::Candidate {
             // ADR 0009 (2026-10-29 amendment): granting a pre-vote for a later
             // term while our own real candidacy is still unresolved (its
@@ -4733,6 +4741,8 @@ where
             self.campaign_stats.pv_refused_leader += 1;
         } else if voted_lease {
             self.campaign_stats.pv_refused_lease += 1;
+        } else if !cluster_checked {
+            self.campaign_stats.pv_refused_unchecked += 1;
         } else {
             self.campaign_stats.pv_refused_term_or_log += 1;
         }

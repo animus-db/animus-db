@@ -1123,6 +1123,12 @@ impl<E: Env> RaftNode<E> {
         self.lock().term()
     }
 
+    /// Lifetime pre-vote / lease counters of this node's core (diagnostics
+    /// only; see [`CampaignStats`](crate::CampaignStats)).
+    pub fn campaign_stats(&self) -> crate::CampaignStats {
+        self.lock().campaign_stats()
+    }
+
     /// Best-known leader id. See `RaftCore::leader`'s own doc: this is the
     /// raw, pre-vote-driven consensus belief — an operational (health/
     /// readiness) reader should call [`leader_within`](Self::leader_within)

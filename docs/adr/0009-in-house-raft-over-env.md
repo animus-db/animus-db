@@ -1159,3 +1159,17 @@ simply has some replicas applying the lease and some not.
 **Tests.** `animus-control` `tests/it/leader_lease.rs` (stale vote leaves the leader in
 place; lapsed lease; transfer target bypass and election; non-target still ignored; a
 leader refuses a pre-vote on a lapsed lease), plus the density cell at 20 seeds.
+
+**Addendum: the pre-vote grant consults the boot-time cluster check.** A voter wiped and
+restarted under its own id has a pending `cluster_check` (issue #667) and refuses real votes,
+but `handle_pre_vote` did not consult it. Until its first `AppendEntries` such a node could
+hand a live follower a pre-vote majority (its forgotten `voted_for` and empty log pass every
+other test); the follower then sent a real higher-term `RequestVote`, which the leader's lease
+ignores, and a write proposed to that leader in the gap was lost (suspected cause of one CI
+failure of `wiped_voter_refuses_and_the_rest_of_the_cluster_keeps_serving`). The pre-vote grant
+now carries the same `!cluster_check.blocks_voting()` conjunct as the real vote (pending or
+refused both refuse; `CampaignStats::pv_refused_unchecked`). Node-local, no wire change, no
+`Gate`. Liveness: a pending node never contributed a usable real vote, so a 3-node cluster
+with one pending node still elects with the other two; a fresh genesis cluster resolves its
+checks from the first probe answers (`Idle`) before pre-votes matter. Test:
+`leader_lease::wiped_voter_with_pending_check_refuses_pre_vote` (fails without the conjunct).
