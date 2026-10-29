@@ -581,6 +581,7 @@ const LSM_FORMATS: &[&str] = &[
     "manifest",
     "sstable_block",
     "sstable_index",
+    "sstable_filter",
     "sstable_image",
 ];
 
@@ -611,6 +612,10 @@ pub fn lsm_formats(data: &[u8]) {
         "sstable_index" => {
             let _ = f::sstable_index(body);
             let _ = f::sstable_index(&fix_tail_crc_le(body));
+        }
+        "sstable_filter" => {
+            let _ = f::sstable_filter(body);
+            let _ = f::sstable_filter(&fix_tail_crc_le(body));
         }
         "sstable_image" => {
             use animus_env::Disk;

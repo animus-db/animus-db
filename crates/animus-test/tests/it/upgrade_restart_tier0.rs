@@ -494,7 +494,7 @@ fn lsm_manifest_run(seed: u64, bytes: &[u8]) -> Result<(), StorageError> {
 fn lsm_manifest_fixture_decodes_and_recovery_proceeds_to_its_tables() {
     for (version, bytes) in fixtures("lsm-manifest") {
         match version {
-            1 | 2 => {}
+            1..=3 => {}
             v => panic!("lsm-manifest v{v} fixture has no tier-0 expectation yet — add an arm"),
         }
         each_seed("tier0_lsm_manifest", |seed| {
@@ -552,7 +552,8 @@ fn lsm_manifest_negative_controls_are_caught() {
 /// test helper is private). The expected value is this list, in key order.
 fn sstable_expected(version: u32) -> Entries {
     match version {
-        1 => {
+        // v2 only adds the filter region after the index; the records are the same.
+        1 | 2 => {
             let mut state = 0x0123_4567_89ab_cdefu64;
             let mut out = Vec::new();
             for i in 0u32..300 {
@@ -625,12 +626,26 @@ fn sstable_run(seed: u64, version: u32, table: &[u8]) -> Result<Entries, Storage
     // The manifest records the table's index offset/length/size; a fixture
     // whose footer disagrees would fail in a confusing way, so say why.
     let footer = |b: &[u8]| b[b.len().saturating_sub(24)..].to_vec();
-    assert_eq!(
-        (table.len(), footer(table)),
-        (scratch_table.len(), footer(&scratch_table)),
-        "tier 0 derives the manifest from a current-writer flush; when the \
-         sstable layout changes, give this test a per-version manifest"
-    );
+    let manifest = if version >= 2 {
+        assert_eq!(
+            (table.len(), footer(table)),
+            (scratch_table.len(), footer(&scratch_table)),
+            "tier 0 derives the manifest from a current-writer flush; when the \
+             sstable layout changes, give this test a per-version manifest"
+        );
+        manifest
+    } else {
+        // A format-1 table has no filter region, so its size differs from the
+        // current writer's; blocks and index are the same, so the index extents
+        // (the first 16 footer bytes) must agree, and the manifest is the
+        // current one transcoded back to a v1 image (format-1 table, no filter).
+        assert_eq!(
+            footer(table)[..16],
+            footer(&scratch_table)[..16],
+            "format 1 and format 2 tables share blocks and index"
+        );
+        animus_storage::reframe_manifest_to_v1(&manifest).expect("manifest to v1")
+    };
     let sc = Scenario::new(seed);
     sc.seed_file("MANIFEST", &manifest);
     sc.seed_file(&sst_name, table);
@@ -662,7 +677,20 @@ fn lsm_sstable_fixture_restarts_with_current_code() {
 #[test]
 fn lsm_sstable_negative_controls_are_caught() {
     let v1 = fixtures("lsm-sstable")[&1].clone();
+    let v2 = fixtures("lsm-sstable")[&2].clone();
     each_seed("tier0_lsm_sstable_neg", |seed| {
+        // A flipped byte inside a format-2 table's filter region fails the open.
+        let n = v2.len();
+        let index_end = u64::from_le_bytes(v2[n - 24..n - 16].try_into().unwrap())
+            + u64::from_le_bytes(v2[n - 16..n - 8].try_into().unwrap());
+        let mut bad_filter = v2.clone();
+        bad_filter[index_end as usize + 20] ^= 0xff;
+        match sstable_run(seed, 2, &bad_filter) {
+            Err(StorageError::Backend(m)) => {
+                assert!(m.contains("filter"), "seed={seed}: {m}")
+            }
+            other => panic!("seed={seed}: flipped filter byte must fail the open, got {other:?}"),
+        }
         let mut flipped = v1.clone();
         flipped[40] ^= 0xff; // inside the first data block
         match sstable_run(seed, 1, &flipped) {
@@ -823,6 +851,24 @@ fn lsm_wal_v2_transcodes_to_the_v1_fixture() {
     assert_eq!(v1, fixtures("lsm-wal")[&1].clone());
 }
 
+/// `CMF1` v3 -> v2 and v3 -> v1 (issue #1389): the v3 fixture transcodes to
+/// images carrying the older version byte, and current is the identity.
+#[test]
+fn lsm_manifest_v3_transcodes_to_v2_and_v1() {
+    let entry = transcode::TABLE
+        .iter()
+        .find(|e| e.name == "lsm-manifest")
+        .expect("lsm-manifest entry");
+    let v3 = fixtures("lsm-manifest")[&3].clone();
+    assert_eq!(v3[4], 3);
+    assert_eq!(entry.transcode_to(&v3, 3).expect("identity"), v3);
+    let v2 = entry.transcode_to(&v3, 2).expect("v3 -> v2");
+    assert_eq!(v2[4], 2);
+    let v1 = entry.transcode_to(&v3, 1).expect("v3 -> v1");
+    assert_eq!(v1[4], 1);
+    assert!(entry.transcode_to(&v3, 4).is_err());
+}
+
 /// `CMF1` (LSM manifest) v2 -> v1 (issue #1389): the transcode of the v2
 /// fixture is a v1 image (version byte 1, no per-table scheme byte, so one byte
 /// per table shorter) that the current decoder still opens; the one
@@ -840,7 +886,8 @@ fn lsm_manifest_v2_transcodes_to_a_decodable_v1_file() {
     // 3 tables: the v2 image carries one scheme byte each; the dropped Bloom
     // also loses its bits.
     assert!(v1.len() < v2.len() - 3, "{} vs {}", v1.len(), v2.len());
-    assert_eq!(entry.transcode_to(&v2, 2).expect("identity"), v2);
+    // Re-transcoding an already-v2 image to v2 is stable.
+    assert_eq!(entry.transcode_to(&v2, 2).expect("stable"), v2);
 }
 
 /// `SWL1` mirror of the CWL1 v2 -> v1 transcode check.
@@ -1105,8 +1152,9 @@ fn transcode_disk_classifies_refuses_unsupported_and_is_deterministic() {
     }
     let before = sc.snapshot_disk();
 
-    // One version back is unsupported today: an error, nothing rewritten.
-    let err = transcode::transcode_disk(&sc.env(), 1, &TranscodeOpts::default()).unwrap_err();
+    // Two versions back is unsupported today (the WALs and the sstable have no
+    // version 0): an error, nothing rewritten.
+    let err = transcode::transcode_disk(&sc.env(), 2, &TranscodeOpts::default()).unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{err}");
     assert_eq!(
         before,

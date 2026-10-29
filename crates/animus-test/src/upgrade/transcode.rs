@@ -6,8 +6,9 @@
 //! format back to an older version (`target_back` versions behind current),
 //! restarts on the current code, and verifies every acknowledged write.
 //!
-//! `lsm-wal`, `lsm-manifest`, `control-wal` and `shared-wal` are v2 and transcode to v1 for
-//! real; every other format is still v1 only, so its only supported target
+//! `lsm-wal`, `control-wal` and `shared-wal` are v2 and transcode to v1 for
+//! real; `lsm-manifest` is v3 (v2 and v1 for real) and `lsm-sstable` is v2 (its
+//! transcode to v1 is the identity, see [`lsm_sstable_transcode`]); every other format is still v1 only, so its only supported target
 //! is the current version and its transcode is the identity. A request for
 //! any unlisted target is an **error** ([`TranscodeError::UnsupportedTarget`]), never a
 //! silent identity: a harness that asked for "one version back" and got the
@@ -271,24 +272,63 @@ fn lsm_wal_transcode(
     }
 }
 
-/// `CMF1` (LSM manifest) v2 -> v1: drop the per-table Bloom hash-scheme byte
-/// (`animus_storage::reframe_manifest_to_v1`). A filter built under the current
-/// scheme cannot be expressed in v1 and is dropped (the table is then gated by
-/// key range alone); legacy-scheme filters survive.
+/// `CMF1` (LSM manifest) v3 -> v2 or v1 (issue #1389). v3 -> v2 re-inlines the
+/// filters a v2 reader needs for format-1 tables (`reframe_manifest_to_v2`);
+/// v1 additionally drops the Bloom hash-scheme byte
+/// (`animus_storage::reframe_manifest_to_v1`). A format-2 table's filter lives in
+/// its SSTable, which an older manifest cannot name: the table is recorded as
+/// format 1 with no filter (gated by key range alone, always correct). A filter
+/// built under the current scheme cannot be expressed in v1 and is dropped;
+/// legacy-scheme filters survive.
 fn lsm_manifest_transcode(
     entry: &FormatEntry,
     bytes: &[u8],
     target: u32,
 ) -> Result<Vec<u8>, TranscodeError> {
+    let malformed = |e: animus_storage::StorageError| TranscodeError::Malformed {
+        format: entry.name,
+        detail: e.to_string(),
+    };
     match target {
         t if t == entry.current_version => Ok(bytes.to_vec()),
-        1 => animus_storage::reframe_manifest_to_v1(bytes).map_err(|e| TranscodeError::Malformed {
-            format: entry.name,
-            detail: e.to_string(),
-        }),
+        2 => animus_storage::reframe_manifest_to_v2(bytes).map_err(malformed),
+        1 => animus_storage::reframe_manifest_to_v1(bytes).map_err(malformed),
         t => Err(entry.unsupported(t)),
     }
 }
+
+/// `lsm-sstable` v2 -> v1 (issue #1389): the identity, deliberately. A format-2
+/// table is its format-1 blocks and index followed by a filter region and the
+/// footer; a format-1 reader takes the index extents from the manifest and never
+/// reads past the index, so the same bytes are a valid format-1 table, and the
+/// transcoded manifest (`lsm_manifest_transcode`) records them as format 1.
+/// Stripping the region would only create mixed states (a current manifest over
+/// a table with no filter) that no real binary produces.
+fn lsm_sstable_transcode(
+    entry: &FormatEntry,
+    bytes: &[u8],
+    target: u32,
+) -> Result<Vec<u8>, TranscodeError> {
+    match target {
+        t if t == entry.current_version || t == 1 => Ok(bytes.to_vec()),
+        t => Err(entry.unsupported(t)),
+    }
+}
+
+const V1_V2_V3: &[VersionSpec] = &[
+    VersionSpec {
+        version: 1,
+        capabilities: CapabilityMask::ALL,
+    },
+    VersionSpec {
+        version: 2,
+        capabilities: CapabilityMask::ALL,
+    },
+    VersionSpec {
+        version: 3,
+        capabilities: CapabilityMask::ALL,
+    },
+];
 
 const V1_ONLY: &[VersionSpec] = &[VersionSpec {
     version: 1,
@@ -320,15 +360,15 @@ pub static TABLE: &[FormatEntry] = &[
     },
     FormatEntry {
         name: "lsm-manifest",
-        current_version: 2,
-        versions: V1_V2,
+        current_version: 3,
+        versions: V1_V2_V3,
         transcode: lsm_manifest_transcode,
     },
     FormatEntry {
         name: "lsm-sstable",
-        current_version: 1,
-        versions: V1_ONLY,
-        transcode: identity_current_only,
+        current_version: 2,
+        versions: V1_V2,
+        transcode: lsm_sstable_transcode,
     },
     FormatEntry {
         name: "control-wal",

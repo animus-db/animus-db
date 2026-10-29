@@ -136,6 +136,15 @@ fn derived() -> Vec<Seed> {
             "sstable_index",
             region,
         );
+        // Format 2: the filter region sits between the index and the footer.
+        if let Some(filter) = img.get(io + il..n - 24).filter(|r| !r.is_empty()) {
+            push(
+                "lsm_formats",
+                format!("{} (filter region)", rel(&f)),
+                "sstable_filter",
+                filter,
+            );
+        }
         // First index entry: magic(4) ver(1) count(4) | key_len(4) key off(8) len(8) ...
         if let Some(kl) = u32_le(region, 9)
             && let (Some(off), Some(len)) = (u64_le(region, 13 + kl), u64_le(region, 21 + kl))
