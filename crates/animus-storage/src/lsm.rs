@@ -196,7 +196,7 @@ mod sstable;
 mod wal;
 
 use bloom::{BloomFilter, HashScheme};
-use sstable::{Record, SsTableMeta, SsTableReader, SsTableWriter};
+use sstable::{FORMAT_FILTER_IN_TABLE, Record, SsTableMeta, SsTableReader, SsTableWriter};
 use wal::{GroupCommit, WAL_HEADER_LEN, WAL_MAGIC, WAL_MARKER_TAG, WAL_VERSION, WAL_VERSION_V1};
 
 /// Issue #1303: at most this many segment numbers below the live set are probed
@@ -1359,7 +1359,7 @@ impl<E: Env> LsmEngine<E> {
         // Load the durable manifest (or a fresh empty one). Decodes the compact
         // binary format; a foreign/pre-baseline manifest is refused loudly.
         let manifest_bytes = env.read(&manifest_file).await.map_err(io)?;
-        let manifest: Manifest = if manifest_bytes.is_empty() {
+        let mut manifest: Manifest = if manifest_bytes.is_empty() {
             Manifest::default()
         } else {
             decode_manifest(&manifest_bytes)?
@@ -1385,14 +1385,17 @@ impl<E: Env> LsmEngine<E> {
         // Open the SSTables the manifest names (reads their footer + index only).
         let block_reads = Arc::new(AtomicU64::new(0));
         let mut readers = Vec::with_capacity(manifest.tables.len());
-        for meta in &manifest.tables {
+        for meta in &mut manifest.tables {
             let file = format!("{prefix}sst-{:06}", meta.seq);
-            readers.push(
-                SsTableReader::open(&env, file, meta.clone())
-                    .await?
-                    .with_block_counter(Arc::clone(&block_reads))
-                    .with_metrics(metrics.clone()),
-            );
+            let reader = SsTableReader::open(&env, file, meta.clone())
+                .await?
+                .with_block_counter(Arc::clone(&block_reads))
+                .with_metrics(metrics.clone());
+            // Adopt the opened meta: a format-2 table's filter was just loaded
+            // from its file, and the introspection views read `has_bloom` here.
+            // (Re-encoding it into the manifest drops the filter bits again.)
+            *meta = reader.meta().clone();
+            readers.push(reader);
         }
 
         // Determine the live WAL segments to replay, then replay them in order
@@ -4705,6 +4708,11 @@ pub mod fuzzing {
         sstable::fuzz_shims::block_index(bytes).map_err(|e| e.to_string())
     }
 
+    /// SSTable filter region (format 2).
+    pub fn sstable_filter(bytes: &[u8]) -> std::result::Result<usize, String> {
+        sstable::fuzz_shims::filter(bytes).map_err(|e| e.to_string())
+    }
+
     /// Open a whole SSTable image already written to `file` on `env`, then
     /// scan and point-read it.
     pub async fn sstable_image<E: Env>(
@@ -4946,7 +4954,116 @@ mod legacy {
                     out.extend_from_slice(&1u32.to_be_bytes());
                     put_bytes(&mut out, &[]);
                 }
-                out.extend_from_slice(&t.format.to_be_bytes());
+                out.extend_from_slice(&t.format.min(1).to_be_bytes());
+            }
+            out.extend_from_slice(&(m.wal_segments.len() as u32).to_be_bytes());
+            for &seg in &m.wal_segments {
+                out.extend_from_slice(&seg.to_be_bytes());
+            }
+            out
+        }
+    }
+
+    /// The v2 manifest: every table record carries its Bloom filter inline,
+    /// tagged with its hash scheme (issue #1389). A v2 table is SSTable format 1,
+    /// so its filter stays in use until compaction replaces the table.
+    pub(super) mod manifest_v2 {
+        use super::super::{
+            BloomFilter, Cursor, HashScheme, Manifest, Result, SsTableMeta, StorageError,
+        };
+        #[cfg(any(test, feature = "legacy-encoders"))]
+        use super::super::{MANIFEST_MAGIC, put_bytes, put_opt_bytes};
+
+        /// The v2 manifest body decoder (frozen); `c` is positioned just past the
+        /// version byte. Identical to v1 except each table record carries a trailing
+        /// `bloom_scheme(u8)` after `bloom_k` naming the hash scheme its Bloom bits
+        /// were set with.
+        pub(in super::super) fn decode_manifest(mut c: Cursor<'_>) -> Result<Manifest> {
+            let next_seq = c.u64()?;
+            let max_version = c.u64()?;
+            let table_count = c.u32()? as usize;
+            // Capped pre-allocation against an untrusted on-disk length prefix: see the
+            // frozen v1 decoder for why.
+            let mut tables = Vec::with_capacity(table_count.min(1 << 20));
+            for _ in 0..table_count {
+                let seq = c.u64()?;
+                let level = c.u32()?;
+                let min_key = c.opt_bytes()?;
+                let max_key = c.opt_bytes()?;
+                let min_version = c.u64()?;
+                let tbl_max_version = c.u64()?;
+                let index_offset = c.u64()?;
+                let index_len = c.u64()?;
+                let file_size = c.u64()?;
+                let has_bloom = c.u8()? != 0;
+                let bloom_k = c.u32()?;
+                let scheme_tag = c.u8()?;
+                let scheme = HashScheme::from_tag(scheme_tag).ok_or_else(|| {
+                    StorageError::Backend(format!(
+                        "unknown bloom hash scheme {scheme_tag} in manifest"
+                    ))
+                })?;
+                let bloom_bits = c.bytes()?;
+                let format = c.u32()?;
+                tables.push(SsTableMeta {
+                    seq,
+                    level,
+                    min_key,
+                    max_key,
+                    min_version,
+                    max_version: tbl_max_version,
+                    index_offset,
+                    index_len,
+                    file_size,
+                    bloom: BloomFilter::from_parts(bloom_bits, bloom_k, scheme),
+                    has_bloom,
+                    format,
+                });
+            }
+            // Trailer: the live WAL-segment list.
+            let count = c.u32()? as usize;
+            let mut wal_segments = Vec::with_capacity(count.min(1 << 20));
+            for _ in 0..count {
+                wal_segments.push(c.u64()?);
+            }
+            Ok(Manifest {
+                next_seq,
+                tables,
+                max_version,
+                wal_segments,
+            })
+        }
+
+        /// Test-only legacy encoder (ADR 0073 "Legacy encoders are test-only"):
+        /// a whole v2 manifest image. A table of a newer SSTable format keeps its
+        /// filter in its file, which a v2 reader cannot see: it is written as
+        /// format 1 with whatever filter the in-memory meta holds (none if it was
+        /// never loaded, which is valid, a range-gated table). The file itself is
+        /// a valid format-1 table (the filter region is past the index).
+        #[cfg(any(test, feature = "legacy-encoders"))]
+        pub(in super::super) fn encode_manifest(m: &Manifest) -> Vec<u8> {
+            let mut out = Vec::new();
+            out.extend_from_slice(&MANIFEST_MAGIC);
+            out.push(2);
+            out.extend_from_slice(&m.next_seq.to_be_bytes());
+            out.extend_from_slice(&m.max_version.to_be_bytes());
+            out.extend_from_slice(&(m.tables.len() as u32).to_be_bytes());
+            for t in &m.tables {
+                out.extend_from_slice(&t.seq.to_be_bytes());
+                out.extend_from_slice(&t.level.to_be_bytes());
+                put_opt_bytes(&mut out, &t.min_key);
+                put_opt_bytes(&mut out, &t.max_key);
+                out.extend_from_slice(&t.min_version.to_be_bytes());
+                out.extend_from_slice(&t.max_version.to_be_bytes());
+                out.extend_from_slice(&t.index_offset.to_be_bytes());
+                out.extend_from_slice(&t.index_len.to_be_bytes());
+                out.extend_from_slice(&t.file_size.to_be_bytes());
+                out.push(u8::from(t.has_bloom));
+                let (bits, k, scheme) = t.bloom.as_parts();
+                out.extend_from_slice(&k.to_be_bytes());
+                out.push(scheme.tag());
+                put_bytes(&mut out, bits);
+                out.extend_from_slice(&t.format.min(1).to_be_bytes());
             }
             out.extend_from_slice(&(m.wal_segments.len() as u32).to_be_bytes());
             for &seg in &m.wal_segments {
@@ -4988,6 +5105,24 @@ pub fn reframe_manifest_to_v1(bytes: &[u8]) -> Result<Vec<u8>> {
         return Ok(Vec::new());
     }
     Ok(legacy::manifest_v1::encode_manifest(&decode_manifest(
+        bytes,
+    )?))
+}
+
+/// Re-frame a current-version (v3) manifest image as a v2 image (inline filters,
+/// scheme-tagged): decode and re-encode under the v2 layout. A table of SSTable
+/// format 2 is recorded as format 1 with no filter (range-gated only, which is
+/// always correct); a format-1 table keeps its inline filter. The upgrade-restart
+/// harness's transcode for `lsm-manifest` to v2 (ADR 0073, issue #1389).
+///
+/// # Errors
+/// Whatever [`decode_manifest`] reports for `bytes`.
+#[cfg(any(test, feature = "legacy-encoders"))]
+pub fn reframe_manifest_to_v2(bytes: &[u8]) -> Result<Vec<u8>> {
+    if bytes.is_empty() {
+        return Ok(Vec::new());
+    }
+    Ok(legacy::manifest_v2::encode_manifest(&decode_manifest(
         bytes,
     )?))
 }
@@ -5123,8 +5258,8 @@ pub async fn rewrite_row_values<E: Env>(
         }
         let mut manifest = decode_manifest(&bytes)?;
         // Re-encode at the version the manifest already has (like a WAL
-        // segment), so a transcoded-back v1 manifest stays v1.
-        let manifest_v1 = bytes.get(4) == Some(&1);
+        // segment), so a transcoded-back v1 or v2 manifest stays that version.
+        let manifest_version = bytes.get(4).copied().unwrap_or(MANIFEST_VERSION);
         let mut manifest_dirty = false;
         for i in 0..manifest.tables.len() {
             let meta = manifest.tables[i].clone();
@@ -5162,10 +5297,10 @@ pub async fn rewrite_row_values<E: Env>(
             report.files_rewritten.push(file);
         }
         if manifest_dirty {
-            let out = if manifest_v1 {
-                legacy::manifest_v1::encode_manifest(&manifest)
-            } else {
-                encode_manifest(&manifest)
+            let out = match manifest_version {
+                1 => legacy::manifest_v1::encode_manifest(&manifest),
+                2 => legacy::manifest_v2::encode_manifest(&manifest),
+                _ => encode_manifest(&manifest),
             };
             env.replace(mfile, &out).await.map_err(io)?;
         }
@@ -5910,10 +6045,18 @@ mod wal_format_fixture_tests {
 //   | min_key: opt_bytes | max_key: opt_bytes
 //   | min_version(u64) | max_version(u64)
 //   | index_offset(u64) | index_len(u64) | file_size(u64)
-//   | has_bloom(u8) | bloom_k(u32) | bloom_scheme(u8, v2+) | bloom_bits: bytes
-//   | format(u32)
+//   | v1/v2: has_bloom(u8) | bloom_k(u32) | bloom_scheme(u8, v2 only) | bloom_bits: bytes
+//            | format(u32)
+//   | v3:    format(u32) | [only if format < 2: the v2 filter fields above, in the
+//            same order: has_bloom(u8) | bloom_k(u32) | bloom_scheme(u8) | bloom_bits]
 //
 //   bloom_scheme := 0 legacy FNV pair (what every v1 filter used) | 1 SplitMix
+//
+// v3 (issue #1389): a table of SSTable format >= 2 carries its Bloom filter in
+// the table file (`sstable.rs` filter region), so its manifest record has no
+// filter fields at all; only a legacy format-1 table still carries its filter
+// inline (it has none in its file), until compaction replaces it. The manifest
+// is therefore a fixed few hundred bytes per live table, whatever the key count.
 //
 //   opt_bytes := present(u8) [ len(u32) bytes ]   (present 0 => None)
 //   bytes     := len(u32) bytes
@@ -5941,7 +6084,9 @@ const MANIFEST_MAGIC: [u8; 4] = *b"CMF1";
 /// (issue #1389) tags every table's Bloom filter with its hash scheme
 /// (`bloom_scheme`), because v1 filters were built with correlated FNV base
 /// hashes and must keep being probed with them; new filters use SplitMix.
-const MANIFEST_VERSION: u8 = 2;
+/// **v3** (issue #1389) drops the filter bits from the record of every table
+/// whose SSTable format keeps its filter in the file (format >= 2).
+const MANIFEST_VERSION: u8 = 3;
 
 /// Append a length-prefixed (`u32`) byte string.
 fn put_bytes(out: &mut Vec<u8>, b: &[u8]) {
@@ -5978,12 +6123,15 @@ fn encode_manifest(m: &Manifest) -> Vec<u8> {
         out.extend_from_slice(&t.index_offset.to_be_bytes());
         out.extend_from_slice(&t.index_len.to_be_bytes());
         out.extend_from_slice(&t.file_size.to_be_bytes());
-        out.push(u8::from(t.has_bloom));
-        let (bits, k, scheme) = t.bloom.as_parts();
-        out.extend_from_slice(&k.to_be_bytes());
-        out.push(scheme.tag());
-        put_bytes(&mut out, bits);
         out.extend_from_slice(&t.format.to_be_bytes());
+        if t.format < FORMAT_FILTER_IN_TABLE {
+            // A legacy table has no filter in its file: the manifest keeps it.
+            out.push(u8::from(t.has_bloom));
+            let (bits, k, scheme) = t.bloom.as_parts();
+            out.extend_from_slice(&k.to_be_bytes());
+            out.push(scheme.tag());
+            put_bytes(&mut out, bits);
+        }
     }
     // Trailer: the live WAL-segment list.
     out.extend_from_slice(&(m.wal_segments.len() as u32).to_be_bytes());
@@ -6072,7 +6220,8 @@ fn decode_manifest(bytes: &[u8]) -> Result<Manifest> {
     // Version dispatch (ADR 0073 Phase 1): exact `match`; see `legacy`.
     match version {
         1 => legacy::manifest_v1::decode_manifest(c),
-        2 => decode_manifest_v2(c),
+        2 => legacy::manifest_v2::decode_manifest(c),
+        3 => decode_manifest_v3(c),
         v => Err(StorageError::UnsupportedFormatVersion {
             format: "lsm-manifest",
             found: u32::from(v),
@@ -6081,11 +6230,13 @@ fn decode_manifest(bytes: &[u8]) -> Result<Manifest> {
     }
 }
 
-/// The v2 (current) manifest body decoder; `c` is positioned just past the
-/// version byte. Identical to v1 except each table record carries a trailing
-/// `bloom_scheme(u8)` after `bloom_k` naming the hash scheme its Bloom bits
-/// were set with.
-fn decode_manifest_v2(mut c: Cursor<'_>) -> Result<Manifest> {
+/// The v3 (current) manifest body decoder; `c` is positioned just past the
+/// version byte. A table record is the shared header, then `format(u32)`, then,
+/// only for a table of a format that keeps no filter in its file (`format <
+/// FORMAT_FILTER_IN_TABLE`), the v2 inline filter fields. A format-2 table's
+/// filter is loaded from its SSTable at open (`SsTableReader::open`), so it
+/// decodes here with an empty, not-yet-loaded filter (`has_bloom = false`).
+fn decode_manifest_v3(mut c: Cursor<'_>) -> Result<Manifest> {
     let next_seq = c.u64()?;
     let max_version = c.u64()?;
     let table_count = c.u32()? as usize;
@@ -6102,16 +6253,24 @@ fn decode_manifest_v2(mut c: Cursor<'_>) -> Result<Manifest> {
         let index_offset = c.u64()?;
         let index_len = c.u64()?;
         let file_size = c.u64()?;
-        let has_bloom = c.u8()? != 0;
-        let bloom_k = c.u32()?;
-        let scheme_tag = c.u8()?;
-        let scheme = HashScheme::from_tag(scheme_tag).ok_or_else(|| {
-            StorageError::Backend(format!(
-                "unknown bloom hash scheme {scheme_tag} in manifest"
-            ))
-        })?;
-        let bloom_bits = c.bytes()?;
         let format = c.u32()?;
+        let (bloom, has_bloom) = if format < FORMAT_FILTER_IN_TABLE {
+            let has_bloom = c.u8()? != 0;
+            let bloom_k = c.u32()?;
+            let scheme_tag = c.u8()?;
+            let scheme = HashScheme::from_tag(scheme_tag).ok_or_else(|| {
+                StorageError::Backend(format!(
+                    "unknown bloom hash scheme {scheme_tag} in manifest"
+                ))
+            })?;
+            let bloom_bits = c.bytes()?;
+            (
+                BloomFilter::from_parts(bloom_bits, bloom_k, scheme),
+                has_bloom,
+            )
+        } else {
+            (BloomFilter::default(), false)
+        };
         tables.push(SsTableMeta {
             seq,
             level,
@@ -6122,7 +6281,7 @@ fn decode_manifest_v2(mut c: Cursor<'_>) -> Result<Manifest> {
             index_offset,
             index_len,
             file_size,
-            bloom: BloomFilter::from_parts(bloom_bits, bloom_k, scheme),
+            bloom,
             has_bloom,
             format,
         });
@@ -6201,6 +6360,11 @@ mod manifest_tests {
                         bloom: BloomFilter::default(),
                         ..sample_meta(3, false)
                     },
+                    // Format 2: the filter is in the table file, none in the manifest.
+                    SsTableMeta {
+                        format: 2,
+                        ..sample_meta(4, false)
+                    },
                 ],
                 wal_segments: vec![2, 3, 5],
             },
@@ -6232,10 +6396,37 @@ mod manifest_tests {
         }
     }
 
-    /// Deterministic, representative manifest for the golden fixture: fixed
-    /// keys/versions, tables with and without a bloom and with an empty-key
-    /// table, and a non-empty WAL-segment list (ADR 0073 fixture-determinism).
+    /// Deterministic, representative manifest for the golden fixture (the current
+    /// version, v3): fixed keys/versions, format-1 tables with an inline filter
+    /// (both hash schemes) and without one, a format-2 table (its filter lives in
+    /// its file, so it decodes with none), an empty-key table, and a non-empty
+    /// WAL-segment list (ADR 0073 fixture-determinism).
     fn representative_manifest() -> Manifest {
+        Manifest {
+            next_seq: 7,
+            max_version: 1234,
+            tables: vec![
+                sample_meta_for(1, true, true),
+                sample_meta_for(2, true, false),
+                sample_meta(3, false),
+                SsTableMeta {
+                    format: 2,
+                    ..sample_meta(4, false)
+                },
+                SsTableMeta {
+                    min_key: None,
+                    max_key: None,
+                    format: 2,
+                    ..sample_meta(5, false)
+                },
+            ],
+            wal_segments: vec![2, 3, 5],
+        }
+    }
+
+    /// The v2 fixture's expectation: every table is format 1 with its inline
+    /// filter (current scheme on table 1).
+    fn representative_manifest_v2() -> Manifest {
         representative_manifest_for(false)
     }
 
@@ -6311,7 +6502,8 @@ mod manifest_tests {
             // `MANIFEST_VERSION`); an unknown version panics, never skips.
             let expected = match crate::fixture_file_version(&path) {
                 1 => representative_manifest_v1(),
-                2 => representative_manifest(),
+                2 => representative_manifest_v2(),
+                3 => representative_manifest(),
                 v => panic!(
                     "fixture {} is version {v} but this test has no expectation for it — \
                      add a per-version arm (ADR 0073 Phase 1 checklist)",
@@ -6442,7 +6634,7 @@ mod manifest_tests {
         assert_eq!(reframe_manifest_to_v1(&v1).expect("again"), v1);
     }
 
-    /// An unknown Bloom scheme tag in a v2 manifest is a loud error, never a
+    /// An unknown Bloom scheme tag in a v2/v3 manifest is a loud error, never a
     /// silent mis-probe.
     #[test]
     fn unknown_bloom_scheme_tag_is_refused() {
@@ -6451,11 +6643,11 @@ mod manifest_tests {
             wal_segments: vec![],
             ..Manifest::default()
         });
-        // Locate the scheme byte: it sits right after `has_bloom(1)+bloom_k(4)`.
+        // Locate the scheme byte: it sits after `format(4)+has_bloom(1)+bloom_k(4)`.
         let table_fixed = 4 + 1 + 8 + 8 + 4 + 8 + 4; // magic, ver, next_seq, max_version, count, seq, level
         let min_key = 1 + 4 + "min-1".len();
         let max_key = 1 + 4 + "max-1".len();
-        let pos = table_fixed + min_key + max_key + 8 * 5 + 1 + 4;
+        let pos = table_fixed + min_key + max_key + 8 * 5 + 4 + 1 + 4; // format, has_bloom, bloom_k
         assert_eq!(
             bytes[pos],
             HashScheme::CURRENT.tag(),
@@ -6505,6 +6697,9 @@ mod manifest_tests {
             let keys: Vec<Vec<u8>> = (0u32..300).map(key).collect();
             let refs: Vec<&[u8]> = keys.iter().map(Vec::as_slice).collect();
             m.tables[0].bloom = BloomFilter::build_legacy(&refs);
+            // The flushed table is format 2 (filter in its file, none in `m`);
+            // v1 records it as format 1 with the legacy filter just built.
+            m.tables[0].has_bloom = true;
             let v1 = legacy::manifest_v1::encode_manifest(&m);
             assert_eq!(v1[4], 1);
             env.replace("m/MANIFEST", &v1).await.expect("replace");
@@ -6520,14 +6715,18 @@ mod manifest_tests {
             }
             assert_eq!(e.get(b"k99999").await.unwrap(), None);
 
-            // A new flush writes a v2 manifest carrying both schemes.
+            // A new flush writes a v3 manifest: the legacy table keeps its inline
+            // filter, the new one (SSTable format 2) carries none.
             e.put(b"zz", b"w", 1000).await.expect("put");
             e.flush_now().await.expect("flush");
             drop(e);
             let m = decode_manifest(&env.read("m/MANIFEST").await.expect("read")).unwrap();
-            let schemes: Vec<_> = m.tables.iter().map(|t| t.bloom.as_parts().2).collect();
-            assert!(schemes.contains(&HashScheme::LegacyFnv), "{schemes:?}");
-            assert!(schemes.contains(&HashScheme::CURRENT), "{schemes:?}");
+            assert_eq!(m.tables.len(), 2);
+            assert_eq!(m.tables[0].format, 1);
+            assert!(m.tables[0].has_bloom);
+            assert_eq!(m.tables[0].bloom.as_parts().2, HashScheme::LegacyFnv);
+            assert_eq!(m.tables[1].format, 2);
+            assert!(!m.tables[1].has_bloom, "format 2 filter is in the file");
             let e = LsmEngine::open_with(sim.env(nid(0)), "m/", opts())
                 .await
                 .expect("reopen mixed");
@@ -6536,6 +6735,260 @@ mod manifest_tests {
             }
             assert!(e.get(b"zz").await.unwrap().is_some());
         });
+    }
+
+    /// The checked-in v2 fixture is exactly what the frozen v2 legacy encoder
+    /// writes for the v2 expectation, and v2 keeps decoding to format-1 tables
+    /// with their inline (current-scheme) filter.
+    #[test]
+    fn v2_fixture_matches_the_legacy_encoder() {
+        let bytes = std::fs::read(fixture_dir().join("v2.bin")).expect("v2 fixture");
+        assert_eq!(
+            legacy::manifest_v2::encode_manifest(&representative_manifest_v2()),
+            bytes
+        );
+        let m = decode_manifest(&bytes).expect("decode v2");
+        assert!(m.tables.iter().all(|t| t.format == 1));
+        assert!(m.tables[0].has_bloom);
+        assert_eq!(m.tables[0].bloom.as_parts().2, HashScheme::CURRENT);
+    }
+
+    /// Issue #1389: a format-2 table's manifest record is the same size whether
+    /// its filter holds 3 keys or 100,000, because the manifest does not carry it;
+    /// a format-1 table's record still carries its filter.
+    #[test]
+    fn v3_record_of_a_format_2_table_has_no_filter_bits() {
+        let big: Vec<Vec<u8>> = (0u32..100_000).map(|i| i.to_be_bytes().to_vec()).collect();
+        let refs: Vec<&[u8]> = big.iter().map(Vec::as_slice).collect();
+        let image = |format: u32, bloom: Option<BloomFilter>| {
+            encode_manifest(&Manifest {
+                tables: vec![SsTableMeta {
+                    format,
+                    has_bloom: bloom.is_some(),
+                    bloom: bloom.unwrap_or_default(),
+                    ..sample_meta(1, false)
+                }],
+                ..Manifest::default()
+            })
+            .len()
+        };
+        let small = image(2, Some(BloomFilter::build(&refs[..3])));
+        let large = image(2, Some(BloomFilter::build(&refs)));
+        assert_eq!(small, large, "format 2 records carry no filter bits");
+        assert!(large < 200, "a format-2 record is small: {large} B");
+        let legacy = image(1, Some(BloomFilter::build(&refs)));
+        assert!(
+            legacy > 100_000,
+            "a format-1 record still carries its filter"
+        );
+    }
+
+    /// v3 -> v2 and v3 -> v1 transcodes: a format-2 table is recorded as format 1
+    /// with no filter (range-gated only), format-1 filters survive v2 (and the
+    /// legacy-scheme ones survive v1); both results decode, and are stable.
+    #[test]
+    fn reframe_v3_down_to_v2_and_v1() {
+        let v3 = encode_manifest(&representative_manifest());
+        let v2 = reframe_manifest_to_v2(&v3).expect("to v2");
+        assert_eq!(v2[4], 2);
+        let m = decode_manifest(&v2).expect("decode v2");
+        assert!(m.tables.iter().all(|t| t.format == 1));
+        assert_eq!(m.tables[0].bloom.as_parts().2, HashScheme::LegacyFnv);
+        assert_eq!(m.tables[1].bloom.as_parts().2, HashScheme::CURRENT);
+        assert!(m.tables[0].has_bloom && m.tables[1].has_bloom);
+        assert!(!m.tables[3].has_bloom && !m.tables[4].has_bloom);
+        assert_eq!(reframe_manifest_to_v2(&v2).expect("again"), v2);
+        let v1 = reframe_manifest_to_v1(&v3).expect("to v1");
+        assert_eq!(v1[4], 1);
+        let m = decode_manifest(&v1).expect("decode v1");
+        assert!(m.tables.iter().all(|t| t.format == 1));
+        assert!(m.tables[0].has_bloom, "legacy filter kept");
+        assert!(!m.tables[1].has_bloom, "current-scheme filter dropped");
+    }
+
+    /// Issue #1389 end to end across the format change. An engine whose files are
+    /// a v2 manifest with inline filters over three old (format-1) SSTables opens
+    /// and answers every key, including absent ones; after flushes and
+    /// compactions the manifest is v3, every live table is format 2 with its
+    /// filter in the file (none in the manifest), and a reopen answers again.
+    #[test]
+    fn engine_migrates_v2_manifest_and_format_1_tables_to_v3_and_format_2() {
+        use crate::StorageEngine;
+        use animus_env::{Disk, nid};
+        use animus_sim::Simulator;
+        use futures::executor::block_on;
+
+        let sim = Simulator::new(1390);
+        let opts = || LsmOptions {
+            flush_threshold_bytes: 1 << 30,
+            compaction_trigger: 3,
+            target_table_bytes: 1 << 20,
+            background_maintenance: false,
+            ..LsmOptions::default()
+        };
+        let key = |i: u32| format!("k{i:05}").into_bytes();
+        block_on(async {
+            let env = sim.env(nid(0));
+            // Three overlapping L0 tables of the old format, 100 keys each,
+            // spaced so no table covers another's keys exactly.
+            let mut tables = Vec::new();
+            for t in 0u32..3 {
+                let records: Vec<Record> = (0u32..100)
+                    .map(|j| Record {
+                        key: key(j * 3 + t),
+                        version: u64::from(t) * 100 + u64::from(j) + 1,
+                        value: Some(format!("old{t}").into_bytes()),
+                    })
+                    .collect();
+                let file = format!("m/sst-{:06}", t + 1);
+                let meta = SsTableWriter::write_v1(&env, &file, u64::from(t) + 1, 0, &records)
+                    .await
+                    .expect("write v1 table");
+                env.sync(&file).await.expect("sync");
+                assert_eq!((meta.format, meta.has_bloom), (1, true));
+                tables.push(meta);
+            }
+            let old = Manifest {
+                next_seq: 4,
+                max_version: 300,
+                tables,
+                wal_segments: vec![],
+            };
+            let v2 = legacy::manifest_v2::encode_manifest(&old);
+            assert_eq!(v2[4], 2);
+            env.replace("m/MANIFEST", &v2).await.expect("replace");
+
+            let e = LsmEngine::open_with(sim.env(nid(0)), "m/", opts())
+                .await
+                .expect("open v2 manifest + format-1 tables");
+            async fn check(e: &LsmEngine<animus_sim::SimEnv>, tag: &str) {
+                let key = |i: u32| format!("k{i:05}").into_bytes();
+                for i in 0u32..300 {
+                    let got = e.get(&key(i)).await.unwrap();
+                    assert_eq!(
+                        got.map(|v| v.value),
+                        Some(format!("old{}", i % 3).into_bytes()),
+                        "{tag}: key {i}"
+                    );
+                }
+                for i in 300u32..400 {
+                    assert!(e.get(&key(i)).await.unwrap().is_none(), "{tag}: absent {i}");
+                }
+            }
+            check(&e, "open").await;
+            assert!(
+                e.sstable_views()
+                    .iter()
+                    .all(|v| v.format == 1 && v.has_bloom)
+            );
+
+            // Flush new data (a format-2 table), then compact everything.
+            for round in 0u32..4 {
+                for j in 0u32..50 {
+                    e.put(
+                        &key(1000 + round * 50 + j),
+                        b"new",
+                        1000 + u64::from(round * 50 + j),
+                    )
+                    .await
+                    .unwrap();
+                }
+                e.flush_now().await.unwrap();
+            }
+            let image = decode_manifest(&env.read("m/MANIFEST").await.unwrap()).unwrap();
+            assert_eq!(env.read("m/MANIFEST").await.unwrap()[4], MANIFEST_VERSION);
+            assert!(
+                image.tables.iter().any(|t| t.format == 2),
+                "new tables are format 2"
+            );
+            for _ in 0..8 {
+                e.compact_now().await.unwrap();
+            }
+            check(&e, "compacted").await;
+            let views = e.sstable_views();
+            assert!(
+                views.iter().all(|v| v.format == 2 && v.has_bloom),
+                "old tables compacted away: {views:?}"
+            );
+            let image = decode_manifest(&env.read("m/MANIFEST").await.unwrap()).unwrap();
+            assert!(image.tables.iter().all(|t| t.format == 2 && !t.has_bloom));
+            drop(e);
+
+            let e = LsmEngine::open_with(sim.env(nid(0)), "m/", opts())
+                .await
+                .expect("reopen v3 manifest");
+            check(&e, "reopened").await;
+            assert!(
+                e.sstable_views()
+                    .iter()
+                    .all(|v| v.format == 2 && v.has_bloom)
+            );
+        });
+    }
+
+    /// The harness direction: an engine's v3 manifest over format-2 tables,
+    /// transcoded back to v2 or v1 (tables recorded as format 1, no filter,
+    /// files untouched), still opens and answers every key, range-gated only;
+    /// the next flush republishes a v3 manifest.
+    #[test]
+    fn engine_opens_a_v3_manifest_transcoded_back_to_v2_and_v1() {
+        use crate::StorageEngine;
+        use animus_env::{Disk, nid};
+        use animus_sim::Simulator;
+        use futures::executor::block_on;
+
+        let opts = || LsmOptions {
+            flush_threshold_bytes: 1 << 30,
+            compaction_trigger: 1 << 20,
+            background_maintenance: false,
+            ..LsmOptions::default()
+        };
+        for back in [2u8, 1] {
+            let sim = Simulator::new(1391 + u64::from(back));
+            block_on(async {
+                let env = sim.env(nid(0));
+                let e = LsmEngine::open_with(sim.env(nid(0)), "m/", opts())
+                    .await
+                    .unwrap();
+                for round in 0u32..3 {
+                    for i in 0u32..100 {
+                        let k = format!("k{:05}", i * 3 + round);
+                        e.put(k.as_bytes(), b"v", u64::from(round * 100 + i) + 1)
+                            .await
+                            .unwrap();
+                    }
+                    e.flush_now().await.unwrap();
+                }
+                drop(e);
+                let v3 = env.read("m/MANIFEST").await.unwrap();
+                assert_eq!(v3[4], 3);
+                let old = match back {
+                    2 => reframe_manifest_to_v2(&v3).unwrap(),
+                    _ => reframe_manifest_to_v1(&v3).unwrap(),
+                };
+                assert_eq!(old[4], back);
+                env.replace("m/MANIFEST", &old).await.unwrap();
+                let e = LsmEngine::open_with(sim.env(nid(0)), "m/", opts())
+                    .await
+                    .unwrap();
+                assert!(
+                    e.sstable_views()
+                        .iter()
+                        .all(|v| v.format == 1 && !v.has_bloom)
+                );
+                for i in 0u32..300 {
+                    let k = format!("k{i:05}");
+                    assert!(
+                        e.get(k.as_bytes()).await.unwrap().is_some(),
+                        "back={back} {k}"
+                    );
+                }
+                assert!(e.get(b"k00500").await.unwrap().is_none());
+                e.put(b"zz", b"v", 5000).await.unwrap();
+                e.flush_now().await.unwrap();
+                assert_eq!(env.read("m/MANIFEST").await.unwrap()[4], 3);
+            });
+        }
     }
 
     /// Engine-level crash soundness: the manifest is swapped by an atomic

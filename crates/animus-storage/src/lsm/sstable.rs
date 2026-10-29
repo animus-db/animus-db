@@ -6,8 +6,10 @@
 //! ## File layout
 //!
 //! ```text
-//! [ block 0 ] [ block 1 ] ... [ block K-1 ] [ index region ] [ footer ]
+//! [ block 0 ] [ block 1 ] ... [ block K-1 ] [ index region ] [ filter region ] [ footer ]
 //! ```
+//!
+//! (the filter region exists from format 2; format 1 has none)
 //!
 //! - A **block** holds a contiguous run of records (sorted by `(key asc,
 //!   version asc)` across the whole table), framed `tag(u8) || payload ||
@@ -41,14 +43,27 @@
 //!   `read_at` at `size - 24`, then reads the index region, then individual blocks
 //!   on demand.
 //!
+//! - The **filter region** (format 2, issue #1389) sits between the index region
+//!   and the footer: the table's Bloom filter over its distinct user keys, as
+//!   `FILTER_MAGIC(4 = b"SSBF") | version(u8) | scheme(u8) | k(u32 LE) |
+//!   bits_len(u32 LE) | bits | crc32(u32 LE over everything before it)`. `scheme`
+//!   is the [`HashScheme`] tag, so the hash scheme travels with the bits. It has
+//!   no recorded offset: it starts at `index_offset + index_len` and ends at
+//!   `file_size - FOOTER_LEN`, both of which the manifest already records. The
+//!   reader loads it once when the table is opened and keeps it in memory; the
+//!   manifest (v3) no longer carries filter bits for a format-2 table. It is
+//!   appended and synced with the table, before the manifest names the table,
+//!   exactly like the data blocks. A format-1 reader never looks past the index
+//!   region (its offsets come from the manifest), so a format-2 file is also a
+//!   valid format-1 file whose trailing filter region is ignored.
+//!
 //! A record's value slot is `Some(value)` or `None` (tombstone). The CRC lets a
 //! read detect a corrupt/torn block; but note the manifest only references a
 //! table whose bytes were `sync`ed before the (atomic) manifest swap, so a torn
 //! block is never reachable in practice — the CRC is defence in depth.
 //!
-//! There is a **single on-disk format** (pre-alpha; no older tables exist —
-//! ADR 0008). [`SsTableMeta::format`] is retained as a per-table version tag for
-//! operator introspection and as a hook should the format ever evolve again.
+//! [`SsTableMeta::format`] is the per-table version tag the manifest records and
+//! the reader dispatches on (see [`FORMAT_CURRENT`]).
 //!
 //! [`Disk::read_at`]: animus_env::Disk::read_at
 
@@ -59,7 +74,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use animus_env::nid;
 use animus_env::{Env, Metric, MetricsHandle};
 
-use super::bloom::BloomFilter;
+use super::bloom::{BloomFilter, HashScheme};
 use crate::{Key, Result, StorageError, Value, Version};
 
 /// Magic in the footer, identifying an AnimusDB SSTable. Used for file
@@ -70,11 +85,16 @@ const MAGIC: u64 = 0x4355_5354_4F53_5333; // "ANIMUS S3"
 /// reset the counter to 1). The reader **dispatches** on the manifest-recorded
 /// [`SsTableMeta::format`] ([`check_format`] at open, a `match` in
 /// `read_block`): `1` is the compression-capable framing + shared-prefix key
-/// encoding; any other value is a loud
+/// encoding with the Bloom filter in the manifest; `2` (issue #1389) is the same
+/// blocks and index plus a filter region ([`FORMAT_FILTER_IN_TABLE`]); any
+/// other value is a loud
 /// [`StorageError::UnsupportedFormatVersion`] (`"lsm-sstable"`). A format
 /// change adds a new value, a new decoder arm and a new golden fixture under
 /// `tests/fixtures/formats/lsm-sstable/`.
-const FORMAT_CURRENT: u32 = 1;
+const FORMAT_CURRENT: u32 = 2;
+/// The first format whose Bloom filter lives in the table file (a filter region
+/// before the footer) rather than inline in the manifest.
+pub(super) const FORMAT_FILTER_IN_TABLE: u32 = 2;
 
 /// Refuse an SSTable whose manifest-recorded `format` this binary cannot decode.
 fn check_format(format: u32) -> Result<()> {
@@ -94,11 +114,12 @@ fn unsupported_format(found: u32) -> StorageError {
 }
 
 /// Legacy (pre-current-format) SSTable block decoders (ADR 0073 Phase 1,
-/// "upgrade-on-read"). Empty while the only format is 1. Once format N+1
-/// exists, the `vN` block decoder moves to `legacy::vN` unchanged in behavior
-/// and — the upgrade-on-read contract — returns the *current* in-memory
-/// records (`Vec<Record>`); `read_block`'s `match` on `meta.format` routes to
-/// it. Never deleted (support window: forever).
+/// "upgrade-on-read"). Empty: formats 1 and 2 share one block layout (format 2
+/// only adds the filter region after the index), so `decode_block_v1` serves
+/// both and `read_block`'s `match` on `meta.format` routes both to it. If a
+/// later format changes the block layout, the old decoder moves to
+/// `legacy::vN` unchanged in behavior, returning the *current* in-memory
+/// records (`Vec<Record>`). Never deleted (support window: forever).
 mod legacy {}
 
 /// Decode one CRC-verified format-1 block: first byte is the block tag; the
@@ -147,6 +168,55 @@ fn decompress_lz4_block(payload: &[u8]) -> Result<Vec<u8>> {
         )));
     }
     lz4_flex::decompress(data, declared).map_err(|e| corrupt(e.to_string()))
+}
+
+const FILTER_MAGIC: [u8; 4] = *b"SSBF";
+/// Filter-region layout version (within format 2).
+const FILTER_VERSION: u8 = 1;
+/// Bytes of a filter region around its bits: magic, version, scheme, `k`,
+/// `bits_len`, and the trailing CRC.
+const FILTER_OVERHEAD: usize = 4 + 1 + 1 + 4 + 4 + 4;
+
+/// Encode a filter region (see the module docs).
+fn encode_filter(bloom: &BloomFilter) -> Vec<u8> {
+    let (bits, k, scheme) = bloom.as_parts();
+    let mut out = Vec::with_capacity(FILTER_OVERHEAD + bits.len());
+    out.extend_from_slice(&FILTER_MAGIC);
+    out.push(FILTER_VERSION);
+    out.push(scheme.tag());
+    out.extend_from_slice(&k.to_le_bytes());
+    out.extend_from_slice(&(bits.len() as u32).to_le_bytes());
+    out.extend_from_slice(bits);
+    let crc = crc32fast::hash(&out);
+    out.extend_from_slice(&crc.to_le_bytes());
+    out
+}
+
+/// Decode a filter region; any damage (short, bad magic/version/scheme, length
+/// disagreeing with the region, CRC mismatch) is a loud error.
+fn decode_filter(bytes: &[u8]) -> Result<BloomFilter> {
+    let bad = |why: &str| StorageError::Backend(format!("corrupt sstable filter: {why}"));
+    if bytes.len() < FILTER_OVERHEAD {
+        return Err(bad("region too short"));
+    }
+    let (body, crc_bytes) = bytes.split_at(bytes.len() - 4);
+    if crc32fast::hash(body) != u32::from_le_bytes(crc_bytes.try_into().unwrap()) {
+        return Err(bad("checksum mismatch"));
+    }
+    if body[..4] != FILTER_MAGIC {
+        return Err(bad("bad magic"));
+    }
+    if body[4] != FILTER_VERSION {
+        return Err(bad("unknown filter version"));
+    }
+    let scheme = HashScheme::from_tag(body[5]).ok_or_else(|| bad("unknown hash scheme"))?;
+    let k = u32::from_le_bytes(body[6..10].try_into().unwrap());
+    let bits_len = u32::from_le_bytes(body[10..14].try_into().unwrap()) as usize;
+    let bits = &body[14..];
+    if bits.len() != bits_len {
+        return Err(bad("bit vector length disagrees with the region"));
+    }
+    Ok(BloomFilter::from_parts(bits.to_vec(), k, scheme))
 }
 
 /// Fixed footer size: `index_offset(8) + index_len(8) + magic(8)`.
@@ -473,6 +543,34 @@ impl SsTableWriter {
         level: u32,
         records: &[Record],
     ) -> Result<SsTableMeta> {
+        Self::write_format(env, file, seq, level, records, FORMAT_CURRENT).await
+    }
+
+    /// Test-only legacy writer (ADR 0073 "Legacy encoders are test-only"): a
+    /// format-1 table, with no filter region. The returned meta carries the
+    /// Bloom a format-1 manifest (v1/v2) would have recorded inline.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Backend`] on an I/O error.
+    #[cfg(test)]
+    pub async fn write_v1<E: Env>(
+        env: &E,
+        file: &str,
+        seq: u64,
+        level: u32,
+        records: &[Record],
+    ) -> Result<SsTableMeta> {
+        Self::write_format(env, file, seq, level, records, 1).await
+    }
+
+    async fn write_format<E: Env>(
+        env: &E,
+        file: &str,
+        seq: u64,
+        level: u32,
+        records: &[Record],
+        format: u32,
+    ) -> Result<SsTableMeta> {
         // Start clean: a prior crashed flush may have left an orphan at this name
         // (we always move the seq forward, but be defensive).
         env.replace(file, &[]).await.map_err(io)?;
@@ -580,6 +678,20 @@ impl SsTableWriter {
         let index_len = index_bytes.len() as u64;
         env.append(file, &index_bytes).await.map_err(io)?;
 
+        // Write the filter region (format 2): the Bloom over the distinct keys,
+        // appended before the footer so it is synced with the table, before any
+        // manifest names it.
+        let key_refs: Vec<&[u8]> = distinct_keys.iter().map(Vec::as_slice).collect();
+        let bloom = BloomFilter::build(&key_refs);
+        let filter_bytes = if format >= FORMAT_FILTER_IN_TABLE {
+            encode_filter(&bloom)
+        } else {
+            Vec::new()
+        };
+        if !filter_bytes.is_empty() {
+            env.append(file, &filter_bytes).await.map_err(io)?;
+        }
+
         // Write the fixed footer.
         let mut footer = Vec::with_capacity(FOOTER_LEN as usize);
         footer.extend_from_slice(&index_offset.to_le_bytes());
@@ -587,9 +699,7 @@ impl SsTableWriter {
         footer.extend_from_slice(&MAGIC.to_le_bytes());
         env.append(file, &footer).await.map_err(io)?;
 
-        let file_size = index_offset + index_len + FOOTER_LEN;
-        let key_refs: Vec<&[u8]> = distinct_keys.iter().map(Vec::as_slice).collect();
-        let bloom = BloomFilter::build(&key_refs);
+        let file_size = index_offset + index_len + filter_bytes.len() as u64 + FOOTER_LEN;
         Ok(SsTableMeta {
             seq,
             level,
@@ -602,7 +712,7 @@ impl SsTableWriter {
             file_size,
             bloom,
             has_bloom: true,
-            format: FORMAT_CURRENT,
+            format,
         })
     }
 }
@@ -630,7 +740,7 @@ impl SsTableReader {
     ///
     /// # Errors
     /// Returns [`StorageError::Backend`] on an I/O error or a malformed index.
-    pub async fn open<E: Env>(env: &E, file: String, meta: SsTableMeta) -> Result<Self> {
+    pub async fn open<E: Env>(env: &E, file: String, mut meta: SsTableMeta) -> Result<Self> {
         check_format(meta.format)?;
         let index = if meta.index_len == 0 {
             Vec::new()
@@ -642,6 +752,34 @@ impl SsTableReader {
             decode_block_index(&bytes)
                 .map_err(|e| StorageError::Backend(format!("corrupt sstable index: {e}")))?
         };
+        // A format-2 table keeps its filter in the file, not the manifest: load it
+        // once here (a meta that already carries one, e.g. fresh from the writer,
+        // is left alone). A format-1 table keeps whatever its manifest supplied.
+        if meta.format >= FORMAT_FILTER_IN_TABLE && !meta.has_bloom {
+            let start = meta.index_offset.checked_add(meta.index_len);
+            let end = meta.file_size.checked_sub(FOOTER_LEN);
+            let (Some(start), Some(end)) = (start, end) else {
+                return Err(StorageError::Backend(
+                    "corrupt sstable filter: extents overflow".into(),
+                ));
+            };
+            if end < start {
+                return Err(StorageError::Backend(
+                    "corrupt sstable filter: region missing".into(),
+                ));
+            }
+            let bytes = env
+                .read_at(&file, start, (end - start) as usize)
+                .await
+                .map_err(io)?;
+            if bytes.len() as u64 != end - start {
+                return Err(StorageError::Backend(
+                    "corrupt sstable filter: short read".into(),
+                ));
+            }
+            meta.bloom = decode_filter(&bytes)?;
+            meta.has_bloom = true;
+        }
         Ok(Self {
             file: Arc::from(file),
             meta: Arc::new(meta),
@@ -700,7 +838,7 @@ impl SsTableReader {
         // but `meta` is a public field, so the fallback arm re-checks rather
         // than assuming.
         match self.meta.format {
-            1 => decode_block_v1(framed),
+            1 | FORMAT_FILTER_IN_TABLE => decode_block_v1(framed),
             other => Err(unsupported_format(other)),
         }
     }
@@ -876,6 +1014,11 @@ pub(super) mod fuzz_shims {
         decode_block_index(bytes).map(|i| i.len())
     }
 
+    /// Decode a filter region (format 2).
+    pub fn filter(bytes: &[u8]) -> Result<usize> {
+        decode_filter(bytes).map(|f| f.as_parts().0.len())
+    }
+
     /// Open a whole SSTable image the caller already wrote to `file` on
     /// `env`, deriving the metadata from its own footer the way a manifest
     /// would have recorded it, then scan every block and point-read every
@@ -911,6 +1054,17 @@ pub(super) mod fuzz_shims {
             has_bloom: false,
             format: 1,
         };
+        // The same image under a format-2 meta (the filter region is whatever sits
+        // between the index and the footer): open must fail cleanly or succeed.
+        let _ = SsTableReader::open(
+            env,
+            file.to_owned(),
+            SsTableMeta {
+                format: FORMAT_FILTER_IN_TABLE,
+                ..meta.clone()
+            },
+        )
+        .await;
         let reader = SsTableReader::open(env, file.to_owned(), meta).await?;
         for bi in reader.index.iter() {
             // Block extents come from the (fuzzed) index; keep reads in-file.
@@ -1569,7 +1723,7 @@ mod tests {
             // an unknown one panics rather than being skipped.
             let version = crate::fixture_file_version(&path);
             let want = match version {
-                1 => fixture_records(),
+                1 | 2 => fixture_records(),
                 v => panic!(
                     "fixture {} is version {v} but this test has no expectation for it — \
                      add a per-version arm (ADR 0073 Phase 1 checklist)",
@@ -1581,6 +1735,19 @@ mod tests {
                     .await
                     .unwrap_or_else(|e| panic!("opening fixture {}: {e}", path.display()));
                 assert!(reader.index.len() > 1, "fixture has a multi-block index");
+                if version >= FORMAT_FILTER_IN_TABLE {
+                    // The filter came out of the file, with the current scheme.
+                    assert!(reader.meta().has_bloom, "{}: filter loaded", path.display());
+                    assert_eq!(reader.meta().bloom.as_parts().2, HashScheme::CURRENT);
+                    for r in &want {
+                        assert!(reader.meta().bloom.may_contain(&r.key), "no false negative");
+                    }
+                } else {
+                    assert!(
+                        !reader.meta().has_bloom,
+                        "format 1 carries no filter in the file"
+                    );
+                }
                 let got = reader.full_scan(&env).await.expect("scan fixture");
                 assert_eq!(got.len(), want.len(), "record count");
                 for (r, (k, v, val)) in want.iter().zip(&got) {
@@ -1656,6 +1823,147 @@ mod tests {
         });
     }
 
+    /// The format-2 writer output has a filter region exactly between the index
+    /// and the footer, sized by `file_size`; `open` loads it (a meta without
+    /// one gets it from the file) and every key probes present.
+    #[test]
+    fn format_2_table_carries_its_filter_and_open_loads_it() {
+        let sim = Simulator::new(6);
+        let env = sim.env(nid(0));
+        block_on(async {
+            let records = fixture_records();
+            let written = SsTableWriter::write(&env, "f2", 1, 0, &records)
+                .await
+                .unwrap();
+            env.sync("f2").await.unwrap();
+            assert_eq!(written.format, 2);
+            assert_eq!(written.file_size, env.size("f2").await.unwrap());
+            let region = written.file_size - FOOTER_LEN - written.index_offset - written.index_len;
+            assert!(region > FILTER_OVERHEAD as u64, "non-empty filter region");
+            // A manifest-decoded meta has no filter; open loads it from the file.
+            let mut bare = written.clone();
+            bare.bloom = BloomFilter::default();
+            bare.has_bloom = false;
+            let reader = SsTableReader::open(&env, "f2".into(), bare).await.unwrap();
+            assert!(reader.meta().has_bloom);
+            assert_eq!(
+                reader.meta().bloom.as_parts(),
+                written.bloom.as_parts(),
+                "loaded filter equals the one built at write time"
+            );
+            for r in &records {
+                assert!(reader.meta().bloom.may_contain(&r.key));
+            }
+        });
+    }
+
+    /// A damaged, truncated or missing filter region fails `open` loudly (it was
+    /// synced before the manifest named the table, so damage is corruption).
+    #[test]
+    fn damaged_filter_region_fails_open() {
+        let sim = Simulator::new(7);
+        let env = sim.env(nid(0));
+        block_on(async {
+            let written = SsTableWriter::write(&env, "f2", 1, 0, &fixture_records())
+                .await
+                .unwrap();
+            env.sync("f2").await.unwrap();
+            let bytes = env.read("f2").await.unwrap();
+            let bare = |m: &SsTableMeta| SsTableMeta {
+                bloom: BloomFilter::default(),
+                has_bloom: false,
+                ..m.clone()
+            };
+            let filter_start = (written.index_offset + written.index_len) as usize;
+            // Flip a bit in the middle of the bit vector.
+            let mut bad = bytes.clone();
+            let mid = filter_start + 20;
+            bad[mid] ^= 0x01;
+            env.replace("bad", &bad).await.unwrap();
+            let r = SsTableReader::open(&env, "bad".into(), bare(&written)).await;
+            assert!(matches!(r, Err(StorageError::Backend(m)) if m.contains("filter")));
+            // A format-2 meta over a format-1 layout (no filter region).
+            let v1 = SsTableWriter::write_v1(&env, "v1", 1, 0, &fixture_records())
+                .await
+                .unwrap();
+            env.sync("v1").await.unwrap();
+            let lying = SsTableMeta {
+                format: 2,
+                ..bare(&v1)
+            };
+            let r = SsTableReader::open(&env, "v1".into(), lying).await;
+            assert!(matches!(r, Err(StorageError::Backend(m)) if m.contains("filter")));
+            // Extents that cannot be right.
+            let mut absurd = bare(&written);
+            absurd.file_size = 3;
+            let r = SsTableReader::open(&env, "f2".into(), absurd).await;
+            assert!(matches!(r, Err(StorageError::Backend(m)) if m.contains("filter")));
+        });
+    }
+
+    /// The filter codec round-trips both schemes and the empty filter, and
+    /// rejects every strict prefix.
+    #[test]
+    fn filter_codec_round_trips_and_rejects_truncation() {
+        let keys: Vec<Vec<u8>> = (0u32..50).map(|i| format!("k{i}").into_bytes()).collect();
+        let refs: Vec<&[u8]> = keys.iter().map(Vec::as_slice).collect();
+        for f in [
+            BloomFilter::build(&refs),
+            BloomFilter::build_legacy(&refs),
+            BloomFilter::build(&[]),
+        ] {
+            let bytes = encode_filter(&f);
+            let back = decode_filter(&bytes).expect("decode");
+            assert_eq!(back.as_parts(), f.as_parts());
+            for len in 0..bytes.len() {
+                assert!(decode_filter(&bytes[..len]).is_err(), "prefix {len}");
+            }
+        }
+    }
+
+    /// A format-1 file (the legacy writer: no filter region) is byte-identical to
+    /// a format-2 file up to the end of the index, and opens as format 1 with the
+    /// filter its manifest supplied; a format-2 file also opens as format 1 (a
+    /// v1 reader ignores everything past the index).
+    #[test]
+    fn format_1_reader_ignores_the_filter_region() {
+        let sim = Simulator::new(8);
+        let env = sim.env(nid(0));
+        block_on(async {
+            let records = fixture_records();
+            let old = SsTableWriter::write_v1(&env, "o", 1, 0, &records)
+                .await
+                .unwrap();
+            let new = SsTableWriter::write(&env, "n", 1, 0, &records)
+                .await
+                .unwrap();
+            env.sync("o").await.unwrap();
+            env.sync("n").await.unwrap();
+            assert_eq!(old.format, 1);
+            assert_eq!(
+                (old.index_offset, old.index_len),
+                (new.index_offset, new.index_len)
+            );
+            assert!(new.file_size > old.file_size);
+            let end = (old.index_offset + old.index_len) as usize;
+            assert_eq!(
+                env.read("o").await.unwrap()[..end],
+                env.read("n").await.unwrap()[..end]
+            );
+            // A format-2 file read under a format-1 meta (as a transcoded-back
+            // manifest records it).
+            let as_v1 = SsTableMeta {
+                format: 1,
+                bloom: BloomFilter::default(),
+                has_bloom: false,
+                ..new.clone()
+            };
+            let reader = SsTableReader::open(&env, "n".into(), as_v1).await.unwrap();
+            assert!(!reader.meta().has_bloom, "range-gated only");
+            assert_eq!(reader.full_scan(&env).await.unwrap().len(), records.len());
+        });
+    }
+
     /// An unsupported `SsTableMeta::format` (0 or newer than the binary knows)
     /// is a loud, named error at open — never a panic, never a misdecode.
     #[test]
@@ -1669,7 +1977,7 @@ mod tests {
                 .unwrap();
             env.sync("uf").await.unwrap();
             let bytes = env.read("uf").await.unwrap();
-            for bad in [0u32, FORMAT_CURRENT + 1, 2, 3, u32::MAX] {
+            for bad in [0u32, FORMAT_CURRENT + 1, FORMAT_CURRENT + 2, u32::MAX] {
                 match open_image(&env, &bytes, bad).await {
                     Err(StorageError::UnsupportedFormatVersion {
                         format,

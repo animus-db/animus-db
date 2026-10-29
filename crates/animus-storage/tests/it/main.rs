@@ -17,6 +17,7 @@ mod lsm_gc;
 mod lsm_group_commit;
 mod lsm_hot_key_read_amp;
 mod lsm_maintenance;
+mod lsm_manifest_bounded;
 mod lsm_merge_fast_path;
 mod lsm_metrics;
 mod lsm_multi_block_versions;

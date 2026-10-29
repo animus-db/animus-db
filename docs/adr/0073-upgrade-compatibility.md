@@ -203,8 +203,8 @@ range a format needs:
 | Format | Location | Version tag today | Lifetime | Notes |
 |---|---|---|---|---|
 | LSM WAL records | `crates/animus-storage/src/lsm/wal.rs` | `WAL_MAGIC = b"LWL1"`, `WAL_VERSION: u8 = 2` (file-level header; **v2** adds sync-marker frames, #1142; v1 kept as `lsm.rs` `legacy::v1`, fixture `lsm-wal/v1.bin`) | durable, node-local | Record framing has no per-record version byte; the file header carries it and `decode_wal` dispatches on it. Crash-safety relies on length-prefixed/checksummed records plus, from v2, durable sync markers that bound the provably-synced prefix; a v1 file keeps the lenient "no valid frame follows" torn-tail rule. |
-| LSM SSTable data blocks + footer | `crates/animus-storage/src/lsm/sstable.rs` | `MAGIC: u64 = 0x4355_5354_4F53_5333` in the footer (file identification only — the reader takes the actual format from the manifest, not by re-reading the footer) plus a real per-table version tag, `SsTableMeta::format: u32` (`FORMAT_CURRENT = 1`), recorded in the manifest for each table | durable, node-local | Better covered than it first looks: the format version lives one level up, in the manifest's per-table metadata, not in the footer bytes themselves. The block index has its own separate magic+version too: `INDEX_MAGIC = b"SSIX"`, `INDEX_VERSION: u8 = 1`. All three (footer magic, manifest-recorded table format, index magic+version) currently describe a single supported format — there is no decoder path for `format != FORMAT_CURRENT` yet, so the tag would need a real N-1 branch added before Phase 1 could rely on it. |
-| LSM manifest | `crates/animus-storage/src/lsm.rs` (`encode_manifest`/`decode_manifest`; v1 kept as `legacy::manifest_v1`) | `MANIFEST_MAGIC = b"CMF1"`, `MANIFEST_VERSION: u8 = 2` (**v2**, issue #1389: each table record carries a `bloom_scheme` byte, `0` = the legacy correlated-FNV pair every v1 filter used, `1` = FNV seed + two SplitMix64 outputs; v1 decodes to scheme `0`, fixtures `lsm-manifest/v1.bin` + `v2.bin`) | durable, **node-local (class L)**: the Bloom bits live only in the manifest; snapshots/`InstallSnapshot` ship `engine_image` rows, never SSTables or their filters, so no Gate is needed | The best-covered format in `animus-storage`: magic + version + a documented legacy fallback (`decode_manifest` still reads a pre-binary-codec JSON manifest when the magic is absent). This is the pattern the rest of the inventory should converge on. |
+| LSM SSTable data blocks + footer | `crates/animus-storage/src/lsm/sstable.rs` | `MAGIC: u64 = 0x4355_5354_4F53_5333` in the footer (file identification only — the reader takes the actual format from the manifest, not by re-reading the footer) plus a real per-table version tag, `SsTableMeta::format: u32` (`FORMAT_CURRENT = 2`; **format 2**, issue #1389: a filter region `SSBF` between the index and the footer holds the table's Bloom filter with its hash-scheme tag, located by `index_offset + index_len .. file_size - 24`; format 1 has none and kept its filter in the manifest), recorded in the manifest for each table; fixtures `lsm-sstable/v1.bin` + `v2.bin` | durable, **node-local (class L)** (snapshots ship `engine_image` rows, never SSTables or filters; split-child clones copy whole files inside one node) | Better covered than it first looks: the format version lives one level up, in the manifest's per-table metadata, not in the footer bytes themselves. The block index has its own separate magic+version too: `INDEX_MAGIC = b"SSIX"`, `INDEX_VERSION: u8 = 1`. All three (footer magic, manifest-recorded table format, index magic+version) currently describe a single supported format — there is no decoder path for `format != FORMAT_CURRENT` yet, so the tag would need a real N-1 branch added before Phase 1 could rely on it. |
+| LSM manifest | `crates/animus-storage/src/lsm.rs` (`encode_manifest`/`decode_manifest`; v1 kept as `legacy::manifest_v1`) | `MANIFEST_MAGIC = b"CMF1"`, `MANIFEST_VERSION: u8 = 3` (**v2**, issue #1389: each table record carries a `bloom_scheme` byte, `0` = the legacy correlated-FNV pair every v1 filter used, `1` = FNV seed + two SplitMix64 outputs; v1 decodes to scheme `0`; **v3**, issue #1389 (Bloom filters out of the manifest): a table record has `format` right after `file_size` and carries the v2 filter fields only when `format < 2`, i.e. a format-2 table's filter is in its SSTable and the manifest is a few hundred bytes per live table whatever the key count; v2 kept as `legacy::manifest_v2`; fixtures `lsm-manifest/v1.bin` + `v2.bin` + `v3.bin`) | durable, **node-local (class L)**: the Bloom bits live in the SSTable (format 2) or, for a legacy format-1 table, in the manifest; snapshots/`InstallSnapshot` ship `engine_image` rows, never SSTables or their filters, so no Gate is needed | The best-covered format in `animus-storage`: magic + version + a documented legacy fallback (`decode_manifest` still reads a pre-binary-codec JSON manifest when the magic is absent). This is the pattern the rest of the inventory should converge on. |
 | Control-plane Raft WAL (`RaftCore` log entries + membership records) | `crates/animus-control/src/persist.rs` | `CONTROL_WAL`: `CWL1` + version **2** (`format::encode_line`); v1 retained as `persist::dispatch::legacy::v1` (fixture `control-wal/v1.bin`; v2 adds sync-marker lines, fixture `control-wal/v2.bin`, issue #1132) | durable, node-local | Two generations of this format have already existed with no version discriminator between them; a reader distinguishes them structurally (parse success), not by a tag. Works only because both are JSON and one is a strict superset shape. |
 | Control-plane snapshot / `InstallSnapshot` payload | `crates/animus-control/src/raft.rs` (`RaftCore::snapshot`, the `S` state-machine type) | `CONTROL_SNAPSHOT`: `CSN1` + version 1 (`persist.rs`), wrapping `S`'s own serde shape | durable, node-local (persisted) **and** transient wire (`InstallSnapshot` RPC) | Same gap as the WAL: whatever `Metadata`'s own serde shape is *is* the wire format, with no independent version byte wrapping it. |
 | `Metadata` + its system-keyspace mirror (ADR 0038) | `crates/animus-control/src/meta.rs`, `syskv.rs` | `METADATA_VERSION: u32 = 1` (`meta.rs`, serialized as `"v"`); the system-keyspace mirror carries `SYSKV_MIRROR_VERSION: u32 = 1` (`mirror.rs`). Individual fields still use ADR 0035's `#[serde(default)]` pattern | durable, node-local (mirror) **and** replicated over the control Raft log | The field-by-field-default discipline is real and documented (ADR 0035 §"Rolling upgrade") but it is a convention, not a checked invariant — nothing fails loudly if a new field is added without the default, or if a field's *meaning* changes without renaming it. |
@@ -3759,3 +3759,52 @@ Maintainer decision on #1355 (`upgrade_previous_release` `clean_3_nodes` failed
   possible without first re-resolving: a v1 binary cannot decode a Settled stub,
   so the downgrade path is the usual one (no finalize beyond what the previous
   release supports).
+
+## Amendment 2026-10-29: Bloom filters move into the SSTable (`lsm-sstable` v2, `lsm-manifest` v3, issue #1389)
+
+Last item of issue #1389. Before this, `encode_manifest` wrote every live
+table's Bloom bits inline, and `write_manifest` rewrote and fsynced the whole
+image on every flush and compaction, so per-flush manifest cost scaled with live
+data (149 KB seen in a soak). The conventional design (LevelDB, RocksDB) keeps the
+filter in the table.
+
+- **`lsm-sstable` v2.** `FORMAT_CURRENT = 2`. The file is `blocks | index |
+  filter region | footer`; the footer is unchanged (24 bytes). The filter region is
+  `b"SSBF" | version u8 | scheme u8 | k u32 LE | bits_len u32 LE | bits | crc32` and
+  has no recorded offset: it spans `index_offset + index_len .. file_size - 24`,
+  extents the manifest already records. `SsTableReader::open` reads it once per
+  table open (never per lookup) and holds it in memory as before. It is appended
+  and synced with the table, before any manifest names the table. Format 1
+  tables are unchanged and still read; they keep the filter their manifest
+  supplied, or none (range-gated only).
+- **`lsm-manifest` v3.** A table record is the v2 header, then `format(u32)`, then
+  the v2 filter fields (`has_bloom`, `bloom_k`, `bloom_scheme`, bits) **only if
+  `format < 2`**. v1 and v2 decode unchanged (`legacy::manifest_v1`,
+  `legacy::manifest_v2`); their inline filters stay in use until the tables are
+  compacted away. The next flush or compaction rewrites a v3 manifest.
+- **Class L, no Gate.** The manifest and SSTables are node-local. Snapshots and
+  `InstallSnapshot` ship `engine_image` rows, never SSTables or filters, and
+  `clone_to_filtered` copies whole files within one node. No wire, replicated
+  command or cross-node shape changed, so there is no `required_gate` row and no
+  mixed-version cell.
+- **Compatibility in the other direction.** A format-2 file is a valid format-1
+  file: a format-1 reader takes the index extents from the manifest and never
+  reads past the index. An older binary is not supported on a post-change data
+  directory (no rollback, as for every format), but the harness models "files an
+  older binary would have left": `lsm-manifest` transcodes v3 -> v2 (inline
+  filters kept for format-1 tables) and v3 -> v1, recording each format-2 table as
+  format 1 **with no filter** (range-gated only, always correct); `lsm-sstable`
+  transcodes v2 -> v1 as the identity, for the reason above. `rewrite_row_values`
+  re-encodes a manifest at the version it already has (v1, v2 or v3).
+- **Fixtures and tests.** New no-overwrite `lsm-manifest/v3.bin` and
+  `lsm-sstable/v2.bin`; per-version expectations in `decodes_every_checked_in_fixture`
+  (both formats) and in `upgrade_restart_tier0`; test-only legacy encoders
+  `legacy::manifest_v2::encode_manifest` and `SsTableWriter::write_v1`; round-trip
+  and old-input tests; `engine_migrates_v2_manifest_and_format_1_tables_to_v3_and_format_2`
+  (a v2 manifest over three format-1 tables opens, answers every key, and ends on a
+  v3 manifest with only format-2 tables after flushes and compactions);
+  `engine_opens_a_v3_manifest_transcoded_back_to_v2_and_v1`; the regression test
+  `lsm_manifest_bounded` (`manifest_bytes_per_live_table_are_constant_whatever_the_key_count`:
+  at most 256 B per live table; 565 B with inline filters, 113 B now). The fuzz
+  target `lsm_formats` gained a `sstable_filter` decoder and opens SSTable images
+  under a format-2 meta too.

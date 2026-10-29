@@ -140,10 +140,13 @@ by what the distributed layer needs, not by any one engine (ADR 0004, 0008).
   byte strings — not JSON; ADR 0073 Phase 0 **deleted the JSON fallback**: a
   missing/foreign magic is `PreBaselineFormat { "lsm-manifest" }`, a version
   outside `1..=MANIFEST_VERSION` is `UnsupportedFormatVersion` — see
-  `encode_manifest`/`decode_manifest` in `lsm.rs` (**v2**, issue #1389: each
-  table record adds a `bloom_scheme` byte; v1 decodes via
-  `legacy::manifest_v1` to the legacy hash scheme and
-  `reframe_manifest_to_v1` is the upgrade-harness transcode back); the manifest also records the
+  `encode_manifest`/`decode_manifest` in `lsm.rs` (**v3**, issue #1389: a table
+  record carries Bloom filter fields only when its SSTable `format < 2`, so the
+  manifest is a few hundred bytes per live table whatever the key count; v2
+  added a `bloom_scheme` byte; v1 and v2 decode via `legacy::manifest_v1` /
+  `legacy::manifest_v2` and their inline filters stay in use until the tables
+  are compacted away; `reframe_manifest_to_v2`/`_v1` are the upgrade-harness
+  transcodes back, which record a format-2 table as format 1 with no filter); the manifest also records the
   **live WAL segment numbers**, part of v1; a torn manifest cannot occur because
   `replace` is atomic, and a truncated image stays a plain `Backend` error),
   `wal-NNNNNN` (the WAL split into **rotating numbered segments** — each write
@@ -232,6 +235,19 @@ by what the distributed layer needs, not by any one engine (ADR 0004, 0008).
   filters from manifest v1 keep the old `HashScheme::LegacyFnv` and are probed
   with it until compacted away). A table with
   `has_bloom == false` is range-gated only. Built over the table's distinct keys on flush/compaction.
+  **Where the filter lives (issue #1389):** SSTable format 2 stores it in the
+  file, a `SSBF` filter region between the index and the footer (scheme tag,
+  `k`, bits, CRC; it spans `index_offset + index_len .. file_size - 24`, so no
+  extra manifest field). `SsTableReader::open` loads it once per table open
+  (`meta.has_bloom == false` on a format-2 meta means "not loaded yet"), and
+  `LsmEngine::open` adopts the opened metas so introspection sees them.
+  Format-1 tables (old manifests) keep the filter their manifest record
+  supplied. The filter is written and synced with the table before the manifest
+  names it. Never put per-key data back into the manifest: it is rewritten and
+  fsynced in full on every flush and compaction (`lsm_manifest_bounded` asserts a
+  per-table byte budget). A format-2 file is also a valid format-1 file (the
+  trailing region is past the index extents), which is why the `lsm-sstable`
+  harness transcode to v1 is the identity.
 - **`merged_at` (the shared backend for `scan`/`scan_at`/`entries`/
   `entries_at`/`entries_with_tombstones`/`scan_with_tombstones`) applies the
   same range gate as every other multi-table path — `sstable_overlaps` — before
