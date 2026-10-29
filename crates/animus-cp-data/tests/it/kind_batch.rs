@@ -409,7 +409,7 @@ fn pending_changes_key_order_is_token_order_not_commit_order() {
     );
     sim.run_for(Duration::from_secs(1));
 
-    let records = block_on(nodes[l].pending_changes_key_order());
+    let records = block_on(nodes[l].pending_changes_key_order()).expect("change-log scan");
     assert_eq!(records.len(), 2, "seed={seed}: {records:?}");
 
     // Physical key order groups by token: pk_lo's record (lower token, the

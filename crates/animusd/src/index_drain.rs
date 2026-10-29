@@ -623,7 +623,16 @@ pub(crate) async fn change_consumer_loop(ctx: ClientCtx) {
                     group.set_quiesce_veto(true, veto_fresh_through);
                     continue;
                 }
-                let pending = !group.pending_changes_key_order().await.is_empty();
+                let pending = match group.pending_changes_key_order().await {
+                    Ok(records) => !records.is_empty(),
+                    Err(e) => {
+                        // Unknown, not empty (issue #1419): hold the veto
+                        // and retry the trim on the next tick.
+                        tracing::debug!(tablet = tablet.0, table, error = %e, "marker trim: scan failed");
+                        group.set_quiesce_veto(true, veto_fresh_through);
+                        continue;
+                    }
+                };
                 group.set_quiesce_veto(pending, veto_fresh_through);
                 if !pending {
                     continue;
@@ -646,7 +655,17 @@ pub(crate) async fn change_consumer_loop(ctx: ClientCtx) {
             // else happened to touch the group. (A table with neither GSIs
             // nor an enabled/ever-enabled stream holds it too now — via the
             // marker branch above, for its own trim obligation.)
-            let hot_backlog_present = !group.pending_changes_key_order().await.is_empty();
+            let hot_backlog_present = match group.pending_changes_key_order().await {
+                Ok(records) => !records.is_empty(),
+                Err(e) => {
+                    // Unknown, not empty (issue #1419): keep the group awake
+                    // and skip every consumer arm this tick; the next tick
+                    // retries against a fresh scan.
+                    tracing::debug!(tablet = tablet.0, table, error = %e, "index drain: change-log scan failed");
+                    group.set_quiesce_veto(true, veto_fresh_through);
+                    continue;
+                }
+            };
             // `|| splitting`: the split driver's own hold (above) must not be
             // released by an empty-backlog sweep mid-build.
             group.set_quiesce_veto(hot_backlog_present || splitting, veto_fresh_through);
@@ -1081,7 +1100,7 @@ pub(crate) async fn drain_tablet<E: Env, R: RelayClient>(
     // "gsi" row yet) or a split's fresh right child (the rule over an empty
     // set) — either way, "reconcile everything currently pending."
     let watermark = group.cursor_min_watermark(GSI_TAG).await;
-    let records = group.pending_changes_key_order().await;
+    let records = group.pending_changes_key_order().await?;
     if records.is_empty() {
         return Ok(());
     }
@@ -1202,12 +1221,12 @@ pub(crate) async fn drain_tablet<E: Env, R: RelayClient>(
 /// matching the veto's own pre-existing "only gate when something is
 /// actually pending" rule.
 async fn gsi_caught_up<E: Env>(group: &CpGroup<E>) -> bool {
-    let max_pending = group
-        .pending_changes_key_order()
-        .await
-        .iter()
-        .filter_map(|(k, _)| record_hlc(k))
-        .max();
+    // A scan error is "not caught up" (issue #1419): this predicate gates a
+    // split cutover, so unknown must veto, never read as nothing pending.
+    let Ok(pending) = group.pending_changes_key_order().await else {
+        return false;
+    };
+    let max_pending = pending.iter().filter_map(|(k, _)| record_hlc(k)).max();
     match max_pending {
         None => true,
         Some(max_hlc) => group
@@ -1917,9 +1936,11 @@ async fn seal_tick(
                 // overwhelming majority of this fork's win, and it is the
                 // only design that doesn't reintroduce a genuine data-
                 // delivery regression.
+                // A scan error skips the tick (issue #1419): memoizing `now_ms`
+                // from a false-empty view would pin a wrong age basis.
                 let oldest = group
                     .pending_changes_key_order()
-                    .await
+                    .await?
                     .iter()
                     .filter_map(|(key, _)| record_hlc(key))
                     .map(|ts| ts.wall_ms)
@@ -2056,7 +2077,7 @@ pub(crate) async fn pitr_seal_now<E: Env, R: RelayClient>(
     let watermark = meta.pitr_segment_watermark(tablet);
     let mut records: Vec<segment::SegmentRecord> = group
         .pending_changes_key_order()
-        .await
+        .await?
         .into_iter()
         .filter_map(|(key, value)| {
             let (ts, ordinal) = record_hlc_ordinal(&key)?;
@@ -2298,7 +2319,7 @@ pub(crate) async fn seal_now<E: Env, R: RelayClient>(
     let watermark = meta.stream_shard_watermark(tablet);
     let mut records: Vec<segment::SegmentRecord> = group
         .pending_changes_key_order()
-        .await
+        .await?
         .into_iter()
         .filter_map(|(key, value)| {
             let (ts, ordinal) = record_hlc_ordinal(&key)?;
@@ -2518,10 +2539,12 @@ pub(crate) async fn hot_read<E: Env>(
     group: &CpGroup<E>,
     from_position: (u64, u32),
     limit: usize,
-) -> Vec<(Vec<u8>, u64, u32, Vec<u8>)> {
+) -> Result<Vec<(Vec<u8>, u64, u32, Vec<u8>)>, String> {
+    // A scan error is an error, not an empty page (issue #1419): an empty
+    // `GetRecords` page tells the consumer it is caught up.
     let mut records: Vec<(Vec<u8>, u64, u32, Vec<u8>)> = group
         .pending_changes_key_order()
-        .await
+        .await?
         .into_iter()
         .filter_map(|(key, value)| {
             let (ts, ordinal) = record_hlc_ordinal(&key)?;
@@ -2531,7 +2554,7 @@ pub(crate) async fn hot_read<E: Env>(
         .collect();
     records.sort_by_key(|(_, packed, ordinal, _)| (*packed, *ordinal));
     records.truncate(limit);
-    records
+    Ok(records)
 }
 
 /// The hot-trim arm (ADR 0042 §8, ADR 0043 §A6, F10), run once per tablet per
@@ -2670,7 +2693,7 @@ pub(crate) async fn trim_janitor<E: Env, R: RelayClient>(
     // disabled had its final seal run first, F12-b). A bounded delete
     // (`trim_point` is `Some`) needs no such check: every record at or below
     // the bound is already consumed by every term it names.
-    let pending = group.pending_changes_key_order().await;
+    let pending = group.pending_changes_key_order().await?;
     if trim_all && !pending.is_empty() {
         let fresh = ctx.metadata_fresh().await;
         let term_appeared = fresh.table_stream(table).is_some()
@@ -2983,7 +3006,11 @@ mod gsi_drain_cursor_tests {
                 .edge
                 .local_cp(tablet)
                 .expect("this node hosts the tablet");
-            let n = group.pending_changes_key_order().await.len();
+            let n = group
+                .pending_changes_key_order()
+                .await
+                .expect("change-log scan")
+                .len();
             if n == want {
                 return;
             }
@@ -3109,7 +3136,10 @@ mod gsi_drain_cursor_tests {
 
             let mut i = 0u32;
             loop {
-                let records = group.pending_changes_key_order().await;
+                let records = group
+                    .pending_changes_key_order()
+                    .await
+                    .expect("change-log scan");
                 if let Some((key, value)) = records.first() {
                     let record = ChangeRecord::decode(value).expect("hidden-table record decodes");
                     assert!(record.marker, "a hidden table's record is a marker");
@@ -3158,7 +3188,11 @@ mod gsi_drain_cursor_tests {
                         .edge
                         .local_cp(tablet)
                         .expect("this node hosts the tablet");
-                    let n = group.pending_changes_key_order().await.len();
+                    let n = group
+                        .pending_changes_key_order()
+                        .await
+                        .expect("change-log scan")
+                        .len();
                     // A generous, sampled ceiling: proves the log doesn't
                     // grow unboundedly with the write stream (it would, under
                     // the pre-ADR-0042 GSI-drain-only design's absence of a
@@ -3498,7 +3532,11 @@ mod gsi_drain_cursor_tests {
             for tick in 0..20 {
                 tokio::time::sleep(INDEX_DRAIN_INTERVAL * 2).await;
                 let watermark = right_group.cursor_min_watermark(GSI_TAG).await;
-                let pending = right_group.pending_changes_key_order().await.len();
+                let pending = right_group
+                    .pending_changes_key_order()
+                    .await
+                    .expect("change-log scan")
+                    .len();
                 if watermark.is_some() {
                     watermark_ever_advanced = true;
                 }
@@ -3587,7 +3625,11 @@ mod gsi_drain_cursor_tests {
                 "an expected tag with no row yet must read as no watermark"
             );
             assert_eq!(
-                group.pending_changes_key_order().await.len(),
+                group
+                    .pending_changes_key_order()
+                    .await
+                    .expect("change-log scan")
+                    .len(),
                 1,
                 "the janitor must not have trimmed anything with no cursor row to bound it"
             );
@@ -3974,7 +4016,9 @@ mod stream_sealer_tests {
                 .local_cp(tablet)
                 .expect("this node hosts the tablet");
             await_true(20, "hot tail trims to empty after the seal", || {
-                futures::executor::block_on(group.pending_changes_key_order()).is_empty()
+                futures::executor::block_on(group.pending_changes_key_order())
+                    .expect("change-log scan")
+                    .is_empty()
             })
             .await;
 
@@ -4121,7 +4165,9 @@ mod stream_sealer_tests {
                 .local_cp(tablet)
                 .expect("this node hosts the tablet");
             await_true(20, "hot tail trims to empty after the PITR seal", || {
-                futures::executor::block_on(group.pending_changes_key_order()).is_empty()
+                futures::executor::block_on(group.pending_changes_key_order())
+                    .expect("change-log scan")
+                    .is_empty()
             })
             .await;
 
@@ -4188,7 +4234,11 @@ mod stream_sealer_tests {
             await_true(
                 20,
                 "hot tail stays empty after disable's final seal",
-                || futures::executor::block_on(group.pending_changes_key_order()).is_empty(),
+                || {
+                    futures::executor::block_on(group.pending_changes_key_order())
+                        .expect("change-log scan")
+                        .is_empty()
+                },
             )
             .await;
 
@@ -4583,7 +4633,9 @@ mod stream_sealer_tests {
             .await;
             // Both terms are now present — trim converges to empty.
             await_true(20, "trim converges once both terms are present", || {
-                futures::executor::block_on(group.pending_changes_key_order()).is_empty()
+                futures::executor::block_on(group.pending_changes_key_order())
+                    .expect("change-log scan")
+                    .is_empty()
             })
             .await;
         })
@@ -4642,7 +4694,9 @@ mod stream_sealer_tests {
                 "the disabled label's catalog rows are still present (un-reaped)"
             );
             await_true(20, "the hot scope drains fully post-disable", || {
-                futures::executor::block_on(group.pending_changes_key_order()).is_empty()
+                futures::executor::block_on(group.pending_changes_key_order())
+                    .expect("change-log scan")
+                    .is_empty()
             })
             .await;
         })
@@ -4705,7 +4759,9 @@ mod stream_sealer_tests {
             assert_eq!(sealed.label, first_label);
             assert_eq!(sealed.count, 3, "the final seal covered every write");
             await_true(20, "hot scope empties after the final seal", || {
-                futures::executor::block_on(group.pending_changes_key_order()).is_empty()
+                futures::executor::block_on(group.pending_changes_key_order())
+                    .expect("change-log scan")
+                    .is_empty()
             })
             .await;
 
@@ -4946,7 +5002,9 @@ mod stream_sealer_tests {
                 .expect("this node hosts the tablet");
 
             await_true(10, "the write lands in the hot tail", || {
-                !futures::executor::block_on(group.pending_changes_key_order()).is_empty()
+                !futures::executor::block_on(group.pending_changes_key_order())
+                    .expect("change-log scan")
+                    .is_empty()
             })
             .await;
 
@@ -4966,7 +5024,9 @@ mod stream_sealer_tests {
                 put_item_padded(node.dynamo_addr(), table, &format!("o{i}"), 50).await;
             }
             await_true(20, "hot tail trims to empty after the seal", || {
-                futures::executor::block_on(group.pending_changes_key_order()).is_empty()
+                futures::executor::block_on(group.pending_changes_key_order())
+                    .expect("change-log scan")
+                    .is_empty()
             })
             .await;
 
@@ -5054,7 +5114,9 @@ mod stream_sealer_tests {
                 .local_cp(tablet)
                 .expect("this node hosts the tablet");
             await_true(20, "plain-table markers trim to empty", || {
-                futures::executor::block_on(group.pending_changes_key_order()).is_empty()
+                futures::executor::block_on(group.pending_changes_key_order())
+                    .expect("change-log scan")
+                    .is_empty()
             })
             .await;
             await_true(10, "the veto releases and the group quiesces", || {
@@ -5065,7 +5127,9 @@ mod stream_sealer_tests {
             // trimmed on the loop's next visits, and quiescence returns.
             put_item_padded(node.dynamo_addr(), table, "p-rewake", 8).await;
             await_true(20, "the re-wake write's marker trims too", || {
-                futures::executor::block_on(group.pending_changes_key_order()).is_empty()
+                futures::executor::block_on(group.pending_changes_key_order())
+                    .expect("change-log scan")
+                    .is_empty()
             })
             .await;
             await_true(10, "the group re-quiesces after the re-wake", || {
@@ -5117,7 +5181,10 @@ mod stream_sealer_tests {
                 .local_cp(only_tablet(&node, streamed))
                 .expect("hosts the streamed tablet");
             await_true(20, "each seeded row left a change record", || {
-                futures::executor::block_on(group.pending_changes_key_order()).len() == 5
+                futures::executor::block_on(group.pending_changes_key_order())
+                    .expect("change-log scan")
+                    .len()
+                    == 5
             })
             .await;
 
@@ -5145,7 +5212,9 @@ mod stream_sealer_tests {
                 .local_cp(only_tablet(&node, plain))
                 .expect("hosts the plain tablet");
             await_true(20, "seeded plain-table markers trim to empty", || {
-                futures::executor::block_on(group.pending_changes_key_order()).is_empty()
+                futures::executor::block_on(group.pending_changes_key_order())
+                    .expect("change-log scan")
+                    .is_empty()
             })
             .await;
         })
@@ -5188,7 +5257,11 @@ mod stream_sealer_tests {
                 .edge
                 .local_cp(only_tablet(&node, table))
                 .expect("hosts the tablet");
-            let baseline = group.pending_changes_key_order().await.len();
+            let baseline = group
+                .pending_changes_key_order()
+                .await
+                .expect("change-log scan")
+                .len();
 
             // One raw plain-value transactional write over the real client
             // protocol — the exact shape `animus-cli`/external callers use.
@@ -5221,10 +5294,16 @@ mod stream_sealer_tests {
             // `staged`, and consumer-hidden (a plain-value write has no
             // resolve-time change record to materialize).
             await_true(20, "the raw txn write's stage marker appears", || {
-                futures::executor::block_on(group.pending_changes_key_order()).len() == baseline + 1
+                futures::executor::block_on(group.pending_changes_key_order())
+                    .expect("change-log scan")
+                    .len()
+                    == baseline + 1
             })
             .await;
-            let records = group.pending_changes_key_order().await;
+            let records = group
+                .pending_changes_key_order()
+                .await
+                .expect("change-log scan");
             let new: Vec<_> = records
                 .iter()
                 .filter_map(|(_, v)| animus_dynamo::ChangeRecord::decode(v))

@@ -769,7 +769,7 @@ fn kind_eval_batch_applies_distinct_key_entries_with_ordered_change_records() {
 
     // Change-log: exactly 3 records, one per item, sharing this entry's own
     // ts, at distinct, order-preserving ordinals 0..3.
-    let records = block_on(nodes[l].pending_changes_key_order());
+    let records = block_on(nodes[l].pending_changes_key_order()).expect("change-log scan");
     assert_eq!(records.len(), 3, "seed={seed}: {records:?}");
     let mut seqnos: Vec<(u64, u32)> = records
         .iter()
@@ -981,7 +981,7 @@ fn kind_eval_batch_a_same_key_duplicate_observes_the_earlier_items_write() {
 
     // Two records — one per item, GSI/change-log derivation consistent with
     // the final state only, at distinct ordinals.
-    let records = block_on(nodes[l].pending_changes_key_order());
+    let records = block_on(nodes[l].pending_changes_key_order()).expect("change-log scan");
     assert_eq!(records.len(), 2, "seed={seed}: {records:?}");
     let mut ordinals: Vec<u32> = records
         .iter()

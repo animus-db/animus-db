@@ -344,6 +344,7 @@ fn snapshot_catchup_reseeds_hot_change_max() {
     // every one of `N` writes minted exactly one change record, so this is
     // never empty.
     let expected_max = block_on(nodes[l].pending_changes_key_order())
+        .expect("change-log scan")
         .iter()
         .filter_map(|(k, _)| decode_change_suffix(k))
         .max()

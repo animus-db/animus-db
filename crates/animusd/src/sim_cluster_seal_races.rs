@@ -654,7 +654,11 @@ async fn sweeper_standin(
             if meta.table_stream(&table).is_none() {
                 continue;
             }
-            let hot = !group.pending_changes_key_order().await.is_empty();
+            let hot = !group
+                .pending_changes_key_order()
+                .await
+                .expect("change-log scan")
+                .is_empty();
             if !hot {
                 empty_sweeps.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }
@@ -728,7 +732,13 @@ fn run_a_stale_veto_never_quiesces_a_group_with_an_unsealed_change_log(seed: u64
                 .into_iter()
                 .find(|(x, _)| *x == t)
                 .expect("hosted");
-            (g.is_quiesced(), g.pending_changes_key_order().await.len())
+            (
+                g.is_quiesced(),
+                g.pending_changes_key_order()
+                    .await
+                    .expect("change-log scan")
+                    .len(),
+            )
         });
         await_slot(
             cluster,
@@ -942,5 +952,245 @@ fn a_stale_snapshot_trim_never_deletes_a_reenabled_streams_records() {
 fn a_stale_snapshot_trim_never_deletes_a_reenabled_streams_records_over_seeds() {
     for i in 0..5 {
         run_stale_trim_never_deletes_a_reenabled_streams_records(0x5EA1_6100 + i);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Issue #1419: a change-log scan error must not read as "no records".
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug)]
+enum Consumer {
+    StreamSeal,
+    PitrSeal,
+    /// `trim_janitor`'s unbounded delete of a table with no consumer term.
+    MarkerTrim,
+}
+
+/// Four acked change records in the LSM engine's SSTables (flushed, so a scan
+/// really reads the disk), then every disk op fails while one consumer runs:
+/// the consumer must report a retryable error, advance no watermark and
+/// delete nothing, and once the disk is healthy the very same records must be
+/// sealed exactly once (or still be present, for the trim). Before the fix
+/// `pending_changes_key_order` mapped the scan error to an empty log, so the
+/// seal returned `Ok(None)` ("nothing pending", which lets a disable
+/// complete) and the trim returned `Ok(())`.
+fn run_a_change_log_scan_error_is_not_an_empty_log(seed: u64, consumer: Consumer) {
+    const RECORDS: u64 = 4;
+    let mut cluster =
+        SimCluster::new_with_lsm_engines(seed, &[crate::config::NodeRole::Both; 3], 3, None);
+    let table = "scanerr";
+    let pitr = matches!(consumer, Consumer::PitrSeal);
+    create_table(
+        &mut cluster,
+        0,
+        table,
+        matches!(consumer, Consumer::StreamSeal),
+    );
+    if pitr {
+        cluster.enable_pitr(table);
+    }
+    let tablet = *cluster
+        .metadata(0)
+        .tablets_for_table(table)
+        .next()
+        .unwrap_or_else(|| panic!("seed={seed}: no tablet"))
+        .0;
+    let l = (0..3u64)
+        .find(|&n| cluster.is_leader_local(n, tablet))
+        .unwrap_or_else(|| panic!("seed={seed}: tablet has no leader"));
+    for i in 0..RECORDS {
+        let (s, b) = cluster.dynamo(
+            l,
+            "DynamoDB_20120810.PutItem",
+            &put_body(table, &format!("r{i}")),
+        );
+        assert_eq!(s, 200, "seed={seed}: put: {b}");
+    }
+
+    // Push the change log out of the memtable so the scan reads SSTable blocks.
+    let flushed = cluster.spawn_detached(l, move |ctx| async move {
+        let (_, group) = ctx
+            .edge
+            .hosted_groups()
+            .into_iter()
+            .find(|(t, _)| *t == tablet)
+            .expect("tablet hosted on its leader");
+        match &group {
+            crate::CpGroup::Lsm(n) => n.storage().flush_now().await.map_err(|e| e.to_string()),
+            crate::CpGroup::Mem(_) => Err("expected an LSM engine".to_owned()),
+        }
+    });
+    let out = await_slot(
+        &mut cluster,
+        &flushed,
+        Duration::from_millis(5),
+        Duration::from_secs(30),
+        "flush",
+    );
+    assert_eq!(out, Ok(()), "seed={seed}: flush");
+
+    {
+        let slot = cluster.spawn_detached(l, move |ctx| async move {
+            let (_, group) = ctx
+                .edge
+                .hosted_groups()
+                .into_iter()
+                .find(|(t, _)| *t == tablet)
+                .expect("tablet hosted on its leader");
+            group.pending_changes_key_order().await.map(|r| r.len())
+        });
+        let n = await_slot(
+            &mut cluster,
+            &slot,
+            Duration::from_millis(5),
+            Duration::from_secs(30),
+            "precount",
+        );
+        assert_eq!(
+            n,
+            Ok(RECORDS as usize),
+            "seed={seed} {consumer:?}: precondition"
+        );
+    }
+
+    let run = |cluster: &mut SimCluster, what: &str| {
+        let slot = cluster.spawn_detached(l, move |ctx| async move {
+            let (_, group) = ctx
+                .edge
+                .hosted_groups()
+                .into_iter()
+                .find(|(t, _)| *t == tablet)
+                .expect("tablet hosted on its leader");
+            match consumer {
+                Consumer::StreamSeal => {
+                    crate::index_drain::seal_now(&ctx, table, tablet, &group).await
+                }
+                Consumer::PitrSeal => {
+                    crate::index_drain::pitr_seal_now(&ctx, table, tablet, &group).await
+                }
+                Consumer::MarkerTrim => {
+                    let meta = ctx.metadata_fresh().await;
+                    crate::index_drain::trim_janitor(
+                        &ctx,
+                        &meta,
+                        table,
+                        tablet,
+                        &group,
+                        &[],
+                        false,
+                        false,
+                    )
+                    .await
+                    .map(|()| None)
+                }
+            }
+        });
+        await_slot(
+            cluster,
+            &slot,
+            Duration::from_millis(5),
+            Duration::from_secs(30),
+            what,
+        )
+    };
+
+    // The disk fails under the scan.
+    let mut broken = animus_sim::DiskConfig::default();
+    broken.set_error_prob(1.0);
+    cluster.set_disk_config(broken);
+    let failed = run(&mut cluster, "consumer on a failing disk");
+    assert!(
+        matches!(&failed, Err(e) if e.contains("change-log scan failed") && e.ends_with("; retry")),
+        "seed={seed} {consumer:?}: a scan error must surface as a retryable error, got {failed:?}"
+    );
+    cluster.set_disk_config(animus_sim::DiskConfig::default());
+    cluster.run_for(Duration::from_secs(2));
+
+    // Nothing was sealed, advanced or deleted by the failed attempt.
+    if !matches!(consumer, Consumer::MarkerTrim) {
+        assert!(
+            sealed_rows(&cluster, l, tablet, pitr).is_empty(),
+            "seed={seed} {consumer:?}: a failed seal must not record a segment"
+        );
+    }
+    let (_, kept) = {
+        let slot = cluster.spawn_detached(l, move |ctx| async move {
+            let (_, group) = ctx
+                .edge
+                .hosted_groups()
+                .into_iter()
+                .find(|(t, _)| *t == tablet)
+                .expect("tablet hosted on its leader");
+            group.pending_changes_key_order().await.map(|r| r.len())
+        });
+        (
+            (),
+            await_slot(
+                &mut cluster,
+                &slot,
+                Duration::from_millis(5),
+                Duration::from_secs(30),
+                "recount",
+            ),
+        )
+    };
+    assert_eq!(
+        kept,
+        Ok(RECORDS as usize),
+        "seed={seed} {consumer:?}: a failed attempt must leave every record in the log"
+    );
+
+    // Healthy disk: the same call now does its job on the same records.
+    let retried = run(&mut cluster, "consumer on a healthy disk");
+    match consumer {
+        Consumer::StreamSeal | Consumer::PitrSeal => {
+            assert!(
+                matches!(retried, Ok(Some(_))),
+                "seed={seed} {consumer:?}: retry must seal, got {retried:?}"
+            );
+            let mut elapsed = Duration::ZERO;
+            loop {
+                let rows = sealed_rows(&cluster, l, tablet, pitr);
+                if rows.iter().map(|r| r.2).sum::<u64>() >= RECORDS {
+                    assert_exactly_once(&rows, RECORDS, seed, "seal after a scan error");
+                    break;
+                }
+                assert!(elapsed < Duration::from_secs(20), "seed={seed}: {rows:?}");
+                cluster.run_for(Duration::from_millis(50));
+                elapsed += Duration::from_millis(50);
+            }
+        }
+        Consumer::MarkerTrim => {
+            assert_eq!(retried, Ok(None), "seed={seed}: retry trims");
+        }
+    }
+}
+
+#[test]
+fn a_stream_seal_scan_error_is_retried_not_read_as_an_empty_log() {
+    run_a_change_log_scan_error_is_not_an_empty_log(env_seed(0x5EA1_7001), Consumer::StreamSeal);
+}
+
+#[test]
+fn a_pitr_seal_scan_error_is_retried_not_read_as_an_empty_log() {
+    run_a_change_log_scan_error_is_not_an_empty_log(env_seed(0x5EA1_7002), Consumer::PitrSeal);
+}
+
+#[test]
+fn a_marker_trim_scan_error_is_retried_not_read_as_an_empty_log() {
+    run_a_change_log_scan_error_is_not_an_empty_log(env_seed(0x5EA1_7003), Consumer::MarkerTrim);
+}
+
+#[test]
+fn change_log_scan_errors_are_never_an_empty_log_over_seeds() {
+    for i in 0..4 {
+        for c in [
+            Consumer::StreamSeal,
+            Consumer::PitrSeal,
+            Consumer::MarkerTrim,
+        ] {
+            run_a_change_log_scan_error_is_not_an_empty_log(0x5EA1_7100 + i, c);
+        }
     }
 }

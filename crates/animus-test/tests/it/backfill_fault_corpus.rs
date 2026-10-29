@@ -379,6 +379,7 @@ fn base_partitions_present(node: &KvNode) -> BTreeSet<Vec<u8>> {
 /// fixed 12-byte `(hlc, ordinal)` suffix.
 fn partitions_with_change_marker(node: &KvNode) -> BTreeSet<Vec<u8>> {
     block_on(node.pending_changes_key_order())
+        .expect("change-log scan")
         .into_iter()
         .filter_map(|(k, _)| k.len().checked_sub(12).map(|n| k[..n].to_vec()))
         .collect()
@@ -393,6 +394,7 @@ fn partitions_with_change_marker(node: &KvNode) -> BTreeSet<Vec<u8>> {
 /// marker a partition got, not just whether it got at least one.
 fn decoded_change_records(node: &KvNode) -> Vec<(Vec<u8>, ChangeRecord)> {
     block_on(node.pending_changes_key_order())
+        .expect("change-log scan")
         .into_iter()
         .filter_map(|(k, v)| {
             let prefix_len = k.len().checked_sub(12)?;
