@@ -338,10 +338,24 @@ impl EmbeddedCluster {
 
     /// Add a combined (control voter + data) node, wait for the cluster to
     /// admit it, and return its index. Advances virtual time while it joins.
-    pub fn grow(&mut self) -> u64 {
+    ///
+    /// # Errors
+    /// A node is crashed or a partition is in place. The fixture only returns
+    /// once *every* node has seen the new member, so a node that cannot hear
+    /// the cluster would make it give up with a panic; refusing up front keeps
+    /// the cluster usable. [`heal_all`](Self::heal_all) (and restart any
+    /// crashed node) first.
+    pub fn grow(&mut self) -> Result<u64, EmbeddedError> {
+        if !self.down.is_empty() || !self.partitions.is_empty() {
+            return Err(EmbeddedError(
+                "cannot add a node while a node is down or a partition is in place: \
+                 heal and restart first"
+                    .into(),
+            ));
+        }
         let node = self.cluster.grow("combined");
         self.spawn_change_consumer(node);
-        node
+        Ok(node)
     }
 
     /// A serializable snapshot of the cluster for a UI: virtual time, per-node
@@ -818,7 +832,7 @@ mod tests {
         let mut c = EmbeddedCluster::new(seed, 3, 3).unwrap();
         create_docs(&mut c);
         assert_eq!(put(&mut c, 0, "k", "1").0, 200);
-        let new = c.grow();
+        let new = c.grow().unwrap();
         assert_eq!(new, 3);
         assert_eq!(c.node_count(), 4);
         assert!(
@@ -826,6 +840,21 @@ mod tests {
             "seed={seed}"
         );
         assert_eq!(c.status().nodes.len(), 4);
+    }
+
+    /// Growing while a node is down or cut off is refused, not a panic that
+    /// would poison the cluster.
+    #[test]
+    fn grow_is_refused_while_degraded() {
+        let seed = env_seed(0xE4B0_0009);
+        let mut c = EmbeddedCluster::new(seed, 3, 3).unwrap();
+        c.crash(2).unwrap();
+        assert!(c.grow().is_err(), "seed={seed}");
+        c.heal_all();
+        c.partition(0, 1).unwrap();
+        assert!(c.grow().is_err(), "seed={seed}");
+        c.heal_all();
+        assert_eq!(c.grow().unwrap(), 3, "seed={seed}");
     }
 
     /// A request whose node is restarted under it is answered `503`, not left

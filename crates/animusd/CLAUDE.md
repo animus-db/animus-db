@@ -148,7 +148,7 @@ wiring; the rules:
   `sim_cluster_lsm.rs`) compiled outside `cfg(test)` and exposed as the public
   `embedded::EmbeddedCluster` (module doc in `src/embedded.rs`): `new`/`submit`/
   `poll`/`advance`/`run_request`/`crash`/`restart`/`partition`/`heal_all`/`grow`/
-  `status`. It pulls in `animus-sim` and `animus-control/sim-versions`. It builds
+  `status`. `grow` returns `Err` while a node is down or partitioned (the fixture waits for every node to see the new member and would otherwise panic; lesson `docs/lessons/testing/2026-10-30-a-browser-build-turns-every-fixture-panic-into-a-dead-page.md`). The `animus-web` crate wraps it for the browser (ADR 0082). It pulls in `animus-sim` and `animus-control/sim-versions`. It builds
   for `wasm32-unknown-unknown`:
   `cargo check -p animusd --lib --no-default-features --features embedded --target wasm32-unknown-unknown`.
   `animus-env` gets `getrandom/js` on wasm32 (its `Cargo.toml`).
