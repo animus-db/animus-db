@@ -143,7 +143,7 @@ fn a_follower_serves_an_eventual_read_with_no_barrier_and_no_leadership() {
         // The scan, over the same half-open range semantics `local_scan`
         // and `linearizable_scan` use.
         assert_eq!(
-            block_on(nodes[f].stale_scan(b"k1", Some(b"k3"), None)),
+            block_on(nodes[f].stale_scan(b"k1", Some(b"k3"), None)).expect("scan"),
             vec![
                 (b"k1".to_vec(), b"v1".to_vec()),
                 (b"k2".to_vec(), b"v2".to_vec()),
@@ -152,7 +152,7 @@ fn a_follower_serves_an_eventual_read_with_no_barrier_and_no_leadership() {
         );
         // Descending, with the limit keeping the *highest* rows.
         assert_eq!(
-            block_on(nodes[f].stale_scan_rev(b"k0", Some(b"k9"), Some(2))),
+            block_on(nodes[f].stale_scan_rev(b"k0", Some(b"k9"), Some(2))).expect("scan"),
             vec![
                 (b"k3".to_vec(), b"v3".to_vec()),
                 (b"k2".to_vec(), b"v2".to_vec()),
@@ -206,7 +206,7 @@ fn an_unresolved_intent_reads_back_one_version_never_as_absent() {
         // Same rule row-by-row inside a scan: the row must not vanish from
         // the page, and the staged bytes must not appear in it.
         assert_eq!(
-            block_on(n.stale_scan(&partition_token(b"acct-9"), None, None)),
+            block_on(n.stale_scan(&partition_token(b"acct-9"), None, None)).expect("scan"),
             vec![(k.clone(), b"committed".to_vec())],
             "node {i}: an eventual scan must keep the intent-covered row at its \
              last committed value (seed={seed})"

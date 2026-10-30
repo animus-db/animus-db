@@ -12745,3 +12745,9 @@ before healing; see
 - `txn_resolver_decided_pass` is paged (`TXN_DECIDED_BATCH`/`TXN_REAP_BATCH` = 128, per-tablet `decided_cursor`). Gate open: verify (`txn_participants_clear`), `txn_settle` the clear batch, grace-delayed resolve then re-verify for the rest, then the reaper (`settled_reapable` + `txn_reap`). Gate closed: the old resolve-and-keep path.
 - The reap age (`TXN_SETTLED_REAP_AGE`) is tied to `TXN_IDEMPOTENCY_TTL_SECS + 2 * CLIENT_TIMEOUT` by a compile-time assertion in `dynamo.rs`; the safety argument is in ADR 0018's 2026-10-27 amendment.
 - `/admin/txns?limit=` (default 200, max 5000) plus `*_total` fields; `sim_cluster_txn_settled.rs` is the regression (seeded, restart, negative control); a restarted `SimCluster` group never re-quiesces, so it asserts the tracker, not quiescence (`docs/lessons/testing/2026-10-27-...`). Mixed-version cell `release9_to_release10_txn_settle_gate`.
+
+- **Eventual reads (issues #1419/#1424):** the three forwarded `stale: true`
+  arms share `ClientCtx::serve_stale_read` (`forwarding.rs`); a read that serves
+  nothing refunds its pre-charge (`throttle_refund_read`), locally too; a failed
+  scan is a `"; retry"` error, never an empty page. Pinned by
+  `sim_cluster_eventual_reads`.

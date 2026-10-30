@@ -751,8 +751,10 @@ pub trait Disk: Send + Sync {
 
     /// Read up to `len` bytes from `file` starting at byte `offset` (over the
     /// durable + buffered view, like [`read`](Disk::read)). Returns fewer bytes
-    /// at end-of-file and an empty vector if the file does not exist or `offset`
-    /// is past the end. This is the random-access primitive an on-disk LSM uses
+    /// at end-of-file and an empty vector if `offset` is past the end. A file
+    /// that does not exist is an **error** (`ErrorKind::NotFound`), not an empty
+    /// read (issue #1419): the caller reads a file it knows exists, and an empty
+    /// result would surface only as a misleading short-read. This is the random-access primitive an on-disk LSM uses
     /// to fetch a single SSTable block without loading the whole file.
     async fn read_at(&self, file: &str, offset: u64, len: usize) -> std::io::Result<Vec<u8>>;
 
