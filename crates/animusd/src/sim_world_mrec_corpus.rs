@@ -120,6 +120,14 @@ struct Plan {
     burst: bool,
     /// Feed the oracle a wrong expectation (negative control).
     bite: bool,
+    /// After the random workload, one more round in which EVERY region writes
+    /// the same key before anything ships (issue #1271): a seed whose random
+    /// ops never produced a surviving conflicting pair left
+    /// `mrec_negative_lww_by_arrival` with nothing to catch. In a round every
+    /// region receives a peer's write stamped differently from its own, so
+    /// last-delivered-wins diverges on every seed, while stamp-ordered LWW
+    /// converges.
+    conflict_round: bool,
     /// Fault-free: the shipped-record bound applies.
     clean: bool,
     /// The cell must actually exercise its fault (else it proves nothing).
@@ -153,6 +161,7 @@ impl Plan {
             form_late: false,
             burst: false,
             bite: false,
+            conflict_round: false,
             clean: false,
             expect: Expect::Nothing,
         }
@@ -229,6 +238,7 @@ fn plans() -> Vec<Plan> {
     v.push(p);
     let mut p = Plan::base("concurrent_conflicting_writes", 3, 45);
     p.burst = true;
+    p.conflict_round = true;
     p.faults = vec![(0, Fault::Lossy(true))];
     v.push(p);
     let mut p = Plan::base("delete_put_race", 2, 60);
@@ -662,6 +672,23 @@ impl W {
                 self.observe(c, &k, v.as_deref());
             }
         }
+    }
+
+    /// One write per region to the same key, all before anything ships, so each
+    /// region later receives a peer's write that it must order by stamp, not by
+    /// arrival (see `Plan::conflict_round`).
+    fn conflict_round(&mut self, plan: &Plan) {
+        let key = KEYS[0];
+        for c in 0..plan.regions {
+            self.m.attempted_by[c] += 1;
+            self.m.seq += 1;
+            let val = pad_of(&format!("{}{}", REGIONS[c], self.m.seq), plan.pad);
+            self.note_attempt(key, &val);
+            let (st, r) = self.call(c, "PutItem", &item_body(key, &val, ""));
+            assert_eq!(st, 200, "conflict round put on region {c}: {r}");
+            self.observe(c, key, Some(&val));
+        }
+        self.step_all();
     }
 
     // ---- faults -----------------------------------------------------------
@@ -1156,6 +1183,9 @@ fn run(seed: u64, plan: &Plan) -> (Dump, u64) {
             let ms = w.rnd(120);
             w.w.run_for(Duration::from_millis(ms));
         }
+    }
+    if plan.conflict_round {
+        w.conflict_round(plan);
     }
     // Faults scheduled at the end of the workload.
     let tail: Vec<Fault> = plan
