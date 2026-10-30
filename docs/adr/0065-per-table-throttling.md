@@ -411,3 +411,18 @@ out: `UpdateTable`'s throughput change joins `GlobalSecondaryIndexUpdates`/
 C, extended) — except a bare `BillingMode: "PAY_PER_REQUEST"` restatement
 alongside a real stream/index change, which stays tolerated as a no-op
 (the pre-ADR-0065 precedent for that exact shape, a common SDK/CLI habit).
+
+## Amendment (2026-10-30, issues #1419 and #1424 — a read that serves nothing is not charged)
+
+The eventual-read pre-charge (the 0.5 RCU minimum, Decision 3) is taken
+before the engine is touched. If the replica then **serves nothing** — the
+read comes back "not served" (`stale_get_served` is `None`) or the engine's
+scan fails — the pre-charge is **refunded** (`ClientCtx::throttle_refund_read`),
+on the forwarded arms (`forwarding.rs`, `serve_stale_read`) and on the local
+path (`read_path.rs`) alike. A served read is still corrected to its real
+byte cost. A scope mismatch or a missing local replica is refused *before*
+the pre-charge, so it never charged anything. A throttle refusal itself is
+unchanged (never a fallback, never `"; retry"`).
+
+Pinned by `sim_cluster_eventual_reads` (served = charged, not served =
+refunded, per arm and on the local path).

@@ -142,7 +142,7 @@ fn an_eventual_read_on_a_quiesced_group_never_wakes_it() {
     );
     // The scan form, not just the point read.
     assert_eq!(
-        block_on(nodes[follower].stale_scan(b"k1", Some(b"k3"), None)),
+        block_on(nodes[follower].stale_scan(b"k1", Some(b"k3"), None)).expect("scan"),
         vec![
             (b"k1".to_vec(), b"v1".to_vec()),
             (b"k2".to_vec(), b"v2".to_vec()),

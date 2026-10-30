@@ -6,6 +6,7 @@
 //! Moved verbatim out of `lib.rs`'s `impl<E: Env> ClientCtx<E>` block --
 //! no logic changes.
 
+use crate::CpGroup;
 use std::collections::{BTreeMap, BTreeSet};
 
 use animus_cp_data::hlc;
@@ -59,6 +60,82 @@ pub(crate) fn is_forward_budget_exhausted(error: &str) -> bool {
 /// `#[deny(clippy::disallowed_methods)]` (ADR 0061 Phase C's closing rung).
 fn format_forward_budget_exhausted(last_hop_error: &str) -> String {
     format!("{FORWARD_BUDGET_EXHAUSTED} (last hop: {last_hop_error}); retry")
+}
+
+/// What the serve step of an eventual read (ADR 0055) produced; see
+/// [`ClientCtx::serve_stale_read`].
+enum StaleServe {
+    /// Answered: the reply and the byte count to post-charge.
+    Served {
+        response: Box<ClientResponse>,
+        bytes: usize,
+    },
+    /// This replica could not answer cheaply; the caller falls back.
+    NotServed,
+    /// The engine failed mid-read (a scan error). A refusal, never an empty
+    /// page (issue #1419).
+    Failed(String),
+}
+
+impl StaleServe {
+    fn pairs(p: Vec<(Vec<u8>, Vec<u8>)>) -> Self {
+        let bytes = p.iter().map(|(k, v)| k.len() + v.len()).sum();
+        Self::Served {
+            response: Box::new(ClientResponse::Pairs(p)),
+            bytes,
+        }
+    }
+}
+
+impl<E: Env, R: RelayClient> ClientCtx<E, R> {
+    /// The shared skeleton of the three forwarded **eventual-read** arms
+    /// (`Get`, `Scan`, `KindScan` with `stale: true`; issue #1424): resolve
+    /// the tablet, find a serveable local replica whose scope passes
+    /// `scope_ok`, pre-charge (ADR 0065 §2/§3: the check happens on the
+    /// serving replica, and a throttle refusal is deliberately distinct from
+    /// `STALE_READ_REFUSAL`), `serve`, then post-charge the real bytes.
+    ///
+    /// Charge contract, pinned by `sim_cluster_eventual_charge`: served =
+    /// pre-charge corrected to the real byte count; not served or failed =
+    /// the pre-charge is **refunded** (nothing was served). Serve-or-refuse
+    /// only, never re-forwards. The leader (strong) arms are deliberately
+    /// not folded in: they refuse differently (`leader_for`).
+    async fn serve_stale_read<S, Fut>(
+        &self,
+        table: &str,
+        tablet: Option<TabletId>,
+        scope_ok: impl FnOnce(&CpGroup<E>) -> bool,
+        serve: S,
+    ) -> ClientResponse
+    where
+        S: FnOnce(CpGroup<E>) -> Fut,
+        Fut: std::future::Future<Output = StaleServe>,
+    {
+        let Some(tablet) = tablet else {
+            return ClientResponse::Error(STALE_READ_REFUSAL.into());
+        };
+        let Some(group) = self.cp_stale_local(tablet).filter(|g| scope_ok(g)) else {
+            return ClientResponse::Error(STALE_READ_REFUSAL.into());
+        };
+        let precharge = match self.throttle_precharge_read(table, tablet, false) {
+            Ok(p) => p,
+            Err(e) => return ClientResponse::Error(e),
+        };
+        match serve(group).await {
+            StaleServe::Served { response, bytes } => {
+                self.throttle_postcharge_read(precharge, bytes, false);
+                *response
+            }
+            StaleServe::NotServed => {
+                self.throttle_refund_read(precharge);
+                ClientResponse::Error(STALE_READ_REFUSAL.into())
+            }
+            StaleServe::Failed(e) => {
+                self.throttle_refund_read(precharge);
+                ClientResponse::Error(e)
+            }
+        }
+    }
 }
 
 impl<E: Env, R: RelayClient> ClientCtx<E, R> {
@@ -1167,37 +1244,23 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 table,
                 stale: true,
             } => {
-                let Some(tablet) = self.tablet_for(&table, &key) else {
-                    return ClientResponse::Error(STALE_READ_REFUSAL.into());
-                };
-                match self.cp_stale_local(tablet) {
-                    Some(group) if group.scope_range().contains(&key) => {
-                        // ADR 0065 §2: this node is the replica actually
-                        // serving the eventual read — the check/charge
-                        // happens here, on the serving side, never on the
-                        // relaying caller. A refusal is deliberately
-                        // distinguishable from `STALE_READ_REFUSAL` (see
-                        // `dynamo::THROTTLE_READ_REFUSAL`'s own doc): the
-                        // caller must propagate it as an error, not treat
-                        // it as "not served cheaply, fall back".
-                        let precharge = match self.throttle_precharge_read(&table, tablet, false) {
-                            Ok(p) => p,
-                            Err(e) => return ClientResponse::Error(e),
-                        };
-                        match group.stale_get_served(&key).await {
-                            Some(v) => {
-                                self.throttle_postcharge_read(
-                                    precharge,
-                                    v.as_ref().map_or(0, Vec::len),
-                                    false,
-                                );
-                                ClientResponse::Value(v)
-                            }
-                            None => ClientResponse::Error(STALE_READ_REFUSAL.into()),
+                let tablet = self.tablet_for(&table, &key);
+                let key = &key;
+                self.serve_stale_read(
+                    &table,
+                    tablet,
+                    |g| g.scope_range().contains(key),
+                    |group| async move {
+                        match group.stale_get_served(key).await {
+                            Some(v) => StaleServe::Served {
+                                bytes: v.as_ref().map_or(0, Vec::len),
+                                response: Box::new(ClientResponse::Value(v)),
+                            },
+                            None => StaleServe::NotServed,
                         }
-                    }
-                    _ => ClientResponse::Error(STALE_READ_REFUSAL.into()),
-                }
+                    },
+                )
+                .await
             }
             ClientRequest::Get {
                 key,
@@ -1254,26 +1317,23 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 table,
                 stale: true,
             } => {
-                let Some(tablet) = self.tablet_for(&table, &start) else {
-                    return ClientResponse::Error(STALE_READ_REFUSAL.into());
-                };
+                let tablet = self.tablet_for(&table, &start);
                 let requested = KeyRange::new(start.clone(), end.clone());
-                match self.cp_stale_local(tablet) {
-                    Some(group) if group.scope_range().contains_range(&requested) => {
-                        // ADR 0065 §2/§3 — this node is the serving replica.
-                        let precharge = match self.throttle_precharge_read(&table, tablet, false) {
-                            Ok(p) => p,
-                            Err(e) => return ClientResponse::Error(e),
-                        };
-                        let p = group
+                self.serve_stale_read(
+                    &table,
+                    tablet,
+                    |g| g.scope_range().contains_range(&requested),
+                    |group| async move {
+                        match group
                             .stale_scan(&start, end.as_deref(), limit, reverse)
-                            .await;
-                        let bytes: usize = p.iter().map(|(k, v)| k.len() + v.len()).sum();
-                        self.throttle_postcharge_read(precharge, bytes, false);
-                        ClientResponse::Pairs(p)
-                    }
-                    _ => ClientResponse::Error(STALE_READ_REFUSAL.into()),
-                }
+                            .await
+                        {
+                            Ok(p) => StaleServe::pairs(p),
+                            Err(e) => StaleServe::Failed(crate::stale_scan_failed(&e)),
+                        }
+                    },
+                )
+                .await
             }
             ClientRequest::Scan {
                 start,
@@ -1321,26 +1381,23 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 reverse,
                 stale: true,
             } => {
-                let Some(tablet) = self.tablet_for(&table, &start) else {
-                    return ClientResponse::Error(STALE_READ_REFUSAL.into());
-                };
+                let tablet = self.tablet_for(&table, &start);
                 let requested = KeyRange::new(start.clone(), end.clone());
-                match self.cp_stale_local(tablet) {
-                    Some(group) if group.scope_range().contains_range(&requested) => {
-                        // ADR 0065 §2/§3 — this node is the serving replica.
-                        let precharge = match self.throttle_precharge_read(&table, tablet, false) {
-                            Ok(p) => p,
-                            Err(e) => return ClientResponse::Error(e),
-                        };
-                        let p = group
+                self.serve_stale_read(
+                    &table,
+                    tablet,
+                    |g| g.scope_range().contains_range(&requested),
+                    |group| async move {
+                        match group
                             .stale_scan_kind(kind, &start, end.as_deref(), limit, reverse)
-                            .await;
-                        let bytes: usize = p.iter().map(|(k, v)| k.len() + v.len()).sum();
-                        self.throttle_postcharge_read(precharge, bytes, false);
-                        ClientResponse::Pairs(p)
-                    }
-                    _ => ClientResponse::Error(STALE_READ_REFUSAL.into()),
-                }
+                            .await
+                        {
+                            Ok(p) => StaleServe::pairs(p),
+                            Err(e) => StaleServe::Failed(crate::stale_scan_failed(&e)),
+                        }
+                    },
+                )
+                .await
             }
             ClientRequest::KindScan {
                 table,
