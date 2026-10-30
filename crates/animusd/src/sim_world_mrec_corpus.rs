@@ -1272,7 +1272,9 @@ cell_tests! {
 /// simulator fingerprint (LWW determinism, oracle 6).
 #[test]
 fn sim_world_mrec_corpus_determinism() {
-    if !cell_selected("determinism") {
+    // One fixed seed (variant 0, which shard 0 keeps): not split by seed, so
+    // it runs on shard 0 only (a later shard may own no seed at small K).
+    if !cell_selected("determinism") || !animus_test::corpus::owns_unsharded() {
         return;
     }
     let plan = plan_named("loss_dup_reorder");

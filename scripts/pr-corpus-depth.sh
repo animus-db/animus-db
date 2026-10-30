@@ -46,14 +46,14 @@ backup|crates/animus-test/tests/it/backup_fault_corpus\.rs|1|ANIMUS_BACKUP_SEEDS
 pitr|crates/animus-test/tests/it/pitr_fault_corpus\.rs|1|ANIMUS_PITR_SEEDS=40|cargo test -p animus-test --test it pitr_fault_corpus::
 lsm_crash|crates/animus-storage/tests/it/lsm_crash\.rs|1|ANIMUS_LSM_CRASH_SEEDS=40|cargo test -p animus-storage --test it lsm_crash::
 lsm_disk_fault|crates/animus-storage/tests/it/lsm_disk_faults\.rs|1|ANIMUS_LSM_DISK_FAULT_SEEDS=40|cargo test -p animus-storage --test it lsm_disk_faults::
-lsm_stall|crates/animus-storage/tests/it/lsm_write_stall\.rs crates/animus-cp-data/tests/it/lsm_stall_admission\.rs crates/animus-cp-data/tests/it/compaction_io_budget_corpus\.rs crates/animusd/src/sim_cluster_lsm_stall\.rs|1|ANIMUS_LSM_STALL_SEEDS=20|cargo test -p animus-storage --test it lsm_write_stall:: ;; cargo test -p animus-cp-data --test it lsm_stall_admission:: ;; cargo test -p animus-cp-data --test it compaction_io_budget_corpus:: ;; cargo test -p animusd --lib sim_cluster_lsm_stall
+lsm_stall|crates/animus-storage/tests/it/lsm_write_stall\.rs crates/animus-cp-data/tests/it/lsm_stall_admission\.rs crates/animus-cp-data/tests/it/compaction_io_budget_corpus\.rs crates/animusd/src/sim_cluster_lsm_stall\.rs|4|ANIMUS_LSM_STALL_SEEDS=20|cargo test -p animus-storage --test it lsm_write_stall:: ;; cargo test -p animus-cp-data --test it lsm_stall_admission:: ;; cargo test -p animus-cp-data --test it compaction_io_budget_corpus:: ;; cargo test -p animusd --lib sim_cluster_lsm_stall
 lsm_encrypted|crates/animus-storage/tests/it/lsm_crash_encrypted\.rs|1|ANIMUS_LSM_ENCRYPTED_SEEDS=40|cargo test -p animus-storage --test it lsm_crash_encrypted::
 segment_store_encrypted|crates/animus-test/tests/it/segment_store_encrypted_fault_corpus\.rs|1|ANIMUS_SEGMENT_STORE_ENCRYPTED_SEEDS=40|cargo test -p animus-test --test it segment_store_encrypted_fault_corpus::
 control|crates/animus-control/tests/it/control_corpus\.rs|1|ANIMUS_CONTROL_SEEDS=40|cargo test -p animus-control --test it control_corpus::
 simcluster|crates/animusd/src/sim_cluster_corpus\.rs|1|ANIMUS_SIMCLUSTER_SEEDS=25|cargo test -p animusd --lib sim_cluster_corpus
 dynamo_wire|crates/animusd/src/sim_cluster_dynamo_corpus\.rs|1|ANIMUS_DYNAMO_WIRE_SEEDS=25|cargo test -p animusd --lib sim_cluster_dynamo_corpus
-zone_placement|crates/animusd/src/sim_cluster_zone_placement\.rs|1|ANIMUS_ZONE_PLACEMENT_SEEDS=25|cargo test -p animusd --lib sim_cluster_zone_placement
-split_relocation|crates/animusd/src/sim_cluster_split_relocation\.rs|1|ANIMUS_SPLIT_RELOCATION_SEEDS=20|cargo test -p animusd --lib sim_cluster_split_relocation
+zone_placement|crates/animusd/src/sim_cluster_zone_placement\.rs|2|ANIMUS_ZONE_PLACEMENT_SEEDS=25|cargo test -p animusd --lib sim_cluster_zone_placement
+split_relocation|crates/animusd/src/sim_cluster_split_relocation\.rs|2|ANIMUS_SPLIT_RELOCATION_SEEDS=20|cargo test -p animusd --lib sim_cluster_split_relocation
 export_import|crates/animus-test/tests/it/export_import_fault_corpus\.rs|1|ANIMUS_EXPORT_IMPORT_SEEDS=40|cargo test -p animus-test --test it export_import_fault_corpus::
 s3_fault|crates/animus-test/tests/it/s3_fault_corpus\.rs|1|ANIMUS_S3_FAULT_SEEDS=100|cargo test -p animus-test --test it s3_fault_corpus::
 heartbeat|crates/animus-cp-data/tests/it/heartbeat_batch_corpus\.rs|1|ANIMUS_HEARTBEAT_SEEDS=40|cargo test -p animus-cp-data --test it heartbeat_batch_corpus::
@@ -62,13 +62,13 @@ density_admission|crates/animus-cp-data/tests/it/density_admission_corpus\.rs|1|
 repair_pacing|crates/animus-control/tests/it/repair_pacing\.rs|1|ANIMUS_REPAIR_PACING_SEEDS=20|cargo test -p animus-control --test it repair_pacing::
 mrsc_leader|crates/animus-cp-data/tests/it/preferred_leader_corpus\.rs|1|ANIMUS_MRSC_SEEDS=40|cargo test -p animus-cp-data --test it preferred_leader_corpus::
 mrsc_cluster|crates/animusd/src/sim_cluster_mrsc\.rs|3|ANIMUS_MRSC_SEEDS=10|cargo test -p animusd --lib sim_cluster_mrsc
-mrec_world|crates/animusd/src/sim_world_mrec_corpus\.rs|1|ANIMUS_MREC_SEEDS=15|cargo test -p animusd --lib sim_world_mrec_corpus
+mrec_world|crates/animusd/src/sim_world_mrec_corpus\.rs|2|ANIMUS_MREC_SEEDS=15|cargo test -p animusd --lib sim_world_mrec_corpus
 sharedwal|crates/animus-cp-data/tests/it/sharedwal_fault_corpus\.rs|1|ANIMUS_SHAREDWAL_SEEDS=40|cargo test -p animus-cp-data --test it sharedwal_fault_corpus::
 wal_rewrite_crash|crates/animus-cp-data/tests/it/wal_rewrite_crash\.rs|1|ANIMUS_WAL_REWRITE_CRASH_SEEDS=50|cargo test -p animus-cp-data --test it wal_rewrite_crash::
 upgrade_restart|crates/animus-test/tests/it/upgrade_restart_corpus\.rs crates/animus-test/tests/it/upgrade_restart_tier0\.rs crates/animus-test/tests/it/upgrade_restart_txn_envelope\.rs|1|ANIMUS_UPGRADE_RESTART_SEEDS=100|cargo test -p animus-test --test it upgrade_restart_corpus::
 upgrade_restart_cluster|crates/animusd/src/sim_cluster_upgrade_corpus\.rs|1|ANIMUS_UPGRADE_RESTART_SEEDS=50|cargo test -p animusd --lib sim_cluster_upgrade_corpus
 upgrade_mixed|crates/animus-control/tests/it/version_mixed_corpus\.rs|1|ANIMUS_UPGRADE_SEEDS=100|cargo test -p animus-control --test it version_mixed_corpus::
-upgrade_mixed_cluster|crates/animusd/src/sim_cluster_mixed_version_corpus\.rs|1|ANIMUS_UPGRADE_SEEDS=40|cargo test -p animusd --lib sim_cluster_mixed_version
+upgrade_mixed_cluster|crates/animusd/src/sim_cluster_mixed_version_corpus\.rs|3|ANIMUS_UPGRADE_SEEDS=40|cargo test -p animusd --lib sim_cluster_mixed_version
 upgrade_roll|crates/animusd/src/sim_cluster_roll_orchestrator\.rs|1|ANIMUS_UPGRADE_SEEDS=40|cargo test -p animusd --lib sim_cluster_roll_orchestrator
 learner_snapshot_livelock|crates/animus-cp-data/tests/it/learner_snapshot_livelock_under_continuous_writer\.rs|1|ANIMUS_LEARNER_SNAPSHOT_LIVELOCK_SEEDS=16|cargo test -p animus-cp-data --test it learner_snapshot_livelock_under_continuous_writer::
 scale|crates/animusd/src/sim_cluster_scale\.rs|1|ANIMUS_SCALE_SEEDS=10 ANIMUS_SCALE_MAX_TABLETS=50000|cargo test -p animusd --lib sim_cluster_scale

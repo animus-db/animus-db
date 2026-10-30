@@ -126,12 +126,27 @@ pub fn shard_from_env() -> Option<Shard> {
 pub fn shard_retain_with<T>(items: Vec<T>, shard: Option<Shard>) -> Vec<T> {
     match shard {
         None => items,
-        Some(sh) => items
-            .into_iter()
-            .enumerate()
-            .filter(|(v, _)| sh.keeps(*v))
-            .map(|(_, t)| t)
-            .collect(),
+        Some(sh) => {
+            let total = items.len();
+            let kept: Vec<T> = items
+                .into_iter()
+                .enumerate()
+                .filter(|(v, _)| sh.keeps(*v))
+                .map(|(_, t)| t)
+                .collect();
+            trace_shard(sh, total, (0..total).filter(|v| sh.keeps(*v)));
+            kept
+        }
+    }
+}
+
+/// `ANIMUS_SHARD_TRACE=1` prints the variant indices a shard kept out of
+/// `total`, so a run at small K for each shard shows that the shards' union is
+/// the unsharded seed set (`sort -u` the `SHARD_TRACE` lines per shard).
+fn trace_shard(sh: Shard, total: usize, kept: impl Iterator<Item = usize>) {
+    if env::var_os("ANIMUS_SHARD_TRACE").is_some() {
+        let kept: Vec<usize> = kept.collect();
+        eprintln!("SHARD_TRACE {}/{} of {total}: {kept:?}", sh.index, sh.of);
     }
 }
 
@@ -145,6 +160,9 @@ pub fn shard_retain<T>(items: Vec<T>) -> Vec<T> {
 /// unset). For a `for i in 0..k` seed loop.
 pub fn shard_range(k: u64) -> impl Iterator<Item = u64> {
     let shard = shard_from_env();
+    if let Some(sh) = shard {
+        trace_shard(sh, k as usize, (0..k as usize).filter(|v| sh.keeps(*v)));
+    }
     (0..k).filter(move |v| shard.is_none_or(|s| s.keeps(*v as usize)))
 }
 
@@ -241,6 +259,17 @@ pub fn expand_cells<T: SeedVariant>(
     k: usize,
     filter: Option<&str>,
 ) -> Vec<T> {
+    expand_cells_sharded(cells, replay, k, filter, shard_from_env())
+}
+
+/// [`expand_cells`] with the shard passed explicitly (`None` = every variant).
+pub fn expand_cells_sharded<T: SeedVariant>(
+    cells: Vec<T>,
+    replay: Option<u64>,
+    k: usize,
+    filter: Option<&str>,
+    shard: Option<Shard>,
+) -> Vec<T> {
     let expanded = if let Some(seed) = replay {
         cells
             .into_iter()
@@ -250,7 +279,7 @@ pub fn expand_cells<T: SeedVariant>(
             })
             .collect()
     } else {
-        seed_expand(cells, k)
+        seed_expand_sharded(cells, k, shard)
     };
     expanded
         .into_iter()
@@ -269,6 +298,27 @@ pub fn corpus_cells<T: SeedVariant>(cells: Vec<T>, seeds_var: &str, cell_var: &s
         .ok()
         .and_then(|v| v.parse::<u64>().ok());
     expand_cells(cells, replay, seeds_from_env(seeds_var), filter.as_deref())
+}
+
+/// [`corpus_cells`] over *every* seed variant, ignoring `ANIMUS_SEED_SHARD`: for
+/// an aggregate check pinned to shard 0 ([`owns_unsharded`]) that must see the
+/// whole seed set.
+pub fn corpus_cells_unsharded<T: SeedVariant>(
+    cells: Vec<T>,
+    seeds_var: &str,
+    cell_var: &str,
+) -> Vec<T> {
+    let filter = env::var(cell_var).ok();
+    let replay = env::var("ANIMUS_SEED")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok());
+    expand_cells_sharded(
+        cells,
+        replay,
+        seeds_from_env(seeds_var),
+        filter.as_deref(),
+        None,
+    )
 }
 
 /// Run `body` once per seed variant of a scenario named `name`, `k` times

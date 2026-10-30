@@ -3463,13 +3463,28 @@ fn run_joiner_range(c: &Cell) -> Verdict {
 
 /// One test per cell family so nextest spreads them across its shards.
 fn run_family(prefix: &str) {
-    let cs: Vec<Cell> = corpus_cells()
+    let sharded = std::env::var_os(corpus::SHARD_VAR).is_some();
+    // N1's "fired on at least one seed" is an aggregate over the whole seed
+    // set, which a seed shard cannot see: it runs over every variant on shard 0
+    // (the family is cheap) and the other shards skip it.
+    let aggregate = prefix == "negative_control_premature";
+    if sharded && aggregate && !corpus::owns_unsharded() {
+        return;
+    }
+    let all = if sharded && aggregate {
+        corpus::corpus_cells_unsharded(cells(), "ANIMUS_UPGRADE_SEEDS", "ANIMUS_UPGRADE_CELL")
+    } else {
+        corpus_cells()
+    };
+    let cs: Vec<Cell> = all
         .into_iter()
         .filter(|c| c.name.starts_with(prefix))
         .collect();
     let narrowed = std::env::var("ANIMUS_UPGRADE_CELL").is_ok();
+    // A shard may own no variant of a family at a small depth K; the
+    // whole-cell-set meta-test checks every family is non-empty.
     assert!(
-        narrowed || !cs.is_empty(),
+        narrowed || sharded || !cs.is_empty(),
         "no cell selected for family {prefix}"
     );
     let mut fired = false;
@@ -3527,6 +3542,10 @@ fn sim_cluster_mixed_version_corpus_negative_control_is_caught() {
 /// either fails per push, not only at the nightly's depth.
 #[test]
 fn sim_cluster_mixed_version_corpus_issue_1249_pinned_seeds() {
+    // Fixed seeds, not split by seed: shard 0 only.
+    if !corpus::owns_unsharded() {
+        return;
+    }
     let pinned: [(&str, Kind, u64); 5] = [
         (
             "kill_b2_leader",
@@ -3677,7 +3696,11 @@ fn sim_cluster_mixed_version_corpus_txn_settle_gate() {
 
 #[test]
 fn sim_cluster_mixed_version_cell_names_and_seeds_are_unique() {
-    let cs = corpus::seed_expand(cells(), 3);
+    // A whole-cell-set meta-test: shard 0 only, over every variant.
+    if !corpus::owns_unsharded() {
+        return;
+    }
+    let cs = corpus::seed_expand_sharded(cells(), 3, None);
     let names: BTreeSet<_> = cs.iter().map(|c| c.name.clone()).collect();
     let seeds: BTreeSet<_> = cs.iter().map(|c| c.seed).collect();
     assert_eq!(names.len(), cs.len(), "duplicate cell name");
@@ -3722,6 +3745,10 @@ fn sim_cluster_mixed_version_cell_names_and_seeds_are_unique() {
 
 #[test]
 fn sim_cluster_mixed_version_run_is_deterministic() {
+    // One fixed cell, not split by seed: shard 0 only.
+    if !corpus::owns_unsharded() {
+        return;
+    }
     let c = cell("roll_ascending", Kind::Roll(0));
     let a = run_cell(&c);
     let b = run_cell(&c);
