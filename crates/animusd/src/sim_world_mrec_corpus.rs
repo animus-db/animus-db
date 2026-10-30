@@ -679,10 +679,10 @@ impl W {
     /// arrival (see `Plan::conflict_round`).
     fn conflict_round(&mut self, plan: &Plan) {
         let key = KEYS[0];
-        for c in 0..plan.regions {
+        for (c, region) in REGIONS.iter().enumerate().take(plan.regions) {
             self.m.attempted_by[c] += 1;
             self.m.seq += 1;
-            let val = pad_of(&format!("{}{}", REGIONS[c], self.m.seq), plan.pad);
+            let val = pad_of(&format!("{region}{}", self.m.seq), plan.pad);
             self.note_attempt(key, &val);
             let (st, r) = self.call(c, "PutItem", &item_body(key, &val, ""));
             assert_eq!(st, 200, "conflict round put on region {c}: {r}");
