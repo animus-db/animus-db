@@ -1795,6 +1795,41 @@ freezes that type's absent-field semantics once merged.**
   unchanged and still backs every one of those. Regression:
   `tests/leader_within_hysteresis.rs`.
 
+- **Leader lease on the real vote, check-quorum, conceded candidacy (ADR 0009's
+  2026-10-29 amendment).** Pre-vote only guards the pre-vote phase: a starved
+  follower holding a stale pre-vote grant still sends a real `RequestVote`, and
+  `handle`'s step-down on any higher term used to depose a healthy leader.
+  `RaftCore::leader_lease(now)` (pub): leader, and either quiesced, inside
+  `lease_grace_until` (set by `become_leader` seeding and `arm_lease_grace` on
+  every leave-quiescence site), or a quorum of voters (self counted) in
+  `last_contact` within `stretched_base()`. `handle` checks it **first**, before
+  the quiescence wake and the step-down: a higher-term `RequestVote` is ignored
+  (no reply, no term adoption; `heard_from` and `stranger_notice` still run;
+  `rv_ignored_lease`) unless the candidate is the leader's own `transfer_target`
+  (the transfer bypass is local state, **no wire field**: a flag would reach the
+  raftkv-wire binary codec and need a frame version plus a `Gate`). Only the
+  leader holds the lease; a follower in lease still grants (documented limit).
+  Check-quorum is lease validity, **not** an active step-down, and a leader
+  **always refuses pre-votes** (`live_leader`): both choices were forced by the
+  CPU-starved sims, where a leader's acks sit in its own queue past any window
+  (making the pre-vote follow the lapsed lease regressed density cell 3 seed
+  `s11`). Third part: a `Candidate` that **grants a pre-vote steps back to
+  `Follower`** (keeps term and `voted_for`, `candidacies_conceded`), otherwise it
+  can win a stale term a moment later and be deposed by the node it waved
+  through via that node's higher-term `AppendEntriesResp`, which the lease cannot
+  stop. Tests: `tests/it/leader_lease.rs`. Any test that wants a disruptive
+  higher-term candidate to depose a leader must first let the lease lapse (no
+  acks for `election_timeout()`).
+  **The pre-vote grant (`handle_pre_vote`) also consults the cluster check**
+  (issue #667): `Refused` always refuses; `Pending` refuses only when the PreVote's
+  `last_log_index`/`last_log_term` is non-zero (the cluster is established), so a
+  wiped, check-pending voter cannot help a live follower form a pre-vote majority
+  (`pv_refused_unchecked`; test `wiped_voter_with_pending_check_refuses_pre_vote`)
+  while a genesis group, where every fresh replica is `Pending` with an empty log,
+  still elects promptly (`genesis_group_of_pending_nodes_elects_via_pre_vote`).
+  Real votes keep the unconditional `blocks_voting()` gate. Any new grant path
+  must consult the same check.
+
 - **Learner (non-voting) membership class (ADR 0058 Train 1).** `RaftCore`
   gains a per-member `role`: alongside the existing voter `config`, a
   parallel `learners: BTreeSet<NodeId>` is kept in sync by the identical
