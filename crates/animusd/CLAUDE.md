@@ -12745,3 +12745,22 @@ before healing; see
 - `txn_resolver_decided_pass` is paged (`TXN_DECIDED_BATCH`/`TXN_REAP_BATCH` = 128, per-tablet `decided_cursor`). Gate open: verify (`txn_participants_clear`), `txn_settle` the clear batch, grace-delayed resolve then re-verify for the rest, then the reaper (`settled_reapable` + `txn_reap`). Gate closed: the old resolve-and-keep path.
 - The reap age (`TXN_SETTLED_REAP_AGE`) is tied to `TXN_IDEMPOTENCY_TTL_SECS + 2 * CLIENT_TIMEOUT` by a compile-time assertion in `dynamo.rs`; the safety argument is in ADR 0018's 2026-10-27 amendment.
 - `/admin/txns?limit=` (default 200, max 5000) plus `*_total` fields; `sim_cluster_txn_settled.rs` is the regression (seeded, restart, negative control); a restarted `SimCluster` group never re-quiesces, so it asserts the tracker, not quiescence (`docs/lessons/testing/2026-10-27-...`). Mixed-version cell `release9_to_release10_txn_settle_gate`.
+
+## Corpus-oracle gotchas from issue #1271 (2026-10-30)
+
+- `sim_cluster_mixed_version_corpus` negative controls assert "the old replica never
+  appended the bad entry" as `last_log_index(OLD) < ProposeResult::Accepted.index`
+  (`old_appended_bad_entry`), never a before/after length delta (an unrelated entry
+  can land between), and move leadership with `move_leadership_off_old` (retried,
+  bounded). Positive cells that compare `post_log != pre_log` over a refused relay
+  are the same hazard if they ever flake.
+- `sim_world_mrec_corpus`: a plan with `conflict_round` ends with one round where
+  every region writes `k0` before anything ships, so `mrec_negative_lww_by_arrival`
+  has a conflicting pair on every seed.
+- `sim_cluster_mrsc` `revert_*`: with a KEPT-Region node down the removed replicas
+  deliberately keep their voter seats and may still lead
+  (`RaftKvNode::reconfigure_step` steps 5/6 need every desired member caught up),
+  so those cells check the metadata revert and availability, not full convergence,
+  until the node returns (`revert_kept_region_node_kill` pins this). `SimCluster`
+  drops not-leader hints (addresses have no `:port`, issue #1431), so a client on a
+  non-hosting node cannot reach such a leader in the sim.

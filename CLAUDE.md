@@ -315,6 +315,11 @@ assertion messages; replay with `ANIMUS_SEED=<seed> cargo test <name>`. The
 
 The deep corpus tiers run nightly in CI
 (`.github/workflows/corpus-deep.yml`), not per-push.
+**Exception (issue #1271): a PR that changes a corpus's test file runs that
+corpus at its nightly depth** (CI job `corpus-changed`, driven by the table in
+`scripts/pr-corpus-depth.sh`: `select <base>` / `run <base>` / `check` (table
+vs `corpus-deep.yml`) / `list-filters` (every name filter matches tests)). A new
+corpus needs a nightly step AND a row there; `check` fails otherwise.
 
 ## The load-bearing constraint: determinism
 

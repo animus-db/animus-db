@@ -365,6 +365,58 @@ jobs:
         if: always()
         run: sccache --show-stats
 
+  # Issue #1271: every corpus runs at 1 seed per push, so a new cell or negative
+  # control can merge "born red" and only fail in the nightly `corpus-deep.yml`.
+  # When a PR changes a corpus's test file, run THAT corpus at its nightly depth.
+  # The file-to-corpus table (with each corpus's nightly env and command) is
+  # `scripts/pr-corpus-depth.sh`; `check` keeps it in step with
+  # `corpus-deep.yml`. Informational on PRs that touch no corpus file (the job
+  # exits in seconds); not part of the `gates` aggregate, but a red result here
+  # is a red nightly waiting to happen and is handled as one (CLAUDE.md,
+  # Session operating mode item 4). Budget: a few minutes per corpus, longer
+  # for the SimCluster/WAN ones (`mrsc_cluster` ~8 CPU-min per seed).
+  corpus-changed:
+    name: corpus-changed (nightly depth)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Table matches corpus-deep.yml
+        run: scripts/pr-corpus-depth.sh check
+
+      - name: Select corpora
+        id: select
+        run: |
+          ids=$(scripts/pr-corpus-depth.sh select "origin/${{ github.base_ref }}" | tr '\n' ' ')
+          echo "ids=${ids}" >> "$GITHUB_OUTPUT"
+          echo "corpora whose test file changed: ${ids:-none}"
+
+      - name: Install Rust toolchain (1.96)
+        if: steps.select.outputs.ids != ''
+        uses: dtolnay/rust-toolchain@1.96.0
+
+      - name: Set up sccache
+        if: steps.select.outputs.ids != ''
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Cache cargo artifacts
+        if: steps.select.outputs.ids != ''
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: "false"
+
+      - name: Changed corpora at nightly depth
+        if: steps.select.outputs.ids != ''
+        run: scripts/pr-corpus-depth.sh run "origin/${{ github.base_ref }}"
+
   # The real-thread ProdEnv tier (issues #280/#286), sharded.
   #
   # Real-thread liveness/concurrency properties (election timing, group

@@ -914,6 +914,7 @@ The LSM WAL/manifest/SSTable decoders are the `lsm_formats` fuzz target, reached
   `io_admit`/`io_settle`/`io_charge` (`IoAdmission`); the order is permit, then bucket, and a
   throttled run drops its permit and ends (retry in 100 ms). Urgent runs (L0 >= 2T) are
   always admitted into debt.
+- `lsm_write_stall` cells read "L0 reached stop" from `l0_table_count()` via `drive_to_stop` (bounded, loud), never from `StallStats::writes[2]`, which counts a write under the cause it FIRST stalled for (issue #1271).
 - `StallFault` (doc-hidden) are the negative-control faults of `tests/it/lsm_write_stall.rs`.
   L0 only reaches 2T in practice: the corpora use a `Wedge` gate that withholds even urgent
   compaction. See `docs/lessons/testing/2026-10-18-an-lsm-stall-test-must-withhold-compaction-not-just-slow-the-disk.md`.
