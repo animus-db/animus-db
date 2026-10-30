@@ -296,7 +296,7 @@ fn directed_placing_two_of_three_diff_under_continuous_writer() {
 #[test]
 fn directed_placing_under_sustained_load_corpus_runs_at_configured_depth() {
     let k = corpus::seeds_from_env("ANIMUS_DIRECTED_PLACING_LOAD_SEEDS");
-    for i in 0..k {
+    for i in corpus::shard_range_usize(k) {
         let seed = if i == 0 {
             BASE_SEED
         } else {

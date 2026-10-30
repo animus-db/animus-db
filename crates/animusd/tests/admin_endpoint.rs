@@ -22,57 +22,9 @@ use tokio::time::{sleep, timeout};
 
 mod support;
 
-/// Bring up an `n`-node cluster, one process per node (each its own edge state),
-/// retrying the (allocate-fresh-ports + start-all) as a unit. `free_addrs` frees
-/// each port before `run_node` rebinds it, so another test binary can steal one in
-/// the window (`AddrInUse`); a fresh attempt re-allocates and the started nodes are
-/// torn down first (the documented port-TOCTOU mitigation, see the crate guide).
+/// Thin wrapper over `support::bring_up_deadline` (bind-and-hold, no retry loop; issue #1421).
 async fn bring_up(n: usize, dir: &std::path::Path) -> (Vec<Node>, animusd::ClusterConfig) {
-    for attempt in 0..16 {
-        let addrs = support::free_addrs(n * 6);
-        let nodes_cfg: Vec<animusd::RoleAddrs> = (0..n)
-            .map(|i| animusd::RoleAddrs {
-                id: animusd::config::node_id(i),
-                role: animusd::config::NodeRole::Both,
-                internal: addrs[6 * i],
-                client: addrs[6 * i + 1],
-                dynamo: addrs[6 * i + 2],
-                admin: addrs[6 * i + 3],
-                intra: addrs[6 * i + 4],
-                console: addrs[6 * i + 5],
-                advertise_host: None,
-                tls: None,
-                encryption_key_path: None,
-                labels: Default::default(),
-                overload: None,
-            })
-            .collect();
-        let config = animusd::ClusterConfig {
-            version: animusd::config::CLUSTER_CONFIG_VERSION,
-            nodes: nodes_cfg,
-            dynamo_auth: None,
-            cluster_settings: None,
-        };
-        let mut nodes = Vec::new();
-        let mut failed = false;
-        for i in 0..n {
-            match animusd::run_node(&config, i, dir.join(format!("node-{attempt}-{i}"))).await {
-                Ok(node) => nodes.push(node),
-                Err(_) => {
-                    failed = true;
-                    break;
-                }
-            }
-        }
-        if !failed {
-            return (nodes, config);
-        }
-        for node in &nodes {
-            node.shutdown_graceful().await;
-        }
-        sleep(Duration::from_millis(50)).await;
-    }
-    panic!("could not bring up cluster after retries (ports kept getting stolen)");
+    support::bring_up_deadline(n, dir, support::JOIN_DEADLINE).await
 }
 
 // `bring_up_with_streams_quiesce` lost its last caller — ADR 0061 rung H,
@@ -1110,45 +1062,18 @@ async fn admin_system_table_split_lineage_after_a_real_split() {
     .expect("test timed out");
 }
 
-/// Bring up a single node with a `dynamo_auth` section (ADR 0057), retrying
-/// the port-TOCTOU race exactly like [`bring_up`] does — this file's own
-/// copy since `bring_up` always builds a config with `dynamo_auth: None`,
-/// the same "sibling test modules keep their own fixtures independent"
-/// convention `dynamo_sigv4.rs::start_single_node_with_auth` already uses.
+/// Bring up a single node with a `dynamo_auth` section (ADR 0057) via
+/// `support::bring_up_deadline_with` (bind-and-hold, no retry loop; issue #1421).
 async fn bring_up_with_auth(
     dir: &std::path::Path,
     credentials: BTreeMap<String, String>,
 ) -> (Node, animusd::ClusterConfig) {
-    for attempt in 0..16 {
-        let addrs = support::free_addrs(6);
-        let config = animusd::ClusterConfig {
-            version: animusd::config::CLUSTER_CONFIG_VERSION,
-            nodes: vec![animusd::RoleAddrs {
-                id: animusd::config::node_id(0),
-                role: animusd::config::NodeRole::Both,
-                internal: addrs[0],
-                client: addrs[1],
-                dynamo: addrs[2],
-                admin: addrs[3],
-                intra: addrs[4],
-                console: addrs[5],
-                advertise_host: None,
-                tls: None,
-                encryption_key_path: None,
-                labels: Default::default(),
-                overload: None,
-            }],
-            dynamo_auth: Some(DynamoAuthConfig {
-                credentials: credentials.clone(),
-            }),
-            cluster_settings: None,
-        };
-        match animusd::run_node(&config, 0, dir.join(format!("node-{attempt}"))).await {
-            Ok(node) => return (node, config),
-            Err(_) => sleep(Duration::from_millis(50)).await,
-        }
-    }
-    panic!("single node (dynamo_auth) failed to start after retries (ports kept getting stolen)");
+    let (mut nodes, config) =
+        support::bring_up_deadline_with(1, dir, support::JOIN_DEADLINE, |config| {
+            config.dynamo_auth = Some(DynamoAuthConfig { credentials });
+        })
+        .await;
+    (nodes.remove(0), config)
 }
 
 /// U-06 (docs/roadmap.md): `/admin/config` reports `auth_enabled: true` and
@@ -1650,6 +1575,19 @@ async fn admin_ready_is_200_while_leaderless_with_metadata() {
         })
         .await
         .expect("a healthy 3-node cluster must report /admin/health and /admin/ready 200");
+
+        // The survivor must be a FOLLOWER. A control leader that loses its
+        // followers keeps refreshing its own leader contact (there is no
+        // check-quorum step-down), so `/admin/health` would stay 200 and the
+        // 503 below would never come: the test failed whenever node 0 won the
+        // election (issue #1421 batch 4 root-caused this; it also failed ~1 in
+        // 4 runs on main before).
+        let follower = nodes
+            .iter()
+            .position(|n| !n.is_control_leader())
+            .expect("a 3-node cluster has a follower");
+        nodes.swap(0, follower);
+        let survivor_addr = nodes[0].admin_addr();
 
         // Lose the control quorum: stop the other two voters.
         let two = nodes.split_off(1);

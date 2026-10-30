@@ -2894,7 +2894,15 @@ impl Disk for SimEnv {
             return Err(e);
         }
         let key = (self.node_id.clone(), file.to_owned());
-        Ok(st.disks.get(&key).map_or_else(Vec::new, |f| {
+        // Mirrors `ProdEnv::read_at`: a missing file is `NotFound`, never an
+        // empty read (issue #1419).
+        let Some(f) = st.disks.get(&key) else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("read_at: no such file {file}"),
+            ));
+        };
+        Ok({
             // The durable + buffered view, sliced — mirrors `read`. A crash clears
             // `buffered`, so an un-synced tail is correctly invisible afterward.
             let total = f.durable.len() + f.buffered.len();
@@ -2909,7 +2917,7 @@ impl Disk for SimEnv {
                     }
                 })
                 .collect()
-        }))
+        })
     }
 
     async fn size(&self, file: &str) -> std::io::Result<u64> {

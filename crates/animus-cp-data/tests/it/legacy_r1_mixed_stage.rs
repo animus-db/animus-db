@@ -70,7 +70,7 @@ fn seeds() -> Vec<u64> {
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(2)
         .max(1);
-    (0..k).map(|i| BASE_SEED + i * 0x9E37).collect()
+    animus_test::corpus::shard_retain((0..k).map(|i| BASE_SEED + i * 0x9E37).collect())
 }
 
 fn key(pk: &[u8], rk: &[u8]) -> Vec<u8> {

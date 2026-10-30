@@ -41,7 +41,7 @@ fn seeds() -> Vec<u64> {
         return vec![s];
     }
     let k = animus_test::corpus::seeds_from_env("ANIMUS_SPLIT_RELOCATION_SEEDS") as u64;
-    (0..k).map(|i| 5 + i).collect()
+    animus_test::corpus::shard_retain((0..k).map(|i| 5 + i).collect())
 }
 
 fn run_cell(seed: u64, lsm: bool) {

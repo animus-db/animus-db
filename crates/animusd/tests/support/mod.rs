@@ -470,6 +470,20 @@ pub async fn bring_up_deadline(
     dir: &Path,
     deadline: Duration,
 ) -> (Vec<Node>, ClusterConfig) {
+    bring_up_deadline_with(n, dir, deadline, |_| {}).await
+}
+
+/// [`bring_up_deadline`] with a config hook: `customize` runs on the
+/// assembled [`ClusterConfig`] (after every node has bound, before any node
+/// starts) so a test can set per-file config such as `dynamo_auth` or
+/// `cluster_settings`. Same bind-then-start, no-retry, `core-{i}` data dirs
+/// (issue #1421).
+pub async fn bring_up_deadline_with(
+    n: usize,
+    dir: &Path,
+    deadline: Duration,
+    customize: impl FnOnce(&mut ClusterConfig),
+) -> (Vec<Node>, ClusterConfig) {
     timeout(deadline, async move {
         let mut bounds = Vec::with_capacity(n);
         for i in 0..n {
@@ -482,12 +496,13 @@ pub async fn bring_up_deadline(
             .unwrap_or_else(|e| panic!("bring_up_deadline: node {i} failed to bind: {e}"));
             bounds.push(bound);
         }
-        let config = ClusterConfig {
+        let mut config = ClusterConfig {
             version: animusd::config::CLUSTER_CONFIG_VERSION,
             nodes: bounds.iter().map(bound_role_addrs).collect(),
             dynamo_auth: None,
             cluster_settings: None,
         };
+        customize(&mut config);
         let mut nodes = Vec::with_capacity(n);
         for (i, bound) in bounds.into_iter().enumerate() {
             let node = animusd::run_bound_node(bound, &config, i)
@@ -625,6 +640,102 @@ pub async fn bring_up_deadline_tls(
     .await
     .unwrap_or_else(|_| {
         panic!("bring_up_deadline_tls: {n}-node TLS cluster did not come up within {deadline:?}")
+    })
+}
+
+/// [`bring_up_deadline_with`] with a **start hook** as well: `start` replaces
+/// `run_bound_node` and is called once per node, in order, with the node's
+/// bound listeners, a clone of the (customised) config and its index. For
+/// tests that start nodes with non-default knobs (a pinned
+/// `orphan_sweep_after`, throttle defaults, ...), which `run_bound_node`
+/// hard-codes; pair it with `animusd::run_bound_node_with_*`. Same
+/// bind-then-start, no-retry, `core-{i}` data dirs (issue #1421).
+pub async fn bring_up_deadline_with_start<F, Fut>(
+    n: usize,
+    dir: &Path,
+    deadline: Duration,
+    customize: impl FnOnce(&mut ClusterConfig),
+    start: F,
+) -> (Vec<Node>, ClusterConfig)
+where
+    F: Fn(animusd::BoundNode, ClusterConfig, usize) -> Fut,
+    Fut: Future<Output = std::io::Result<Node>>,
+{
+    bring_up_deadline_inner(n, dir, deadline, unbound_role_addrs, customize, start).await
+}
+
+/// [`bring_up_deadline`] with per-node topology labels (`labels(i)` for node
+/// `i`). Labels are consumed at **bind** time (the node's self-registration
+/// reads them from its bound `RoleAddrs`), so a [`bring_up_deadline_with`]
+/// config hook cannot set them.
+pub async fn bring_up_deadline_labeled(
+    n: usize,
+    dir: &Path,
+    deadline: Duration,
+    labels: impl Fn(usize) -> BTreeMap<String, String>,
+) -> (Vec<Node>, ClusterConfig) {
+    bring_up_deadline_inner(
+        n,
+        dir,
+        deadline,
+        |i| {
+            let mut a = unbound_role_addrs(i);
+            a.labels = labels(i);
+            a
+        },
+        |config| {
+            for (i, node) in config.nodes.iter_mut().enumerate() {
+                node.labels = labels(i);
+            }
+        },
+        |bound, config, i| async move { animusd::run_bound_node(bound, &config, i).await },
+    )
+    .await
+}
+
+async fn bring_up_deadline_inner<F, Fut>(
+    n: usize,
+    dir: &Path,
+    deadline: Duration,
+    addrs_for: impl Fn(usize) -> RoleAddrs,
+    customize: impl FnOnce(&mut ClusterConfig),
+    start: F,
+) -> (Vec<Node>, ClusterConfig)
+where
+    F: Fn(animusd::BoundNode, ClusterConfig, usize) -> Fut,
+    Fut: Future<Output = std::io::Result<Node>>,
+{
+    timeout(deadline, async move {
+        let mut bounds = Vec::with_capacity(n);
+        for i in 0..n {
+            let bound = Node::bind(
+                animusd::config::node_id(i),
+                addrs_for(i),
+                dir.join(format!("core-{i}")),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("bring_up_deadline: node {i} failed to bind: {e}"));
+            bounds.push(bound);
+        }
+        let mut config = ClusterConfig {
+            version: animusd::config::CLUSTER_CONFIG_VERSION,
+            nodes: bounds.iter().map(bound_role_addrs).collect(),
+            dynamo_auth: None,
+            cluster_settings: None,
+        };
+        customize(&mut config);
+        let mut nodes = Vec::with_capacity(n);
+        for (i, bound) in bounds.into_iter().enumerate() {
+            let node = start(bound, config.clone(), i)
+                .await
+                .unwrap_or_else(|e| panic!("bring_up_deadline: node {i} failed to start: {e}"));
+            nodes.push(node);
+        }
+        (nodes, config)
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!("bring_up_deadline: {n}-node cluster did not come up within {deadline:?}")
     })
 }
 

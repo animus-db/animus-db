@@ -6679,7 +6679,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         start: &[u8],
         limit: usize,
     ) -> (Vec<(Vec<u8>, Vec<u8>)>, Option<Vec<u8>>) {
-        let raw = self.raw_base_rows(start, None).await;
+        let raw = self.raw_base_rows(start, None).await.unwrap_or_default();
         let mut out = Vec::new();
         for (key, vv) in raw {
             if out.len() >= limit {
@@ -6839,24 +6839,34 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// being dropped. Dropping it is right for `local_scan`'s admin/debug
     /// callers and wrong here — a client-visible scan that silently omits an
     /// item which exists is a fabricated deletion, not staleness.
+    ///
+    /// # Errors
+    ///
+    /// The engine's scan error, **propagated, never an empty page** (issue
+    /// #1419): to a client an empty page is a fabricated deletion, so the
+    /// serving edge must refuse or fail the read instead.
     pub async fn stale_scan(
         &self,
         start: &[u8],
         end: Option<&[u8]>,
         limit: Option<usize>,
-    ) -> Vec<(Vec<u8>, Vec<u8>)> {
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, animus_storage::StorageError> {
         self.stale_scan_ordered(start, end, limit, false).await
     }
 
     /// [`stale_scan`](Self::stale_scan)'s **descending** dual — the eventual
     /// counterpart of [`local_scan_rev`](Self::local_scan_rev), serving a
     /// `ConsistentRead: false` `Query` with `ScanIndexForward: false`.
+    ///
+    /// # Errors
+    ///
+    /// As [`stale_scan`](Self::stale_scan).
     pub async fn stale_scan_rev(
         &self,
         start: &[u8],
         end: Option<&[u8]>,
         limit: Option<usize>,
-    ) -> Vec<(Vec<u8>, Vec<u8>)> {
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, animus_storage::StorageError> {
         self.stale_scan_ordered(start, end, limit, true).await
     }
 
@@ -6871,10 +6881,10 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         end: Option<&[u8]>,
         limit: Option<usize>,
         reverse: bool,
-    ) -> Vec<(Vec<u8>, Vec<u8>)> {
-        let raw = self.raw_base_rows(start, end).await;
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, animus_storage::StorageError> {
+        let raw = self.raw_base_rows(start, end).await?;
         let pairs = self.stale_scan_rows(raw).await;
-        Self::order_and_limit(pairs, limit, reverse)
+        Ok(Self::order_and_limit(pairs, limit, reverse))
     }
 
     /// [`resolve_scan_rows`](Self::resolve_scan_rows)'s eventual counterpart
@@ -6974,6 +6984,11 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// identical ordering), so a still-`Pending` row interleaved in the
     /// requested range never silently consumes one of the caller's
     /// requested slots.
+    ///
+    /// **Degraded on a scan error:** an engine error reads as an empty
+    /// range (tests, the TTL reaper's per-tick scan, where "nothing this
+    /// tick" is the right degraded answer). A client-visible read uses
+    /// [`try_local_scan_kind`](Self::try_local_scan_kind) (issue #1419).
     pub async fn local_scan_kind(
         &self,
         kind: u8,
@@ -6981,6 +6996,24 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         end: Option<&[u8]>,
         limit: Option<usize>,
     ) -> Vec<(Vec<u8>, Vec<u8>)> {
+        self.try_local_scan_kind(kind, start, end, limit)
+            .await
+            .unwrap_or_default()
+    }
+
+    /// [`local_scan_kind`](Self::local_scan_kind) with the engine's scan
+    /// error **propagated**, never read as an empty range (issue #1419).
+    ///
+    /// # Errors
+    ///
+    /// The engine's own scan error.
+    pub async fn try_local_scan_kind(
+        &self,
+        kind: u8,
+        start: &[u8],
+        end: Option<&[u8]>,
+        limit: Option<usize>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, animus_storage::StorageError> {
         self.local_scan_kind_ordered(kind, start, end, limit, false)
             .await
     }
@@ -6995,6 +7028,24 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         end: Option<&[u8]>,
         limit: Option<usize>,
     ) -> Vec<(Vec<u8>, Vec<u8>)> {
+        self.try_local_scan_kind_rev(kind, start, end, limit)
+            .await
+            .unwrap_or_default()
+    }
+
+    /// [`local_scan_kind_rev`](Self::local_scan_kind_rev) with the engine's
+    /// scan error propagated (issue #1419).
+    ///
+    /// # Errors
+    ///
+    /// The engine's own scan error.
+    pub async fn try_local_scan_kind_rev(
+        &self,
+        kind: u8,
+        start: &[u8],
+        end: Option<&[u8]>,
+        limit: Option<usize>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, animus_storage::StorageError> {
         self.local_scan_kind_ordered(kind, start, end, limit, true)
             .await
     }
@@ -7008,28 +7059,22 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         end: Option<&[u8]>,
         limit: Option<usize>,
         reverse: bool,
-    ) -> Vec<(Vec<u8>, Vec<u8>)> {
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, animus_storage::StorageError> {
         let Some(scope) = self.kind_scopes.get(kind as usize) else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         let raw: Vec<(Vec<u8>, animus_storage::VersionedValue)> = match end {
-            Some(e) => self
-                .storage
-                .scan(&scope.physical(start), &scope.physical(e))
-                .await
-                .ok()
-                .into_iter()
-                .flatten()
-                .collect(),
+            Some(e) => {
+                self.storage
+                    .scan(&scope.physical(start), &scope.physical(e))
+                    .await?
+            }
             None => match scope.physical_bounds().1 {
-                Some(physical_end) => self
-                    .storage
-                    .scan(&scope.physical(start), &physical_end)
-                    .await
-                    .ok()
-                    .into_iter()
-                    .flatten()
-                    .collect(),
+                Some(physical_end) => {
+                    self.storage
+                        .scan(&scope.physical(start), &physical_end)
+                        .await?
+                }
                 // Only `StorageScope::whole()` (no real prefix) — not a real
                 // tablet's kind scope, which always has a non-`0xFF`-ending
                 // prefix (the scope selector byte itself) and so always
@@ -7064,7 +7109,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         } else if let Some(n) = limit {
             pairs.truncate(n);
         }
-        pairs
+        Ok(pairs)
     }
 
     /// This tablet's own current engine watermark — the highest committed
@@ -7319,7 +7364,10 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             return None;
         }
         let ts = self.read_serve_ts().await?;
-        let rows = self.local_scan_kind_rev(kind, start, end, limit).await;
+        let rows = self
+            .try_local_scan_kind_rev(kind, start, end, limit)
+            .await
+            .ok()?;
         self.ts_cache.lock().expect("ts cache poisoned").bump(
             start.to_vec(),
             end.map(<[u8]>::to_vec),
@@ -7339,7 +7387,10 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             return None;
         }
         let ts = self.read_serve_ts().await?;
-        let rows = self.local_scan_kind(kind, start, end, limit).await;
+        let rows = self
+            .try_local_scan_kind(kind, start, end, limit)
+            .await
+            .ok()?;
         // Bump the *whole requested span*, mirroring `linearizable_scan`'s
         // identical reasoning — a future write anywhere in `[start, end)` is
         // pushed above this read regardless of how many rows it returned.
@@ -7597,7 +7648,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             return None;
         }
         let ts = self.read_serve_ts().await?;
-        let rows = self.local_scan(start, end, limit).await;
+        let rows = self.try_local_scan(start, end, limit).await.ok()?;
         // Bump the *whole requested span* (not just the rows a `limit`
         // happened to return): over-conservative, never wrong — a future
         // write anywhere in `[start, end)` is still pushed above this read,
@@ -7631,7 +7682,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
             return None;
         }
         let ts = self.read_serve_ts().await?;
-        let rows = self.local_scan_rev(start, end, limit).await;
+        let rows = self.try_local_scan_rev(start, end, limit).await.ok()?;
         self.ts_cache.lock().expect("ts cache poisoned").bump(
             start.to_vec(),
             end.map(<[u8]>::to_vec),
@@ -7649,12 +7700,35 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// bug on a node hosting several tablets (ADR 0028). Used for admin/debug
     /// introspection and the auto-split key-materialization path, which only
     /// ever run on a replica inspecting its own state.
+    ///
+    /// **Degraded on a scan error:** an engine error reads as an empty
+    /// range here (admin/debug and tests only). Anything a client or a
+    /// destructive decision depends on uses
+    /// [`try_local_scan`](Self::try_local_scan) (issue #1419).
     pub async fn local_scan(
         &self,
         start: &[u8],
         end: Option<&[u8]>,
         limit: Option<usize>,
     ) -> Vec<(Vec<u8>, Vec<u8>)> {
+        self.try_local_scan(start, end, limit)
+            .await
+            .unwrap_or_default()
+    }
+
+    /// [`local_scan`](Self::local_scan) with the engine's scan error
+    /// **propagated**, never read as an empty range (issue #1419). The
+    /// linearizable scans serve through this.
+    ///
+    /// # Errors
+    ///
+    /// The engine's own scan error.
+    pub async fn try_local_scan(
+        &self,
+        start: &[u8],
+        end: Option<&[u8]>,
+        limit: Option<usize>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, animus_storage::StorageError> {
         self.local_scan_ordered(start, end, limit, false).await
     }
 
@@ -7670,12 +7744,32 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// as taking from the head, and — the point of doing it here rather than in
     /// the edge — it is what keeps a descending page's *network* payload
     /// bounded by `limit` when the read is forwarded to another node.
+    ///
+    /// Degraded on a scan error exactly like [`local_scan`](Self::local_scan);
+    /// [`try_local_scan_rev`](Self::try_local_scan_rev) propagates it.
     pub async fn local_scan_rev(
         &self,
         start: &[u8],
         end: Option<&[u8]>,
         limit: Option<usize>,
     ) -> Vec<(Vec<u8>, Vec<u8>)> {
+        self.try_local_scan_rev(start, end, limit)
+            .await
+            .unwrap_or_default()
+    }
+
+    /// [`local_scan_rev`](Self::local_scan_rev) with the engine's scan error
+    /// propagated (issue #1419).
+    ///
+    /// # Errors
+    ///
+    /// The engine's own scan error.
+    pub async fn try_local_scan_rev(
+        &self,
+        start: &[u8],
+        end: Option<&[u8]>,
+        limit: Option<usize>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, animus_storage::StorageError> {
         self.local_scan_ordered(start, end, limit, true).await
     }
 
@@ -7688,8 +7782,8 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         end: Option<&[u8]>,
         limit: Option<usize>,
         reverse: bool,
-    ) -> Vec<(Vec<u8>, Vec<u8>)> {
-        let raw = self.raw_base_rows(start, end).await;
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, animus_storage::StorageError> {
+        let raw = self.raw_base_rows(start, end).await?;
         // ADR 0018 §2/PR3: filter out this crate's internal txn-record
         // marker keys and resolve every remaining row's value envelope
         // (`resolve_scan_rows`'s doc) — applied *before* `limit` so an
@@ -7697,7 +7791,7 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         // requested range never silently consumes one of the caller's
         // requested slots.
         let pairs = self.resolve_scan_rows(raw, None).await;
-        Self::order_and_limit(pairs, limit, reverse)
+        Ok(Self::order_and_limit(pairs, limit, reverse))
     }
 
     /// The raw, still-enveloped `(logical key, versioned value)` rows of this
@@ -7707,11 +7801,16 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
     /// [`stale_scan_ordered`](Self::stale_scan_ordered). The two differ only
     /// in how they resolve a row's envelope, never in which rows they read,
     /// so the range/bounds reasoning below lives here once.
+    ///
+    /// # Errors
+    ///
+    /// The engine's own scan error, propagated (issue #1419): an empty `Ok`
+    /// means the range is genuinely empty.
     async fn raw_base_rows(
         &self,
         start: &[u8],
         end: Option<&[u8]>,
-    ) -> Vec<(Vec<u8>, animus_storage::VersionedValue)> {
+    ) -> Result<Vec<(Vec<u8>, animus_storage::VersionedValue)>, animus_storage::StorageError> {
         // Push the range down into the engine (audit P4): a bounded scan reads
         // only `[start, end)` instead of materializing the whole tablet and
         // filtering; both `scan` and `entries` return key-ordered results by the
@@ -7735,14 +7834,12 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
         // engine is this tablet's own (ADR 0050), so the filter's remaining
         // job is separating this kind's rows from sibling kinds' and from
         // the engine-global reserved-namespace markers.
-        match end {
+        Ok(match end {
             Some(e) => self
                 .storage
                 .scan(&self.scope.physical(start), &self.scope.physical(e))
-                .await
-                .ok()
+                .await?
                 .into_iter()
-                .flatten()
                 .filter_map(|(k, vv)| {
                     let logical = self.scope.strip_in_range(&k)?;
                     Some((logical.to_vec(), vv))
@@ -7752,10 +7849,8 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
                 Some(physical_end) => self
                     .storage
                     .scan(&self.scope.physical(start), &physical_end)
-                    .await
-                    .ok()
+                    .await?
                     .into_iter()
-                    .flatten()
                     .filter_map(|(k, vv)| {
                         let logical = self.scope.strip_in_range(&k)?;
                         Some((logical.to_vec(), vv))
@@ -7764,17 +7859,15 @@ impl<E: Env, S: StorageEngine + 'static> RaftKvNode<E, S> {
                 None => self
                     .storage
                     .entries()
-                    .await
-                    .ok()
+                    .await?
                     .into_iter()
-                    .flatten()
                     .filter_map(|(k, vv)| {
                         let logical = self.scope.strip_in_range(&k)?;
                         (logical >= start).then(|| (logical.to_vec(), vv))
                     })
                     .collect(),
             },
-        }
+        })
     }
 
     /// Apply a scan's `reverse`/`limit` tail to already-key-ordered,
@@ -8886,7 +8979,7 @@ async fn recover_kv_wal<E: Env>(
     if let Err(e) = result {
         assert!(
             halted.load(Ordering::SeqCst),
-            "raftkv wal rewrite failed while running: {e}"
+            "raftkv wal recovery (free-space probe or image rewrite) failed while running: {e}"
         );
     }
 }

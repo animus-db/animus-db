@@ -36,7 +36,7 @@ fn seeds() -> Vec<u64> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(1)
         .max(1);
-    (0..k).map(|i| 0x0081_2000 + i).collect()
+    animus_test::corpus::shard_retain((0..k).map(|i| 0x0081_2000 + i).collect())
 }
 
 fn put_body(id: &str) -> String {
@@ -92,7 +92,15 @@ fn run(seed: u64, fault: StallFault) -> (Vec<String>, usize) {
         let (mut throttled, mut acked) = (0usize, Vec::new());
         let mut vv = Vec::new();
         let mut n = 0usize;
-        for _round in 0..5 {
+        // The healthy run needs only a burst that reaches the propose bound. The
+        // OldGate control must instead reach L0 stop and hold a writer there for
+        // 10 s of virtual time, and how fast flushes pile up L0 files is
+        // seed-dependent (seed 0x812003 adds about one L0 file per 12 s round, so
+        // 5 rounds never get there; #1271). Keep driving the wedged burst until
+        // the sim panics, bounded: a miss falls through to the control's own
+        // loud "must violate no-panic" assertion.
+        let rounds = if fault == StallFault::OldGate { 60 } else { 5 };
+        for _round in 0..rounds {
             let bodies: Vec<String> = (0..48)
                 .map(|_| {
                     n += 1;

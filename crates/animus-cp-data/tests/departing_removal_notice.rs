@@ -280,7 +280,7 @@ fn a_removed_replica_behind_the_compacted_log_is_told_not_snapshotted_and_releas
 #[test]
 fn a_removed_replica_behind_the_compacted_log_corpus() {
     let k = animus_test::corpus::seeds_from_env("ANIMUS_LEARNER_SEEDS").max(3);
-    for i in 0..k {
+    for i in animus_test::corpus::shard_range_usize(k) {
         scenario_release(animus_test::corpus::name_seed(&format!(
             "removal_notice_release_s{i:03}"
         )));

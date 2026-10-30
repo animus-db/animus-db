@@ -3663,3 +3663,9 @@ every decided record of the history (issue #1380, a design question). Lesson:
 - `KvCommand::TxnSettle`/`TxnReap` (codec tags 20/21, `required_gate` = `TxnSettled`). Apply never branches on the gate; `RaftKvNode::txn_settle`/`txn_reap` check it before proposing. Settle is a per-entry no-op for absent/Pending/Settled/foreign/sealed records; reap checks the age against the entry's own `ts` (`TXN_SETTLED_REAP_AGE`), never the proposer's word.
 - `rebuild_txn_tracker` puts Settled records in `settled` only; decided ones go to `unresolved_decided` + `unsettled`. The settle apply drains both on every replica; with the gate open a non-empty `unsettled` vetoes quiescence. Any new tracker consumer or rebuild reference must handle the `settled` set (the chunked-rebuild test mixes stubs in).
 - Fixtures: `raftkv-wire/v1-txnsettle.bin`, `raftkv-wal/v2-txnsettle.bin`, `txn-record/v1.bin`+`v2.bin`. Never edit existing ones.
+
+- **Scans propagate engine errors (issues #1419/#1424).** `stale_scan*`,
+  `try_local_scan*`, `try_local_scan_kind*` return `Result`; `linearizable_scan*`
+  answer `None` on a scan error. The Vec-returning `local_scan*` /
+  `local_scan_kind*` wrappers read an error as empty and are for admin, tests
+  and the TTL reaper only. Never serve a client from them.

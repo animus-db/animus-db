@@ -168,7 +168,7 @@ fn seeds(base: u64) -> Vec<u64> {
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(1)
         .max(1);
-    (0..k).map(|i| base + i).collect()
+    animus_test::corpus::shard_retain((0..k).map(|i| base + i).collect())
 }
 
 /// Gate closed (cluster version 1: a previous-release replica may be a

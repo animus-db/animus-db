@@ -94,7 +94,7 @@ fn seed_depth() -> u64 {
 }
 
 fn seeds(base: u64) -> impl Iterator<Item = u64> {
-    (0..seed_depth()).map(move |k| base.wrapping_add(k))
+    animus_test::corpus::shard_range(seed_depth()).map(move |k| base.wrapping_add(k))
 }
 
 fn create_table(cluster: &mut SimCluster, table: &str) {

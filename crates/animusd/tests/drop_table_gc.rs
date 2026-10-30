@@ -36,62 +36,16 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
 
-/// Bring up an `n`-node cluster, one process per node, retrying the
-/// (allocate-fresh-ports + start-all) as a unit (the documented port-TOCTOU
-/// mitigation). Returns the per-node data dirs so the test can assert on-disk
-/// state and restart nodes on the same dirs.
+/// Bring up an `n`-node cluster via `support::bring_up_deadline` (bind-and-hold,
+/// no retry loop; issue #1421). Returns the per-node data dirs (`core-{i}`) so
+/// the test can assert on-disk state and restart nodes on the same dirs.
 async fn bring_up(
     n: usize,
     dir: &Path,
 ) -> (Vec<Node>, animusd::ClusterConfig, Vec<std::path::PathBuf>) {
-    for attempt in 0..16 {
-        let addrs = support::free_addrs(n * 6);
-        let nodes_cfg: Vec<animusd::RoleAddrs> = (0..n)
-            .map(|i| animusd::RoleAddrs {
-                id: animusd::config::node_id(i),
-                role: animusd::config::NodeRole::Both,
-                internal: addrs[6 * i],
-                client: addrs[6 * i + 1],
-                dynamo: addrs[6 * i + 2],
-                admin: addrs[6 * i + 3],
-                intra: addrs[6 * i + 4],
-                console: addrs[6 * i + 5],
-                advertise_host: None,
-                tls: None,
-                encryption_key_path: None,
-                labels: Default::default(),
-                overload: None,
-            })
-            .collect();
-        let config = animusd::ClusterConfig {
-            version: animusd::config::CLUSTER_CONFIG_VERSION,
-            nodes: nodes_cfg,
-            dynamo_auth: None,
-            cluster_settings: None,
-        };
-        let dirs: Vec<std::path::PathBuf> = (0..n)
-            .map(|i| dir.join(format!("node-{attempt}-{i}")))
-            .collect();
-        let mut nodes = Vec::new();
-        let mut failed = false;
-        for (i, node_dir) in dirs.iter().enumerate() {
-            match animusd::run_node(&config, i, node_dir).await {
-                Ok(node) => nodes.push(node),
-                Err(_) => {
-                    failed = true;
-                    break;
-                }
-            }
-        }
-        if !failed {
-            return (nodes, config, dirs);
-        }
-        for node in &nodes {
-            node.shutdown_graceful().await;
-        }
-        sleep(Duration::from_millis(50)).await;
-    }
-    panic!("could not bring up cluster after retries (ports kept getting stolen)");
+    let (nodes, config) = support::bring_up_deadline(n, dir, support::JOIN_DEADLINE).await;
+    let dirs = (0..n).map(|i| dir.join(format!("core-{i}"))).collect();
+    (nodes, config, dirs)
 }
 
 /// One HTTP/1.0 request to the admin endpoint; returns `(status, parsed JSON)`.

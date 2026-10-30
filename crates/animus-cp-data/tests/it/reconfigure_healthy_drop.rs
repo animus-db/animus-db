@@ -377,7 +377,7 @@ fn seeds_per_cell() -> u64 {
 
 #[test]
 fn healthy_drop_over_seeds() {
-    for round in 0..seeds_per_cell() {
+    for round in corpus::shard_range(seeds_per_cell()) {
         let seed = 0x7810_1000 + round;
         run_drop_follower(seed);
         run_drop_leader(seed);

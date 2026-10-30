@@ -445,6 +445,106 @@ jobs:
         if: always()
         run: sccache --show-stats
 
+  # Issue #1271: every corpus runs at 1 seed per push, so a new cell or negative
+  # control can merge "born red" and only fail in the nightly `corpus-deep.yml`.
+  # When a PR changes a corpus's test file, run THAT corpus at its nightly depth.
+  # The file-to-corpus table (with each corpus's nightly env, command and
+  # shard count) is `scripts/pr-corpus-depth.sh`; `check` keeps it in step with
+  # `corpus-deep.yml`. Not part of the `gates` aggregate, but a red result here
+  # is a red nightly waiting to happen and is handled as one (CLAUDE.md,
+  # Session operating mode item 4).
+  #
+  # Three jobs: `corpus-select` turns the diff into a JSON matrix of
+  # {corpus, shard, of}; `corpus-shard` runs one entry each with
+  # `ANIMUS_SEED_SHARD=shard/of` (a deep corpus is split across parallel
+  # workers by seed variant, not run at a lower depth: `mrsc_cluster` is ~17
+  # minutes unsharded, ~6 as 3 shards); `corpus-changed` is the single check
+  # that fails if any shard failed (and passes when no corpus changed).
+  corpus-select:
+    name: corpus-select
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      matrix: ${{ steps.select.outputs.matrix }}
+      any: ${{ steps.select.outputs.any }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Table matches corpus-deep.yml
+        run: scripts/pr-corpus-depth.sh check
+
+      - name: Select corpora
+        id: select
+        run: |
+          matrix=$(scripts/pr-corpus-depth.sh matrix "origin/${{ github.base_ref }}")
+          echo "matrix=${matrix}" >> "$GITHUB_OUTPUT"
+          if [ "$matrix" = '{"include":[]}' ]; then any=false; else any=true; fi
+          echo "any=${any}" >> "$GITHUB_OUTPUT"
+          echo "corpus workers: ${matrix}"
+
+  corpus-shard:
+    name: corpus ${{ matrix.corpus }} (shard ${{ matrix.shard }}/${{ matrix.of }})
+    needs: corpus-select
+    if: needs.corpus-select.outputs.any == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.corpus-select.outputs.matrix) }}
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (1.96)
+        uses: dtolnay/rust-toolchain@1.96.0
+
+      # The shards compile the same crates: sccache (GitHub Actions cache
+      # backend) shares compiled objects between them and with other jobs, and
+      # rust-cache restores the registry, so only the first runner to reach a
+      # unit pays for it.
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: "false"
+
+      - name: Corpus at nightly depth, one shard
+        run: scripts/pr-corpus-depth.sh run-shard "${{ matrix.corpus }}" "${{ matrix.shard }}" "${{ matrix.of }}"
+
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats
+
+  # The one check to watch: red if any shard failed or was cancelled, green when
+  # every shard passed or no corpus changed. Keeps the pre-sharding name.
+  corpus-changed:
+    name: corpus-changed (nightly depth)
+    if: always() && github.event_name == 'pull_request'
+    needs: [corpus-select, corpus-shard]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Every selected corpus shard passed
+        env:
+          SELECT: ${{ needs.corpus-select.result }}
+          SHARDS: ${{ needs.corpus-shard.result }}
+        run: |
+          echo "corpus-select: ${SELECT}, corpus-shard: ${SHARDS}"
+          [ "${SELECT}" = success ] || { echo "corpus-select did not succeed"; exit 1; }
+          case "${SHARDS}" in
+            success | skipped) ;;  # skipped: no corpus test file changed
+            *) echo "a corpus shard failed or was cancelled"; exit 1 ;;
+          esac
+
   # The real-thread ProdEnv tier (issues #280/#286), sharded.
   #
   # Real-thread liveness/concurrency properties (election timing, group

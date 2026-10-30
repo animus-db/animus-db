@@ -103,7 +103,7 @@ fn seed_depth() -> u64 {
 /// deeper knob (seed 0 is always `base` itself, so `K=1`'s exact behavior is
 /// a strict prefix of any deeper run).
 fn seeds(base: u64) -> impl Iterator<Item = u64> {
-    (0..seed_depth()).map(move |k| base.wrapping_add(k))
+    corpus::shard_range(seed_depth()).map(move |k| base.wrapping_add(k))
 }
 
 /// Stand up a 3-node group, every replica opted into quiescence with the same

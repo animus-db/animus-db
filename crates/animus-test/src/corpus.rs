@@ -36,6 +36,17 @@
 //!   algorithm without forcing every corpus into one struct shape.
 //! - [`for_each_seed`] — for corpora that drive one named scenario directly
 //!   (no `Vec<Scenario>`), via a closure. Uses [`odd_name_seed`].
+//!
+//! **Seed sharding (`ANIMUS_SEED_SHARD=i/n`, issue #1271).** A deep corpus can
+//! be split across `n` parallel workers: shard `i` (0-based) runs only the
+//! seed variants whose index `% n == i`, so the union of the `n` shards is
+//! exactly the unsharded run and the shards are disjoint. Variant 0 (the
+//! canonical, frozen cell) therefore lives in shard 0 alone. Unset, nothing
+//! changes. The expansion helpers above apply it themselves; a corpus that
+//! computes its own seed list or `0..k` loop MUST route it through
+//! [`shard_retain`] / [`shard_range`] (or call [`reject_shard`] if it cannot
+//! be split), so that no corpus ignores the knob silently. A malformed value
+//! panics.
 
 use std::env;
 
@@ -70,6 +81,116 @@ pub fn seeds_from_env(var_name: &str) -> usize {
         .max(1)
 }
 
+/// Env var carrying the seed shard, `i/n` (see the module doc).
+pub const SHARD_VAR: &str = "ANIMUS_SEED_SHARD";
+
+/// One worker's slice of the seed variants: variant `v` belongs to shard
+/// `v % of`. Constructed by [`Shard::parse`] / [`shard_from_env`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Shard {
+    pub index: usize,
+    pub of: usize,
+}
+
+impl Shard {
+    /// Parse `i/n` with `n >= 1` and `i < n`.
+    pub fn parse(s: &str) -> Result<Shard, String> {
+        let bad = || format!("{SHARD_VAR}={s:?}: expected `i/n` with 0 <= i < n and n >= 1");
+        let (i, n) = s.split_once('/').ok_or_else(bad)?;
+        let index: usize = i.trim().parse().map_err(|_| bad())?;
+        let of: usize = n.trim().parse().map_err(|_| bad())?;
+        if of == 0 || index >= of {
+            return Err(bad());
+        }
+        Ok(Shard { index, of })
+    }
+
+    /// Whether this shard runs seed variant `variant`.
+    pub fn keeps(&self, variant: usize) -> bool {
+        variant % self.of == self.index
+    }
+}
+
+/// The shard from `ANIMUS_SEED_SHARD`, `None` when unset. Panics on a
+/// malformed value: a typo must never silently run the whole corpus (or
+/// nothing) on every worker.
+pub fn shard_from_env() -> Option<Shard> {
+    match env::var(SHARD_VAR) {
+        Ok(v) => Some(Shard::parse(&v).unwrap_or_else(|e| panic!("{e}"))),
+        Err(env::VarError::NotPresent) => None,
+        Err(e) => panic!("{SHARD_VAR}: {e}"),
+    }
+}
+
+/// Pure core of [`shard_retain`].
+pub fn shard_retain_with<T>(items: Vec<T>, shard: Option<Shard>) -> Vec<T> {
+    match shard {
+        None => items,
+        Some(sh) => {
+            let total = items.len();
+            let kept: Vec<T> = items
+                .into_iter()
+                .enumerate()
+                .filter(|(v, _)| sh.keeps(*v))
+                .map(|(_, t)| t)
+                .collect();
+            trace_shard(sh, total, (0..total).filter(|v| sh.keeps(*v)));
+            kept
+        }
+    }
+}
+
+/// `ANIMUS_SHARD_TRACE=1` prints the variant indices a shard kept out of
+/// `total`, so a run at small K for each shard shows that the shards' union is
+/// the unsharded seed set (`sort -u` the `SHARD_TRACE` lines per shard).
+fn trace_shard(sh: Shard, total: usize, kept: impl Iterator<Item = usize>) {
+    if env::var_os("ANIMUS_SHARD_TRACE").is_some() {
+        let kept: Vec<usize> = kept.collect();
+        eprintln!("SHARD_TRACE {}/{} of {total}: {kept:?}", sh.index, sh.of);
+    }
+}
+
+/// Keep only this shard's items of a seed list whose position is its variant
+/// index (position 0 is the canonical variant). Identity when unset.
+pub fn shard_retain<T>(items: Vec<T>) -> Vec<T> {
+    shard_retain_with(items, shard_from_env())
+}
+
+/// `0..k`, restricted to this shard's variant indices (all of `0..k` when
+/// unset). For a `for i in 0..k` seed loop.
+pub fn shard_range(k: u64) -> impl Iterator<Item = u64> {
+    let shard = shard_from_env();
+    if let Some(sh) = shard {
+        trace_shard(sh, k as usize, (0..k as usize).filter(|v| sh.keeps(*v)));
+    }
+    (0..k).filter(move |v| shard.is_none_or(|s| s.keeps(*v as usize)))
+}
+
+/// Whether this worker runs the corpus's *unsharded* tests: aggregate negative
+/// controls ("at least one seed shows the failure") and meta-tests that
+/// inspect the whole cell set cannot be split by seed, so they run once, in
+/// full, on shard 0 (or always when no shard is set) and are skipped by the
+/// other shards.
+pub fn owns_unsharded() -> bool {
+    shard_from_env().is_none_or(|s| s.index == 0)
+}
+
+/// [`shard_range`] for a `usize` loop bound.
+pub fn shard_range_usize(k: usize) -> impl Iterator<Item = usize> {
+    let shard = shard_from_env();
+    (0..k).filter(move |v| shard.is_none_or(|s| s.keeps(*v)))
+}
+
+/// For a corpus that cannot be split by seed (a fixed-seed regression, an
+/// index-addressed seed list): fail loudly if a shard was requested, rather
+/// than silently running it in full on every worker.
+pub fn reject_shard(corpus: &str) {
+    assert!(
+        shard_from_env().is_none(),
+        "{corpus} cannot be sharded by seed; unset {SHARD_VAR}"
+    );
+}
+
 /// A scenario cell a corpus can expand into `k` seed variants. A corpus
 /// implements this for its own `Scenario` type so [`seed_expand`] can own
 /// the expansion algorithm generically.
@@ -89,12 +210,26 @@ pub trait SeedVariant: Clone {
 /// [`name_seed`]) and a fresh, name-derived seed, exercising the same
 /// scenario under different interleavings.
 pub fn seed_expand<T: SeedVariant>(cells: Vec<T>, k: usize) -> Vec<T> {
+    seed_expand_sharded(cells, k, shard_from_env())
+}
+
+/// [`seed_expand`] with the shard passed explicitly (the pure core). Variant
+/// `v` of every cell is kept only by shard `v % of`; with `k <= 1` only
+/// variant 0 exists, so only shard 0 runs anything.
+pub fn seed_expand_sharded<T: SeedVariant>(
+    cells: Vec<T>,
+    k: usize,
+    shard: Option<Shard>,
+) -> Vec<T> {
     if k <= 1 {
-        return cells;
+        return shard_retain_with_variant0(cells, shard);
     }
     let mut out = Vec::with_capacity(cells.len() * k);
     for cell in cells {
         for i in 0..k {
+            if !shard.is_none_or(|s| s.keeps(i)) {
+                continue;
+            }
             if i == 0 {
                 out.push(cell.clone());
             } else {
@@ -107,6 +242,13 @@ pub fn seed_expand<T: SeedVariant>(cells: Vec<T>, k: usize) -> Vec<T> {
     out
 }
 
+fn shard_retain_with_variant0<T>(cells: Vec<T>, shard: Option<Shard>) -> Vec<T> {
+    match shard {
+        Some(s) if !s.keeps(0) => Vec::new(),
+        _ => cells,
+    }
+}
+
 /// The pure core of [`corpus_cells`]: with `replay = Some(seed)` every cell is
 /// reseeded to `seed` under its own name (an `ANIMUS_SEED` replay, no depth
 /// expansion); otherwise the cells are expanded `k` deep with [`seed_expand`].
@@ -117,6 +259,17 @@ pub fn expand_cells<T: SeedVariant>(
     k: usize,
     filter: Option<&str>,
 ) -> Vec<T> {
+    expand_cells_sharded(cells, replay, k, filter, shard_from_env())
+}
+
+/// [`expand_cells`] with the shard passed explicitly (`None` = every variant).
+pub fn expand_cells_sharded<T: SeedVariant>(
+    cells: Vec<T>,
+    replay: Option<u64>,
+    k: usize,
+    filter: Option<&str>,
+    shard: Option<Shard>,
+) -> Vec<T> {
     let expanded = if let Some(seed) = replay {
         cells
             .into_iter()
@@ -126,7 +279,7 @@ pub fn expand_cells<T: SeedVariant>(
             })
             .collect()
     } else {
-        seed_expand(cells, k)
+        seed_expand_sharded(cells, k, shard)
     };
     expanded
         .into_iter()
@@ -147,6 +300,27 @@ pub fn corpus_cells<T: SeedVariant>(cells: Vec<T>, seeds_var: &str, cell_var: &s
     expand_cells(cells, replay, seeds_from_env(seeds_var), filter.as_deref())
 }
 
+/// [`corpus_cells`] over *every* seed variant, ignoring `ANIMUS_SEED_SHARD`: for
+/// an aggregate check pinned to shard 0 ([`owns_unsharded`]) that must see the
+/// whole seed set.
+pub fn corpus_cells_unsharded<T: SeedVariant>(
+    cells: Vec<T>,
+    seeds_var: &str,
+    cell_var: &str,
+) -> Vec<T> {
+    let filter = env::var(cell_var).ok();
+    let replay = env::var("ANIMUS_SEED")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok());
+    expand_cells_sharded(
+        cells,
+        replay,
+        seeds_from_env(seeds_var),
+        filter.as_deref(),
+        None,
+    )
+}
+
 /// Run `body` once per seed variant of a scenario named `name`, `k` times
 /// total — the closure-based sibling of [`seed_expand`], for corpora that
 /// drive a scenario directly rather than building a `Vec<Scenario>` up
@@ -155,7 +329,11 @@ pub fn corpus_cells<T: SeedVariant>(cells: Vec<T>, seeds_var: &str, cell_var: &s
 /// shape's own existing convention — distinct from `seed_expand`'s
 /// `_s{i:02}`).
 pub fn for_each_seed(name: &str, k: usize, mut body: impl FnMut(u64)) {
+    let shard = shard_from_env();
     for variant in 0..k {
+        if !shard.is_none_or(|s| s.keeps(variant)) {
+            continue;
+        }
         let seed = if variant == 0 {
             odd_name_seed(name)
         } else {
@@ -286,5 +464,103 @@ mod tests {
         assert_eq!(seeds[0], odd_name_seed("widgets"));
         assert_eq!(seeds[1], odd_name_seed("widgets_s1"));
         assert_eq!(seeds[2], odd_name_seed("widgets_s2"));
+    }
+
+    fn cells3() -> Vec<C> {
+        ["a", "b", "c"]
+            .iter()
+            .enumerate()
+            .map(|(i, n)| C {
+                name: (*n).into(),
+                seed: i as u64,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn shard_parse_accepts_valid_and_rejects_malformed() {
+        assert_eq!(Shard::parse("0/1"), Ok(Shard { index: 0, of: 1 }));
+        assert_eq!(Shard::parse("2/4"), Ok(Shard { index: 2, of: 4 }));
+        for bad in [
+            "", "1", "1/", "/2", "a/b", "0/0", "2/2", "3/2", "-1/2", "1/2/3",
+        ] {
+            assert!(Shard::parse(bad).is_err(), "{bad:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn unset_shard_leaves_expansion_unchanged() {
+        for k in [0, 1, 2, 5] {
+            let plain = seed_expand_sharded(cells3(), k, None);
+            // Byte-for-byte what the pre-shard algorithm produced.
+            let mut want = Vec::new();
+            for c in cells3() {
+                for i in 0..k.max(1) {
+                    if i == 0 {
+                        want.push(c.clone());
+                    } else {
+                        let n = format!("{}_s{i:02}", c.name);
+                        want.push(C {
+                            seed: name_seed(&n),
+                            name: n,
+                        });
+                    }
+                }
+            }
+            assert_eq!(plain, want, "k={k}");
+        }
+        assert_eq!(shard_retain_with(vec![1, 2, 3], None), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn shards_partition_the_expansion_exactly() {
+        for k in [0usize, 1, 2, 3, 7, 10] {
+            for n in 1..=5usize {
+                let full = seed_expand_sharded(cells3(), k, None);
+                let mut union: Vec<C> = Vec::new();
+                for i in 0..n {
+                    let part = seed_expand_sharded(cells3(), k, Some(Shard { index: i, of: n }));
+                    for c in &part {
+                        assert!(!union.contains(c), "k={k} n={n}: {c:?} in two shards");
+                    }
+                    union.extend(part);
+                }
+                let mut a: Vec<String> = full.iter().map(|c| c.name.clone()).collect();
+                let mut b: Vec<String> = union.iter().map(|c| c.name.clone()).collect();
+                a.sort();
+                b.sort();
+                assert_eq!(a, b, "k={k} n={n}: union != unsharded run");
+            }
+        }
+    }
+
+    #[test]
+    fn canonical_variant_zero_lands_in_exactly_one_shard() {
+        for n in 1..=4usize {
+            let owners: Vec<usize> = (0..n)
+                .filter(|i| {
+                    seed_expand_sharded(cells3(), 6, Some(Shard { index: *i, of: n }))
+                        .iter()
+                        .any(|c| c.name == "a")
+                })
+                .collect();
+            assert_eq!(owners, vec![0], "n={n}");
+        }
+    }
+
+    #[test]
+    fn shard_retain_partitions_a_seed_list() {
+        let all: Vec<u64> = (100..113).collect();
+        for n in 1..=6usize {
+            let mut union = Vec::new();
+            for i in 0..n {
+                union.extend(shard_retain_with(
+                    all.clone(),
+                    Some(Shard { index: i, of: n }),
+                ));
+            }
+            union.sort();
+            assert_eq!(union, all, "n={n}");
+        }
     }
 }

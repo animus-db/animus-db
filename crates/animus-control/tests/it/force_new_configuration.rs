@@ -134,9 +134,11 @@ fn seeds(cell: &str) -> Vec<u64> {
         return vec![s.parse().expect("ANIMUS_SEED must be a u64")];
     }
     let k = corpus::seeds_from_env("ANIMUS_FORCE_RECOVER_SEEDS");
-    (0..k)
-        .map(|i| corpus::name_seed(&format!("force_new_configuration_{cell}_s{i}")))
-        .collect()
+    animus_test::corpus::shard_retain(
+        (0..k)
+            .map(|i| corpus::name_seed(&format!("force_new_configuration_{cell}_s{i}")))
+            .collect(),
+    )
 }
 
 fn replay_hint(cell: &str, seed: u64) -> String {

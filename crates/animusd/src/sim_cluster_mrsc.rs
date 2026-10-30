@@ -80,7 +80,9 @@ const JITTER: Duration = Duration::from_millis(30);
 const TAIL_JITTER: Duration = Duration::from_millis(250);
 const TAIL_PROB: f64 = 0.10;
 
-fn seeds() -> Vec<u64> {
+/// Every seed of the run (`ANIMUS_SEED` replay, else the depth knob), before
+/// `ANIMUS_SEED_SHARD` takes its slice.
+fn all_seeds() -> Vec<u64> {
     if let Some(s) = std::env::var("ANIMUS_SEED")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
@@ -89,6 +91,14 @@ fn seeds() -> Vec<u64> {
     }
     let k = animus_test::corpus::seeds_from_env("ANIMUS_MRSC_SEEDS") as u64;
     (0..k).map(|i| 0x6D00_0000 + i).collect()
+}
+
+/// This worker's seeds (`ANIMUS_SEED_SHARD`; a replay is never sharded).
+fn seeds() -> Vec<u64> {
+    if std::env::var("ANIMUS_SEED").is_ok() {
+        return all_seeds();
+    }
+    animus_test::corpus::shard_retain(all_seeds())
 }
 
 fn cell_selected(name: &str) -> bool {
@@ -453,7 +463,8 @@ impl Run {
             format!(r#"{{"TableName":"{table}","Item":{{"pk":{{"S":"{k}"}},"v":{{"S":"{v}"}}}}}}"#);
         for i in 0..tries {
             let node = via[(self.next as usize + i) % via.len()];
-            if call(&mut self.c, node, "PutItem", &body).0 == 200 {
+            let r = call(&mut self.c, node, "PutItem", &body);
+            if r.0 == 200 {
                 self.acked.insert((table.to_owned(), k), v);
                 return true;
             }
@@ -1124,6 +1135,21 @@ impl Run {
         });
     }
 
+    /// The control-plane half of [`reverted`](Self::reverted): the table is a
+    /// regional table in `keep` with its tablets' replica sets moved there, as
+    /// seen by a live node. The Raft groups themselves may still be moving.
+    fn reverted_in_metadata(&mut self, table: &str, keep: &str) {
+        let (t, k) = (table.to_owned(), keep.to_owned());
+        let dead = self.dead.clone();
+        self.must(
+            &format!("{table} metadata reverted into {keep}"),
+            move |c| {
+                let live = (0..NODES).find(|n| !dead.contains(n)).expect("a live node");
+                reverted_into(&c.metadata(live), &t, &k)
+            },
+        );
+    }
+
     /// Acked writes through `via` while the cluster converges: `rounds` of one
     /// virtual second and one put each (every put must ack: a quorum survives
     /// every fault these cells inject).
@@ -1277,6 +1303,11 @@ enum Kill {
     /// The leader of the table's tablet (in the preferred Region, which is
     /// being deleted).
     TabletLeader,
+    /// A node of the KEPT Region (issue #1271): one of the two desired
+    /// replicas. The groups cannot finish moving while it is down (see
+    /// `revert_with_kill`), so the cell asserts availability and the
+    /// control-plane revert while it is down and full convergence after.
+    KeptRegionNode,
 }
 
 /// Delete r-a (the preferred Region) and r-c through a node of r-b, keeping
@@ -1299,13 +1330,48 @@ fn revert_with_kill(seed: u64, kill: Kill) {
             let id = tablets_of(&mut run.c, live, "glob1")[0];
             leader_of(&run.c, id, &run.dead).expect("a leader").0
         }
+        Kill::KeptRegionNode => nodes_of_region("r-b")[1],
     };
     run.c.crash(victim);
     run.dead.insert(victim);
     let live = run.live();
     run.write_while_converging("glob1", &live, 5);
-    run.reverted("glob1", "r-b");
-    run.workload("glob1", &live);
+    if region_of_node(victim) == "r-b" {
+        // The victim is one of the two DESIRED replicas of the reverted
+        // table. The reconfigure ladder drops an extra voter (and moves
+        // leadership off a removed leader) only once every desired member is
+        // caught up (`RaftKvNode::reconfigure_step` steps 5 and 6): dropping
+        // to a two-voter group with one voter down would trade a working
+        // quorum for none. So the removed replicas deliberately stay in the
+        // group, and may still lead it, until the victim returns. Which node
+        // is the control leader is seed-dependent, so seed 1828716545 (control
+        // leader n2, a kept-Region node) failed the strict check below while
+        // other seeds never reached this branch. The table must stay
+        // available (the writes above acked) and be reverted in the metadata.
+        run.reverted_in_metadata("glob1", "r-b");
+        // Clients on a node that hosts no replica of the table reach a
+        // removed-but-still-leading replica only by chasing the refusal's
+        // leader hint, and `SimCluster` addresses (`n0`, no `:port`) fail
+        // `parse_not_leader_refusal`'s `host:port` shape check, so the hint
+        // is dropped there (production addresses pass it). Drive the workload
+        // through the nodes that host the table, which find the leader by
+        // their own local hint; everyone is exercised after the restart.
+        let ids: BTreeSet<TabletId> = run
+            .c
+            .metadata(live[0])
+            .tablets_for_table("glob1")
+            .map(|(i, _)| *i)
+            .collect();
+        let hosts: Vec<u64> = live
+            .iter()
+            .copied()
+            .filter(|n| run.c.hosted_tablets(*n).iter().any(|h| ids.contains(h)))
+            .collect();
+        run.workload("glob1", &hosts);
+    } else {
+        run.reverted("glob1", "r-b");
+        run.workload("glob1", &live);
+    }
     run.c.restart(victim);
     run.dead.remove(&victim);
     run.reverted("glob1", "r-b");
@@ -1320,6 +1386,12 @@ fn cell_revert_control_leader_kill(seed: u64) {
 
 fn cell_revert_tablet_leader_kill(seed: u64) {
     revert_with_kill(seed, Kill::TabletLeader);
+}
+
+/// Deterministic sibling of the control-leader kill: the dead node is always a
+/// kept-Region replica, never the removed Region's (issue #1271).
+fn cell_revert_kept_region_node_kill(seed: u64) {
+    revert_with_kill(seed, Kill::KeptRegionNode);
 }
 
 /// The witness form (r-c witness): delete the witness and r-b through a node
@@ -1417,6 +1489,8 @@ cell_tests! {
         ("revert_control_leader_kill", cell_revert_control_leader_kill),
     sim_cluster_mrsc_corpus_revert_tablet_leader_kill =>
         ("revert_tablet_leader_kill", cell_revert_tablet_leader_kill),
+    sim_cluster_mrsc_corpus_revert_kept_region_node_kill =>
+        ("revert_kept_region_node_kill", cell_revert_kept_region_node_kill),
     sim_cluster_mrsc_corpus_revert_witness_form_partition =>
         ("revert_witness_form_partition", cell_revert_witness_form_partition),
 }
@@ -1457,9 +1531,14 @@ fn mrsc_negative_preferred_leader_disabled() {
 /// violation and a Region loss costs it its quorum.
 #[test]
 fn mrsc_negative_unpinned_policy() {
+    // Aggregate over the whole seed set ("some seed doubles a Region"), so it
+    // cannot be split by seed: shard 0 runs it in full, the others skip it.
+    if !animus_test::corpus::owns_unsharded() {
+        return;
+    }
     let mut violated = 0usize;
     let mut quorum_lost = 0usize;
-    let all = seeds();
+    let all = all_seeds();
     for seed in all.iter().copied() {
         let mut run = Run::boot(seed);
         run.create_table("plain");

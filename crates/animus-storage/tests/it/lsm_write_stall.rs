@@ -77,7 +77,7 @@ fn seeds() -> Vec<u64> {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(1);
-    (0..k.max(1)).map(|i| 0x1081 + i).collect()
+    animus_test::corpus::shard_retain((0..k.max(1)).map(|i| 0x1081 + i).collect())
 }
 
 /// Whether the cell named `name` is selected by `ANIMUS_LSM_STALL_CELL`.
@@ -187,6 +187,45 @@ fn run_sampling(sim: &mut Simulator, e: &LsmEngine<SimEnv>, d: Duration) -> usiz
     hwm
 }
 
+/// Bound (virtual time) on how long a cell drives writes toward the L0 stop
+/// level before it fails loudly (issue #1271). A fixed-duration workload does
+/// not always get there on every seed (the writers' own slowdown ramp throttles
+/// the climb), so the cells drive until the level is reached, not for a time.
+const STOP_DRIVE_BOUND: Duration = Duration::from_secs(180);
+
+/// Keep running (10 ms slices) until the engine's L0 holds `STOP_TABLES`
+/// tables, sampling the high-water mark into `hwm`. `Err` when
+/// [`STOP_DRIVE_BOUND`] passes first.
+///
+/// "Reached the stop level" is read off L0 itself, never off
+/// `StallStats::writes[2]`: that counter attributes a write to the cause it
+/// FIRST stalled for, so a write that entered in the slowdown ramp and
+/// escalated to stop is counted as slowdown, and with compaction wedged the
+/// parked writers never finish (issue #1271: s4227/s4229/s4234 had L0 at the
+/// stop level and `writes[2] == 0`).
+fn drive_to_stop(
+    sim: &mut Simulator,
+    e: &LsmEngine<SimEnv>,
+    hwm: &mut usize,
+) -> Result<(), String> {
+    let slices = STOP_DRIVE_BOUND.as_millis() / 10;
+    for _ in 0..slices {
+        if *hwm >= STOP_TABLES {
+            return Ok(());
+        }
+        sim.run_for(Duration::from_millis(10));
+        *hwm = (*hwm).max(e.l0_table_count());
+    }
+    if *hwm >= STOP_TABLES {
+        return Ok(());
+    }
+    Err(format!(
+        "the workload never drove L0 to the stop level ({STOP_TABLES}) within {STOP_DRIVE_BOUND:?} \
+         (hwm {hwm}, stats {:?})",
+        e.stall_stats()
+    ))
+}
+
 /// The oracles every cell shares; `Err(why)` when one fails.
 fn check_common(
     e: &LsmEngine<SimEnv>,
@@ -226,7 +265,7 @@ fn check_common(
 
 struct Cell1 {
     slowdown_writes: u64,
-    stop_writes: u64,
+    stop_nanos: u64,
     l0_hwm_wedged: usize,
     acked_wedged_end: usize,
     acked_after: usize,
@@ -247,7 +286,8 @@ fn cell1(seed: u64, l0_stall: bool) -> (Result<(), String>, Cell1) {
     let ver = Arc::new(AtomicU64::new(0));
     let w = start_writers(&sim, &e, n, val_len, &ver, "c1");
 
-    let hwm_wedged = run_sampling(&mut sim, &e, Duration::from_secs(wedge_s));
+    let mut hwm_wedged = run_sampling(&mut sim, &e, Duration::from_secs(wedge_s));
+    let drive = drive_to_stop(&mut sim, &e, &mut hwm_wedged);
     let acked_wedged_end = w.acked();
     let stats_wedged = e.stall_stats();
     wedged.store(false, Ordering::Release);
@@ -259,7 +299,8 @@ fn cell1(seed: u64, l0_stall: bool) -> (Result<(), String>, Cell1) {
     sim.run_until_quiescent(2_000_000);
     let l0_final = e.l0_table_count();
     let hwm = hwm_wedged.max(hwm_after);
-    let mut r = check_common(&e, &w, hwm, n);
+    let stats_end = e.stall_stats();
+    let mut r = drive.and_then(|()| check_common(&e, &w, hwm, n));
     if r.is_ok() && l0_stall && l0_final > STOP_TABLES {
         r = Err(format!(
             "the stop never cleared: L0 {l0_final} after the wedge lifted"
@@ -269,7 +310,9 @@ fn cell1(seed: u64, l0_stall: bool) -> (Result<(), String>, Cell1) {
         r,
         Cell1 {
             slowdown_writes: stats_wedged.writes[1],
-            stop_writes: stats_wedged.writes[2],
+            // Time writers spent held at the stop level (settled once the
+            // wedge lifted), not the first-cause write count.
+            stop_nanos: stats_end.nanos[2],
             l0_hwm_wedged: hwm_wedged,
             acked_wedged_end,
             acked_after,
@@ -291,8 +334,8 @@ fn cell1_l0_climbs_slows_stops_then_clears() {
             "seed {seed}: no write was ever delayed"
         );
         assert!(
-            c.stop_writes > 0,
-            "seed {seed}: L0 never reached the stop level"
+            c.stop_nanos > 0,
+            "seed {seed}: no write was ever held at the L0 stop level"
         );
         assert!(
             c.l0_hwm_wedged >= STOP_TABLES,
@@ -465,19 +508,10 @@ fn crash_mid_stall(seed: u64, torn: bool) -> Result<(), String> {
     sim.set_disk_config(cfg);
     let ver = Arc::new(AtomicU64::new(0));
     let w = start_writers(&sim, &e, n, val_len, &ver, "pre");
-    // Run until the stop level is reached, then a bit more so writers are
-    // parked in the stall.
-    let mut stalled = false;
-    for _ in 0..3000 {
-        sim.run_for(Duration::from_millis(10));
-        if e.stall_stats().writes[2] > 0 {
-            stalled = true;
-            break;
-        }
-    }
-    if !stalled {
-        return Err("the workload never reached the L0 stop level".into());
-    }
+    // Drive until the stop level is reached (bounded, loud on a miss), then a
+    // bit more so writers are parked in the stall.
+    let mut hwm_pre = 0;
+    drive_to_stop(&mut sim, &e, &mut hwm_pre)?;
     sim.run_for(Duration::from_millis(200));
     // Power loss with writers parked in the stall.
     let acked: Vec<(Vec<u8>, Vec<u8>)> = w.log.lock().unwrap().acked.clone();

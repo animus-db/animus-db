@@ -241,10 +241,10 @@
 //! restore (ADR 0059 Trains 1–3, all implemented). Threads through
 //! `--config`/`--node`, `--cluster N`, `animusd control` (W-10), **and now
 //! `join`/`data --seed` too (issue #676)** — `--cluster-control`/
-//! `--cluster-data` and the standalone `data --config` subcommand remain a
-//! documented gap (each always gets the default `Cluster` store, since
-//! neither parses this flag: `start_split_cluster_with_growth` hardcodes it
-//! for every data-role node it stands up, and `data --config` has no
+//! `--cluster-data` now **hard-errors** on it (issue #1422; it used to be
+//! silently ignored, `start_split_cluster_with_growth` hardcoding the
+//! default `Cluster` store for every data-role node it stands up), and the
+//! standalone `data --config` subcommand remains a documented gap (it has no
 //! `cluster_settings`-shaped route to it the way `--quiesce-after`/
 //! `--heartbeat-batch`/`--shared-wal` do). **A control-only node
 //! now provisions a real backup store just like a combined or data-only
@@ -256,7 +256,7 @@
 //! "omit for cluster") — omitting the flag and passing `--backup-store
 //! cluster` are equivalent.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, SocketAddr};
 use std::process::ExitCode;
 use std::time::Duration;
@@ -514,9 +514,9 @@ async fn run(args: &[String]) -> Result<(), String> {
     // `--export-s3-endpoint`/`--export-s3-region` (ADR 0068 §2, S-05): this
     // node's S3 connection parameters for the export **customer**-bucket
     // store — see `resolve_export_s3`'s own doc. Reaches `--config/--node`
-    // only (a documented gap on `--cluster N`/`--cluster-control`+
-    // `--cluster-data`/`control`/`data`/`join`, mirroring `--segment-store`/
-    // `--backup-store`'s own partial CLI reach).
+    // only (a documented gap on `--cluster N`/`control`/`data`/`join`,
+    // mirroring `--segment-store`/`--backup-store`'s own partial CLI reach;
+    // a hard error with `--cluster-control`/`--cluster-data`, issue #1422).
     let mut export_s3_endpoint: Option<String> = None;
     let mut export_s3_region: Option<String> = None;
     // `--quiesce-after SECS` (ADR 0044 phase-1 PR7): opts every data-plane CP
@@ -644,10 +644,9 @@ async fn run(args: &[String]) -> Result<(), String> {
     // is a hard error" shape `dynamo_auth_path` above uses). `--cluster N`:
     // applied to every generated node (they still each bind their own
     // distinct port, so `{host}:{port}` stays a unique identity per node).
-    // `--cluster-control`/`--cluster-data`: a documented gap, matching this
-    // dev-only path's existing `--quiesce-after` one — not threaded through,
-    // since `run_in_process_split_cluster` has no per-node-advertise-host
-    // wrapper to call.
+    // `--cluster-control`/`--cluster-data`: a hard error (issue #1422) —
+    // `run_in_process_split_cluster` has no per-node-advertise-host wrapper
+    // to thread it through, and silently ignoring it was the worse failure.
     let mut advertise_host: Option<String> = None;
     // G-01 stage G-a: `--label`/`--labels-file`/`--labels-file-annotations`/
     // `--labels-wait-secs` — this node's topology labels (`animusd::node_labels`).
@@ -696,7 +695,11 @@ async fn run(args: &[String]) -> Result<(), String> {
     let mut queued_bytes_budget: Option<u64> = None;
 
     let mut it = args.iter();
+    // Every flag spelling the command line carried, for the one mode/flag
+    // table (`check_flags_for_mode`).
+    let mut seen_flags: BTreeSet<&str> = BTreeSet::new();
     while let Some(arg) = it.next() {
+        seen_flags.insert(arg.as_str());
         match arg.as_str() {
             "--config" => config_path = Some(parse_next(&mut it, "--config")?),
             "--node" => node = Some(parse_next(&mut it, "--node")?),
@@ -881,6 +884,13 @@ async fn run(args: &[String]) -> Result<(), String> {
             other => return Err(format!("unknown argument `{other}`")),
         }
     }
+    // Issue #1422: the run mode is derived once, then (a) mode conflicts and
+    // (b) flags that do not fit the mode are rejected, both before anything
+    // else is parsed or any file is read.
+    // The flag table is `FLAG_RULES`; flags the split dev path does not
+    // honour are hard errors there, not silent gaps.
+    let mode = derive_mode(config_path, node, cluster, cluster_control, cluster_data)?;
+    check_flags_for_mode(&mode, &seen_flags)?;
     let tls_flag = resolve_tls_flags(tls_cert, tls_key, tls_ca)?;
     let overload_flag = resolve_overload_flags(max_connections, max_inflight, queued_bytes_budget)?;
     // S-06: the raw (un-defaulted) CLI values for every knob
@@ -959,127 +969,23 @@ async fn run(args: &[String]) -> Result<(), String> {
     )?;
     let quiesce_after = quiesce_after_duration(cli_cluster_settings.quiesce_after_secs);
     validate_quiesce_after(quiesce_after)?;
-    if max_region_rtt_ms.is_some() && config_path.is_none() {
-        return Err(
-            "--max-region-rtt-ms is only supported with --config/--node (set \
-             cluster_settings.max_region_rtt_ms in the config file for the other shapes)"
-                .into(),
-        );
-    }
-    if lag_stretch_max_x.is_some() && config_path.is_none() {
-        return Err(
-            "--lag-stretch-max is only supported with --config/--node (set \
-             cluster_settings.lag_stretch_max_x in the config file for the other shapes)"
-                .into(),
-        );
-    }
-    if campaign_max_inflight.is_some() && config_path.is_none() {
-        return Err(
-            "--campaign-max-inflight is only supported with --config/--node (set \
-             cluster_settings.campaign_max_inflight in the config file for the other shapes)"
-                .into(),
-        );
-    }
-    if (node_weight.is_some() || node_max_replicas.is_some()) && config_path.is_none() {
-        return Err(
-            "--node-weight/--node-max-replicas are only supported with --config/--node (set \
-             cluster_settings.node_weight / node_max_replicas in the config file for the \
-             other shapes)"
-                .into(),
-        );
-    }
-    if (cores.is_some() || awake_max_per_core.is_some()) && config_path.is_none() {
-        return Err(
-            "--cores/--awake-max-per-core are only supported with --config/--node (set \
-             cluster_settings.cores / awake_max_per_core in the config file for the other \
-             shapes)"
-                .into(),
-        );
-    }
-    if (bg_snapshot_streams.is_some()
-        || bg_catchup_learners.is_some()
-        || bg_splits.is_some()
-        || bg_compactions.is_some()
-        || bg_compaction_io_bytes_per_sec.is_some()
-        || memtable_budget_bytes.is_some()
-        || repair_proposals_per_tick.is_some()
-        || repair_inflight_max.is_some())
-        && config_path.is_none()
-    {
-        return Err(
-            "--bg-snapshot-streams/--bg-catchup-learners/--bg-splits/--bg-compactions/\
-             --compaction-io-bytes-per-sec/--memtable-budget-bytes/--repair-proposals-per-tick/--repair-inflight-max are only \
-             supported with --config/--node (set the matching cluster_settings keys in the \
-             config file for the other shapes)"
-                .into(),
-        );
-    }
-    if (host_unsettled_max.is_some() || host_settle_timeout_ms.is_some()) && config_path.is_none() {
-        return Err(
-            "--host-unsettled-max/--host-settle-timeout-ms are only supported with \
-             --config/--node (set cluster_settings.host_unsettled_max / \
-             host_settle_timeout_ms in the config file for the other shapes)"
-                .into(),
-        );
-    }
-    if (mrec_region.is_some()
-        || !mrec_peers.is_empty()
-        || allow_insecure_peers.is_some()
-        || mrec_max_clock_skew_ms.is_some())
-        && config_path.is_none()
-    {
-        return Err(
-            "--region/--peer/--allow-insecure-peers/--mrec-max-clock-skew-ms are only supported \
-             with --config/--node (set the cluster_settings keys in the config file for the \
-             other shapes)"
-                .into(),
-        );
-    }
     let dynamo_auth_flag = dynamo_auth_path
         .as_deref()
         .map(load_dynamo_auth_file)
         .transpose()?;
 
-    if cluster_control.is_some() || cluster_data.is_some() {
-        if config_path.is_some() || cluster.is_some() {
-            return Err(
-                "use either --config, --cluster, or --cluster-control/--cluster-data, not both"
-                    .into(),
-            );
-        }
-        if tls_flag.is_some() {
-            return Err("--tls-cert/--tls-key/--tls-ca are not yet supported with \
-                 --cluster-control/--cluster-data — use --config/--node against a config file \
-                 whose own node entries carry a tls section (ADR 0064)"
-                .into());
-        }
-        if overload_flag.is_some() {
-            return Err(
-                "--max-connections/--max-inflight are not yet supported with \
-                 --cluster-control/--cluster-data — use --config/--node against a config file \
-                 whose own node entries carry an overload section (ADR 0074)"
-                    .into(),
-            );
-        }
-        if encryption_key_path.is_some() {
-            return Err("--encryption-key is not yet supported with \
-                 --cluster-control/--cluster-data — use --config/--node against a config file \
-                 whose own node entries carry an encryption_key_path (ADR 0069)"
-                .into());
-        }
-        let control_n = cluster_control.ok_or("--cluster-data also needs --cluster-control N")?;
-        let data_n = cluster_data.ok_or("--cluster-control also needs --cluster-data M")?;
+    if let Mode::Split { control, data } = mode {
         // `--quiesce-after`/`--heartbeat-batch`/`--shared-wal` now thread
         // through the split-deployment dev path too (issue #676) — the
         // identical `DEFAULT_QUIESCE_AFTER_SECS`/`DEFAULT_HEARTBEAT_BATCH`/
         // `DEFAULT_SHARED_WAL` resolution `--config`/`--cluster N` already
-        // apply when the flag is omitted. `--segment-store`/`--backup-store`
-        // remain a documented gap on this path (noted below/in the CLAUDE.md
-        // CLI reference) — `start_split_cluster_with_growth` hardcodes the
-        // default `Cluster` store for every data-role node it stands up.
+        // apply when the flag is omitted. The flags this path does not honour
+        // (`--segment-store`, `--backup-store`, the S3, throttle, label,
+        // `--advertise-host` and stream-seal flags, ...) are hard errors in
+        // `check_flags_for_mode`, not silent gaps (issue #1422).
         return run_in_process_split_cluster(
-            control_n,
-            data_n,
+            control,
+            data,
             ip,
             dir,
             backend,
@@ -1099,9 +1005,8 @@ async fn run(args: &[String]) -> Result<(), String> {
         .await;
     }
 
-    match (config_path, cluster) {
-        (Some(_), Some(_)) => Err("use either --config or --cluster, not both".into()),
-        (Some(path), None) => {
+    match mode {
+        Mode::Config { path, node } => {
             let index = node.ok_or("--config requires --node I")?;
             run_single(
                 &path,
@@ -1121,30 +1026,7 @@ async fn run(args: &[String]) -> Result<(), String> {
             )
             .await
         }
-        (None, Some(n)) => {
-            if label_flags.is_set() {
-                return Err(
-                    "--label/--labels-file are not supported with --cluster N (every \
-                     node would share one label set) — use --config/--node, or `join`"
-                        .into(),
-                );
-            }
-            if overload_flag.is_some() {
-                return Err(
-                    "--max-connections/--max-inflight are not yet supported with --cluster N — \
-                     use --config/--node against a config file whose own node entries carry an \
-                     overload section (ADR 0074)"
-                        .into(),
-                );
-            }
-            if tls_flag.is_some() {
-                return Err(
-                    "--tls-cert/--tls-key/--tls-ca are not yet supported with --cluster N — \
-                     use --config/--node against a config file whose own node entries carry a \
-                     tls section (ADR 0064)"
-                        .into(),
-                );
-            }
+        Mode::Cluster(n) => {
             run_in_process_cluster(
                 n,
                 ip,
@@ -1175,8 +1057,256 @@ async fn run(args: &[String]) -> Result<(), String> {
             )
             .await
         }
-        (None, None) => Err("nothing to do".into()),
+        Mode::Split { .. } => unreachable!("returned above"),
+        Mode::Idle => Err("nothing to do".into()),
     }
+}
+
+/// The run mode `run()` derives once from `--config`/`--node`, `--cluster` and
+/// `--cluster-control`/`--cluster-data` (issue #1422).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Mode {
+    /// `--config FILE --node I` (`node` is checked at dispatch).
+    Config { path: String, node: Option<usize> },
+    /// `--cluster N`, the in-process combined dev cluster.
+    Cluster(usize),
+    /// `--cluster-control N --cluster-data M`, the in-process split dev cluster.
+    Split { control: usize, data: usize },
+    /// None of the three given (the run ends in "nothing to do").
+    Idle,
+}
+
+/// A [`Mode`] without its payload, the key of the flag table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModeKind {
+    Config,
+    Cluster,
+    Split,
+    Idle,
+}
+
+impl Mode {
+    fn kind(&self) -> ModeKind {
+        match self {
+            Mode::Config { .. } => ModeKind::Config,
+            Mode::Cluster(_) => ModeKind::Cluster,
+            Mode::Split { .. } => ModeKind::Split,
+            Mode::Idle => ModeKind::Idle,
+        }
+    }
+}
+
+impl ModeKind {
+    fn describe(self) -> &'static str {
+        match self {
+            ModeKind::Config => "--config/--node",
+            ModeKind::Cluster => "--cluster N",
+            ModeKind::Split => "--cluster-control/--cluster-data",
+            ModeKind::Idle => "no --config, --cluster or --cluster-control",
+        }
+    }
+}
+
+/// Derive the [`Mode`], rejecting mode conflicts (step (a) of the error order:
+/// conflicts, then flags that do not fit the mode, then file loading).
+fn derive_mode(
+    config_path: Option<String>,
+    node: Option<usize>,
+    cluster: Option<usize>,
+    cluster_control: Option<usize>,
+    cluster_data: Option<usize>,
+) -> Result<Mode, String> {
+    if cluster_control.is_some() || cluster_data.is_some() {
+        if config_path.is_some() || cluster.is_some() {
+            return Err(
+                "use either --config, --cluster, or --cluster-control/--cluster-data, not both"
+                    .into(),
+            );
+        }
+        let control = cluster_control.ok_or("--cluster-data also needs --cluster-control N")?;
+        let data = cluster_data.ok_or("--cluster-control also needs --cluster-data M")?;
+        return Ok(Mode::Split { control, data });
+    }
+    match (config_path, cluster) {
+        (Some(_), Some(_)) => Err("use either --config or --cluster, not both".into()),
+        (Some(path), None) => Ok(Mode::Config { path, node }),
+        (None, Some(n)) => Ok(Mode::Cluster(n)),
+        (None, None) => Ok(Mode::Idle),
+    }
+}
+
+/// One row of the flag table: the spellings of a flag group, the modes it is
+/// allowed in, and what to do instead elsewhere.
+struct FlagRule {
+    flags: &'static [&'static str],
+    allowed: &'static [ModeKind],
+    instead: &'static str,
+}
+
+const CONFIG_ONLY: &[ModeKind] = &[ModeKind::Config];
+/// Honoured by `--config`/`--node` and `--cluster N`; the split dev path
+/// (`start_split_cluster_with_growth`) takes none of them, so it ignored them
+/// silently until issue #1422 made them hard errors.
+const NOT_SPLIT: &[ModeKind] = &[ModeKind::Config, ModeKind::Cluster, ModeKind::Idle];
+
+const USE_CONFIG_OR_CLUSTER: &str = "use --config/--node or --cluster N";
+
+/// The one table of "flag, the modes it is allowed in" (issue #1422). A flag
+/// in no row (`--dir`, `--ip`, `--ephemeral`, `--auto-split-*`,
+/// `--orphan-sweep-after`, `--quiesce-after`, the heartbeat/shared-wal
+/// toggles, `--dynamo-auth`) is honoured by every mode.
+const FLAG_RULES: &[FlagRule] = &[
+    FlagRule {
+        flags: &["--max-region-rtt-ms"],
+        allowed: CONFIG_ONLY,
+        instead: "set cluster_settings.max_region_rtt_ms in the config file for the other shapes",
+    },
+    FlagRule {
+        flags: &["--lag-stretch-max"],
+        allowed: CONFIG_ONLY,
+        instead: "set cluster_settings.lag_stretch_max_x in the config file for the other shapes",
+    },
+    FlagRule {
+        flags: &["--campaign-max-inflight"],
+        allowed: CONFIG_ONLY,
+        instead: "set cluster_settings.campaign_max_inflight in the config file for the other shapes",
+    },
+    FlagRule {
+        flags: &["--node-weight", "--node-max-replicas"],
+        allowed: CONFIG_ONLY,
+        instead: "set cluster_settings.node_weight / node_max_replicas in the config file for the other shapes",
+    },
+    FlagRule {
+        flags: &["--cores", "--awake-max-per-core"],
+        allowed: CONFIG_ONLY,
+        instead: "set cluster_settings.cores / awake_max_per_core in the config file for the other shapes",
+    },
+    FlagRule {
+        flags: &[
+            "--bg-snapshot-streams",
+            "--bg-catchup-learners",
+            "--bg-splits",
+            "--bg-compactions",
+            "--compaction-io-bytes-per-sec",
+            "--memtable-budget-bytes",
+            "--repair-proposals-per-tick",
+            "--repair-inflight-max",
+        ],
+        allowed: CONFIG_ONLY,
+        instead: "set the matching cluster_settings keys in the config file for the other shapes",
+    },
+    FlagRule {
+        flags: &["--host-unsettled-max", "--host-settle-timeout-ms"],
+        allowed: CONFIG_ONLY,
+        instead: "set cluster_settings.host_unsettled_max / host_settle_timeout_ms in the config file for the other shapes",
+    },
+    FlagRule {
+        flags: &[
+            "--region",
+            "--peer",
+            "--allow-insecure-peers",
+            "--mrec-max-clock-skew-ms",
+        ],
+        allowed: CONFIG_ONLY,
+        instead: "set the cluster_settings keys in the config file for the other shapes",
+    },
+    FlagRule {
+        flags: &["--tls-cert", "--tls-key", "--tls-ca"],
+        allowed: CONFIG_ONLY,
+        instead: "use --config/--node against a config file whose own node entries carry a tls section (ADR 0064)",
+    },
+    FlagRule {
+        flags: &[
+            "--max-connections",
+            "--max-inflight",
+            "--queued-bytes-budget",
+        ],
+        allowed: CONFIG_ONLY,
+        instead: "use --config/--node against a config file whose own node entries carry an overload section (ADR 0074)",
+    },
+    FlagRule {
+        flags: &[
+            "--label",
+            "--labels-file",
+            "--labels-file-annotations",
+            "--labels-wait-secs",
+        ],
+        allowed: CONFIG_ONLY,
+        instead: "the in-process dev clusters would give every node one label set; use --config/--node, or `join`",
+    },
+    FlagRule {
+        flags: &["--encryption-key"],
+        allowed: NOT_SPLIT,
+        instead: "use --config/--node against a config file whose own node entries carry an encryption_key_path (ADR 0069)",
+    },
+    FlagRule {
+        flags: &["--advertise-host"],
+        allowed: NOT_SPLIT,
+        instead: USE_CONFIG_OR_CLUSTER,
+    },
+    FlagRule {
+        flags: &[
+            "--throttle-read-units",
+            "--throttle-write-units",
+            "--tablet-max-read-units",
+            "--tablet-max-write-units",
+        ],
+        allowed: NOT_SPLIT,
+        instead: USE_CONFIG_OR_CLUSTER,
+    },
+    FlagRule {
+        flags: &[
+            "--stream-seal-bytes",
+            "--stream-seal-age",
+            "--stream-retention",
+        ],
+        allowed: NOT_SPLIT,
+        instead: USE_CONFIG_OR_CLUSTER,
+    },
+    FlagRule {
+        flags: &[
+            "--segment-store",
+            "--backup-store",
+            "--s3-credentials",
+            "--allow-insecure-s3",
+        ],
+        allowed: NOT_SPLIT,
+        instead: USE_CONFIG_OR_CLUSTER,
+    },
+    FlagRule {
+        flags: &["--export-s3-endpoint", "--export-s3-region"],
+        allowed: NOT_SPLIT,
+        instead: USE_CONFIG_OR_CLUSTER,
+    },
+];
+
+/// Step (b) of the error order: reject the first flag group on the command
+/// line that the derived mode does not honour, from [`FLAG_RULES`].
+fn check_flags_for_mode(mode: &Mode, seen: &BTreeSet<&str>) -> Result<(), String> {
+    let kind = mode.kind();
+    for rule in FLAG_RULES.iter().filter(|r| !r.allowed.contains(&kind)) {
+        let given: Vec<&str> = rule
+            .flags
+            .iter()
+            .copied()
+            .filter(|f| seen.contains(f))
+            .collect();
+        if given.is_empty() {
+            continue;
+        }
+        let verb = if rule.allowed == CONFIG_ONLY {
+            "only supported with --config/--node".to_string()
+        } else {
+            format!("not supported with {}", kind.describe())
+        };
+        return Err(format!(
+            "{} {} {verb} ({})",
+            given.join("/"),
+            if given.len() == 1 { "is" } else { "are" },
+            rule.instead,
+        ));
+    }
+    Ok(())
 }
 
 /// **Default ON** at [`DEFAULT_QUIESCE_AFTER_SECS`] when `--quiesce-after` is
@@ -3616,6 +3746,243 @@ fn orphan_sweep_after_duration(secs: Option<u64>) -> Duration {
 mod tests {
     use super::*;
 
+    // --- run mode + flag table (issue #1422) ------------------------------
+
+    /// What `run()` does between argument parsing and any file load: derive
+    /// the mode, then check the flags against it. Values are taken from the
+    /// mode flags only; every `--flag` token is recorded as seen.
+    fn mode_check(args: &[&str]) -> Result<Mode, String> {
+        let val = |name: &str| -> Option<String> {
+            args.iter()
+                .position(|a| *a == name)
+                .and_then(|i| args.get(i + 1))
+                .map(|v| (*v).to_string())
+        };
+        let num = |name: &str| val(name).map(|v| v.parse::<usize>().unwrap());
+        let mode = derive_mode(
+            val("--config"),
+            num("--node"),
+            num("--cluster"),
+            num("--cluster-control"),
+            num("--cluster-data"),
+        )?;
+        let seen: BTreeSet<&str> = args
+            .iter()
+            .copied()
+            .filter(|a| a.starts_with("--"))
+            .collect();
+        check_flags_for_mode(&mode, &seen)?;
+        Ok(mode)
+    }
+
+    #[test]
+    fn run_mode_is_derived_from_the_mode_flags() {
+        assert_eq!(
+            mode_check(&["--config", "c.json", "--node", "1"]).unwrap(),
+            Mode::Config {
+                path: "c.json".into(),
+                node: Some(1)
+            }
+        );
+        assert_eq!(mode_check(&["--cluster", "3"]).unwrap(), Mode::Cluster(3));
+        assert_eq!(
+            mode_check(&["--cluster-control", "1", "--cluster-data", "2"]).unwrap(),
+            Mode::Split {
+                control: 1,
+                data: 2
+            }
+        );
+        assert_eq!(mode_check(&["--ephemeral"]).unwrap(), Mode::Idle);
+    }
+
+    #[test]
+    fn mode_conflicts_are_reported_before_flags_that_do_not_fit_the_mode() {
+        // The issue's case: the real conflict, not the `--cores` error.
+        let err =
+            mode_check(&["--cluster", "3", "--cluster-control", "1", "--cores", "4"]).unwrap_err();
+        assert!(err.contains("use either --config, --cluster, or"), "{err}");
+        let err = mode_check(&[
+            "--config",
+            "c.json",
+            "--node",
+            "0",
+            "--cluster",
+            "3",
+            "--cores",
+            "4",
+        ])
+        .unwrap_err();
+        assert_eq!(err, "use either --config or --cluster, not both");
+        // A split-mode conflict beats a newly rejected split flag too.
+        let err = mode_check(&[
+            "--config",
+            "c.json",
+            "--cluster-data",
+            "2",
+            "--segment-store",
+            "x",
+        ])
+        .unwrap_err();
+        assert!(err.contains("not both"), "{err}");
+        // An incomplete split pair is a mode error, ahead of the flag check.
+        let err = mode_check(&["--cluster-data", "2", "--tls-cert", "c"]).unwrap_err();
+        assert_eq!(err, "--cluster-data also needs --cluster-control N");
+        let err = mode_check(&["--cluster-control", "2", "--advertise-host", "h"]).unwrap_err();
+        assert_eq!(err, "--cluster-control also needs --cluster-data M");
+    }
+
+    #[test]
+    fn config_only_flags_are_rejected_outside_config_mode() {
+        for flag in [
+            "--max-region-rtt-ms",
+            "--lag-stretch-max",
+            "--campaign-max-inflight",
+            "--node-weight",
+            "--node-max-replicas",
+            "--cores",
+            "--awake-max-per-core",
+            "--bg-snapshot-streams",
+            "--bg-catchup-learners",
+            "--bg-splits",
+            "--bg-compactions",
+            "--compaction-io-bytes-per-sec",
+            "--memtable-budget-bytes",
+            "--repair-proposals-per-tick",
+            "--repair-inflight-max",
+            "--host-unsettled-max",
+            "--host-settle-timeout-ms",
+            "--region",
+            "--peer",
+            "--allow-insecure-peers",
+            "--mrec-max-clock-skew-ms",
+            "--tls-cert",
+            "--max-connections",
+            "--queued-bytes-budget",
+            "--label",
+            "--labels-file",
+        ] {
+            for shape in [
+                &["--cluster", "3"][..],
+                &["--cluster-control", "1", "--cluster-data", "2"][..],
+                &[][..],
+            ] {
+                let mut args = shape.to_vec();
+                args.extend([flag, "1"]);
+                let err = mode_check(&args).unwrap_err();
+                assert!(err.contains(flag), "{flag} {shape:?}: {err}");
+                assert!(err.contains("only supported with --config/--node"), "{err}");
+            }
+            let ok = mode_check(&["--config", "c.json", "--node", "0", flag, "1"]);
+            assert!(ok.is_ok(), "{flag} is allowed with --config: {ok:?}");
+        }
+    }
+
+    #[test]
+    fn flags_the_split_dev_path_ignored_are_now_hard_errors() {
+        for flag in [
+            "--label",
+            "--labels-file",
+            "--labels-file-annotations",
+            "--labels-wait-secs",
+            "--advertise-host",
+            "--throttle-read-units",
+            "--throttle-write-units",
+            "--tablet-max-read-units",
+            "--tablet-max-write-units",
+            "--export-s3-endpoint",
+            "--export-s3-region",
+            "--segment-store",
+            "--backup-store",
+            "--s3-credentials",
+            "--allow-insecure-s3",
+            "--stream-seal-bytes",
+            "--stream-seal-age",
+            "--stream-retention",
+            "--encryption-key",
+            "--tls-key",
+            "--max-inflight",
+        ] {
+            let err = mode_check(&["--cluster-control", "1", "--cluster-data", "2", flag, "x"])
+                .unwrap_err();
+            assert!(err.contains(flag), "{flag}: {err}");
+            assert!(
+                err.contains("--config/--node"),
+                "{flag} names where it is supported: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn flags_the_split_dev_path_honours_stay_allowed() {
+        let ok = mode_check(&[
+            "--cluster-control",
+            "1",
+            "--cluster-data",
+            "2",
+            "--dir",
+            "d",
+            "--ip",
+            "127.0.0.1",
+            "--ephemeral",
+            "--auto-split-bytes",
+            "1",
+            "--auto-split-change-rate",
+            "1",
+            "--auto-split-ops-rate",
+            "1",
+            "--orphan-sweep-after",
+            "1",
+            "--quiesce-after",
+            "1",
+            "--heartbeat-batch",
+            "--no-shared-wal",
+            "--dynamo-auth",
+            "a.json",
+        ]);
+        assert_eq!(
+            ok.unwrap(),
+            Mode::Split {
+                control: 1,
+                data: 2
+            }
+        );
+    }
+
+    #[test]
+    fn flags_that_cluster_and_config_honour_stay_allowed() {
+        for shape in [
+            &["--cluster", "3"][..],
+            &["--config", "c.json", "--node", "0"][..],
+        ] {
+            let mut args = shape.to_vec();
+            args.extend([
+                "--advertise-host",
+                "h",
+                "--throttle-read-units",
+                "1",
+                "--segment-store",
+                "x",
+                "--backup-store",
+                "y",
+                "--stream-retention",
+                "1",
+                "--encryption-key",
+                "k",
+                "--export-s3-region",
+                "r",
+            ]);
+            assert!(mode_check(&args).is_ok(), "{shape:?}");
+        }
+    }
+
+    #[test]
+    fn cluster_mode_still_rejects_tls_overload_and_labels() {
+        for flag in ["--tls-cert", "--max-connections", "--label"] {
+            let err = mode_check(&["--cluster", "3", flag, "x"]).unwrap_err();
+            assert!(err.contains(flag), "{err}");
+        }
+    }
+
     #[test]
     fn queued_bytes_budget_flag_builds_a_section_and_conflicts_with_the_file() {
         assert!(resolve_overload_flags(None, None, None).unwrap().is_none());
@@ -4888,6 +5255,6 @@ mod tests {
         .await
         .expect_err("--encryption-key must still be rejected on this dev-only path");
         assert!(err.contains("--encryption-key"), "{err}");
-        assert!(err.contains("not yet supported"), "{err}");
+        assert!(err.contains("not supported"), "{err}");
     }
 }

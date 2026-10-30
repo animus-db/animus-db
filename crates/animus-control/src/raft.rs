@@ -422,6 +422,14 @@ pub struct CampaignStats {
     pub pv_refused_lease: u64,
     /// Refused: the candidate's term is behind, or its log is.
     pub pv_refused_term_or_log: u64,
+    /// Refused: this node's boot-time cluster check is pending or resolved to
+    /// refused (ADR 0009's 2026-10-29 amendment), the same gate as a real vote.
+    pub pv_refused_unchecked: u64,
+    /// Higher-term real `RequestVote`s ignored because this node was a leader
+    /// holding its lease (ADR 0009's 2026-10-29 amendment).
+    pub rv_ignored_lease: u64,
+    /// Real candidacies conceded by granting a pre-vote for a later term.
+    pub candidacies_conceded: u64,
     /// Real elections started (term bumps).
     pub elections_started: u64,
     /// Sum, over dropped-by-hold grants, of nanoseconds since that round began.
@@ -1355,6 +1363,12 @@ pub struct RaftCore<C = MetaCommand, S = Metadata> {
     // health`). Consensus continues to consult `leader_id`/`election_
     // deadline` exclusively, unchanged.
     last_leader_contact: Option<(NodeId, Nanos)>,
+    // ADR 0009 (2026-10-29 amendment): leader-lease grace. A leader's lease
+    // (`leader_lease`) normally needs a quorum of voters heard from within the
+    // stretched election base; after a stint begins or a quiesced leader wakes
+    // (its `last_contact` is stale by construction -- nobody acked while it was
+    // silent) the lease is held until this instant instead. Volatile, leader-only.
+    lease_grace_until: Nanos,
     // Issue #1228: sticky companion of `last_leader_contact` -- `true` once this
     // process has ever had a genuine leader contact (an `AppendEntries`/
     // `InstallSnapshot` from a leader, or its own election win). Unlike
@@ -1909,6 +1923,7 @@ where
             durable_index: 0,
             leader_id: None,
             last_leader_contact: None,
+            lease_grace_until: Nanos(0),
             had_leader_contact: false,
             pre_votes: BTreeSet::new(),
             votes: BTreeSet::new(),
@@ -3216,6 +3231,9 @@ where
         // clears (an aborted or completed transfer shouldn't let a leader that
         // was mid-handoff moments ago quiesce immediately on its very next
         // tick).
+        if self.quiesced {
+            self.arm_lease_grace(now);
+        }
         self.quiesced = false;
         self.last_activity = now;
         true
@@ -3682,6 +3700,37 @@ where
         entropy: u64,
     ) -> Vec<Out<C>> {
         self.now_hint = now;
+        // ADR 0009 (2026-10-29 amendment): a leader holding its lease ignores a
+        // higher-term real `RequestVote` outright -- no term adoption, no
+        // step-down, no reply -- exactly like etcd's `inLease` (Raft thesis
+        // 4.2.3, "disruptive servers"). Pre-vote only guards the pre-vote
+        // phase: a starved follower holding a stale grant still sends a real
+        // vote. The one bypass is the leader's own transfer target (it asked
+        // for this election), recognised from local state so the wire stays
+        // unchanged. Evaluated before the quiescence wake below, which would
+        // otherwise age the lease.
+        if let RaftMsg::RequestVote {
+            term,
+            ref candidate,
+            ..
+        } = msg
+            && term > self.current_term
+            && self.leader_lease(now)
+            && self.transfer_target.as_ref() != Some(candidate)
+        {
+            self.campaign_stats.rv_ignored_lease += 1;
+            // The candidate's self-vote is durable evidence either way
+            // (`handle_request_vote`'s `heard_from` rule); a removed node still
+            // learns it is gone.
+            self.heard_from.insert(candidate.clone());
+            let out: Vec<Out<C>> = self.stranger_notice(candidate).into_iter().collect();
+            if self.quiesced {
+                self.quiesced = false;
+                self.last_activity = now;
+                self.arm_lease_grace(now);
+            }
+            return out;
+        }
         // Any message from a higher term forces us to step down first — **except**
         // pre-vote traffic, which by design never changes a node's term (a pre-vote
         // carries only a *prospective* term). Bypassing the step-down here is what
@@ -3794,6 +3843,7 @@ where
             if !out.is_empty() {
                 self.quiesced = false;
                 self.last_activity = now;
+                self.arm_lease_grace(now);
             }
             return out;
         }
@@ -3865,6 +3915,7 @@ where
         if self.quiesced {
             self.quiesced = false;
             self.last_activity = now;
+            self.arm_lease_grace(now);
         }
         match msg {
             RaftMsg::PreVote {
@@ -4548,6 +4599,70 @@ where
     /// until_deadline`, `prevote_rejected_by_a_candidate_within_its_own_
     /// election_deadline`, and the pre-existing `election_still_succeeds_
     /// when_leader_is_gone` (which the role-less draft above broke).
+    /// Re-arm the leader-lease grace window (see `lease_grace_until`): called
+    /// whenever a leader leaves quiescence, since its per-peer `last_contact`
+    /// is stale by construction (nobody acked while it was silent).
+    fn arm_lease_grace(&mut self, now: Nanos) {
+        if self.role == Role::Leader {
+            self.lease_grace_until = Nanos(now.0.saturating_add(self.stretched_base()));
+        }
+    }
+
+    /// Whether this node is a leader that may still **hold its lease**
+    /// (ADR 0009's 2026-10-29 amendment; Raft thesis 4.2.3, etcd `inLease` plus
+    /// check-quorum). A healthy leader ignores a higher-term `RequestVote`
+    /// rather than stepping down for it, so a starved candidate holding a stale
+    /// pre-vote grant cannot depose it. The lease is only valid while the leader
+    /// has heard from a quorum of voters within the stretched election base
+    /// (itself counting as one), or is quiesced (it sends and hears nothing by
+    /// design), or is inside the post-election / post-wake grace window. A
+    /// leader cut off from its quorum therefore stops claiming the lease within
+    /// an election timeout and behaves as before (steps down on a higher term,
+    /// grants pre-votes). Deliberately **not** an active step-down: a CPU-starved
+    /// leader's acks can sit in its own queue past the window, and deposing
+    /// itself for that would be the very churn the lease prevents.
+    ///
+    /// Deterministic: a pure function of `now` and the per-peer `last_contact`.
+    #[must_use]
+    pub fn leader_lease(&self, now: Nanos) -> bool {
+        if self.role != Role::Leader {
+            return false;
+        }
+        if self.quiesced || now.0 < self.lease_grace_until.0 {
+            return true;
+        }
+        let window = self.stretched_base();
+        let recent = self
+            .peers
+            .iter()
+            .filter(|p| {
+                self.last_contact
+                    .get(*p)
+                    .is_some_and(|at| now.0.saturating_sub(at.0) <= window)
+            })
+            .count()
+            + usize::from(self.is_voter());
+        recent >= self.majority()
+    }
+
+    /// The "a live leader exists" half of the pre-vote refusal: this node is
+    /// the leader, or a follower that heard a leader within its election
+    /// deadline (the real-vote analogue for a leader is
+    /// [`leader_lease`](Self::leader_lease), which additionally requires a
+    /// quorum of recent contact).
+    fn live_leader(&self, now: Nanos) -> bool {
+        match self.role {
+            // A leader always refuses a pre-vote, lease or not (the long-standing
+            // rule): a pre-vote costs nothing to refuse, while granting one on a
+            // lapsed lease let a CPU-starved leader (whose acks sat in its own
+            // queue past the window) be waved off by its followers. The check-quorum
+            // lease only gates the *real* vote, where it decides between ignoring
+            // and the plain-Raft step-down.
+            Role::Leader => true,
+            _ => self.leader_id.is_some() && now.0 < self.election_deadline.0,
+        }
+    }
+
     fn handle_pre_vote(
         &mut self,
         candidate: NodeId,
@@ -4564,9 +4679,8 @@ where
             && self.voted_for.is_some()
             && now.0 < self.election_deadline.0
             && !self.vote_lease_lapsed;
-        let has_live_leader = self.role == Role::Leader
-            || (self.leader_id.is_some() && now.0 < self.election_deadline.0)
-            || voted_lease;
+        let live_leader = self.live_leader(now);
+        let has_live_leader = live_leader || voted_lease;
         let log_ok = last_log_term > self.last_log_term()
             || (last_log_term == self.last_log_term() && last_log_index >= self.last_log_index());
         // Issue #1019 (2026-09-21 amendment to ADR 0058 Train 1): the
@@ -4599,15 +4713,45 @@ where
         // all when `!is_voter()`. A stray/injected `PreVote` reaching a
         // learner can therefore still be granted here without any safety
         // consequence — it simply won't count toward anyone's majority.
-        let granted = !has_live_leader && term >= self.current_term && log_ok;
+        // ADR 0009 (2026-10-29 amendment, refined for genesis): the gate of the real vote
+        // (issue #667), relaxed for a Pending node facing an empty-log candidate. A wiped voter's forgotten `voted_for` and empty log make
+        // it look like a willing, up-to-date-enough granter; a pre-vote majority
+        // it helps form sends a live follower into a real higher-term election.
+        // A `Refused` node always refuses. A `Pending` node (every freshly
+        // hosted replica starts so) refuses only when the candidate's log
+        // proves the cluster is already established (non-empty log): in
+        // genesis every log is empty, so pre-votes must flow or the first
+        // election is delayed by a full election timeout.
+        let cluster_checked = match self.cluster_check {
+            ClusterCheck::Idle => true,
+            ClusterCheck::Refused => false,
+            ClusterCheck::Pending { .. } => last_log_index == 0 && last_log_term == 0,
+        };
+        let granted = !has_live_leader && term >= self.current_term && log_ok && cluster_checked;
+        if granted && self.role == Role::Candidate {
+            // ADR 0009 (2026-10-29 amendment): granting a pre-vote for a later
+            // term while our own real candidacy is still unresolved (its
+            // deadline lapsed but the vote responses, or our own tick, are
+            // still queued) concedes that candidacy. Otherwise the candidacy
+            // can still win a moment later, and the node it just waved
+            // through is already on its way to a higher term: a leader
+            // elected into an election its own grant already lost. The
+            // candidate keeps its term and its `voted_for` (vote safety), and
+            // its lapsed deadline restarts it through the pre-vote path on the
+            // next tick exactly as before; late `RequestVoteResp`s no longer
+            // count (`handle_vote_resp` gates on the role).
+            self.role = Role::Follower;
+            self.votes.clear();
+            self.campaign_stats.candidacies_conceded += 1;
+        }
         if granted {
             self.campaign_stats.pv_granted += 1;
-        } else if self.role == Role::Leader
-            || (self.leader_id.is_some() && now.0 < self.election_deadline.0)
-        {
+        } else if live_leader {
             self.campaign_stats.pv_refused_leader += 1;
         } else if voted_lease {
             self.campaign_stats.pv_refused_lease += 1;
+        } else if !cluster_checked {
+            self.campaign_stats.pv_refused_unchecked += 1;
         } else {
             self.campaign_stats.pv_refused_term_or_log += 1;
         }
@@ -6274,6 +6418,9 @@ where
     /// and harmless if this node isn't even quiesced.
     pub fn note_local_activity(&mut self, now: Nanos) {
         self.last_activity = now;
+        if self.quiesced {
+            self.arm_lease_grace(now);
+        }
         self.quiesced = false;
     }
 

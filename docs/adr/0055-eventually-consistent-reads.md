@@ -410,3 +410,18 @@ unaffected, the two invariants this ADR is responsible for:
   `stale_read_ready()` freshness gate share no code path, and this ADR's
   own `quiesced_eventual_read.rs` regression (`animus-cp-data/tests/`)
   still passes unmodified.
+
+## Amendment (2026-10-30, issues #1419 and #1424 — a failed eventual scan is an error, never an empty page)
+
+`stale_scan`/`stale_scan_rev` and the kind scans an eventual `Query`/`Scan`
+use now **propagate the engine's scan error** instead of reading it as an empty
+range: to a DynamoDB client an empty page is a fabricated deletion, not
+staleness. On the local path the error is a retryable `"; retry"` error
+(wire: 503 `ServiceUnavailable`); on a forwarded eventual read the serving
+replica refuses, and the forwarder falls back to the linearizable path as for
+any other "not served cheaply" refusal. The linearizable scans return `None`
+(retry) on a scan error rather than `Some(empty)`. The three forwarded
+eventual arms share one skeleton (`serve_stale_read`); the leader arms are
+deliberately separate. `Disk::read_at` of a missing file is now an
+`ErrorKind::NotFound` error in both `ProdEnv` and `SimEnv`, so a vanished
+SSTable names its cause instead of surfacing as a "short sstable block read".

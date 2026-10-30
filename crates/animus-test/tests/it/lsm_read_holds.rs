@@ -142,9 +142,11 @@ impl Cluster {
 }
 
 fn seeds(tag: &str) -> Vec<u64> {
-    (0..corpus::seeds_from_env("ANIMUS_LSM_HOLD_SEEDS").max(3))
-        .map(|k| corpus::name_seed(&format!("lsm_read_holds_{tag}_{k}")))
-        .collect()
+    corpus::shard_retain(
+        (0..corpus::seeds_from_env("ANIMUS_LSM_HOLD_SEEDS").max(3))
+            .map(|k| corpus::name_seed(&format!("lsm_read_holds_{tag}_{k}")))
+            .collect(),
+    )
 }
 
 /// Write `hot = "v1"`, take its timestamp, churn for `churn_ms` of HLC time,

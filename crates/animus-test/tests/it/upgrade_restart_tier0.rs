@@ -479,7 +479,8 @@ fn lsm_wal_negative_controls_are_caught() {
 /// that the real `decode_manifest` accepts the fixture and recovery then acts
 /// on its table list: the first thing `open` does after decoding is read the
 /// first table's index region (`sst-000001`, absent), so the error must be the
-/// sstable-index read failing and never a manifest/format error. (The sstable's own tier-0 test below opens a full engine.)
+/// read of that table failing (`read_at` reports the missing file as
+/// `NotFound` since #1419) and never a manifest/format error. (The sstable's own tier-0 test below opens a full engine.)
 fn lsm_manifest_run(seed: u64, bytes: &[u8]) -> Result<(), StorageError> {
     let sc = Scenario::new(seed);
     sc.seed_file("MANIFEST", bytes);
@@ -502,9 +503,9 @@ fn lsm_manifest_fixture_decodes_and_recovery_proceeds_to_its_tables() {
                 .expect_err("the manifest's tables do not exist, so open must stop there");
             let msg = err.to_string();
             assert!(
-                matches!(err, StorageError::Backend(_)) && msg.contains("sstable index"),
+                matches!(err, StorageError::Backend(_)) && msg.contains("sst-000001"),
                 "seed={seed}: expected the open to get past the manifest decode and fail \
-                 reading the first table's index, got: {msg}"
+                 reading the first table (sst-000001), got: {msg}"
             );
         });
     }

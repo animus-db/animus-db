@@ -1974,6 +1974,26 @@ Real-TCP regression: `tests/overload.rs`.
 
 ## CLI reference
 
+**Run-mode validation order (issue #1422).** `run()` derives a `Mode`
+(`Config`/`Cluster`/`Split`/`Idle`) once after argument parsing, then errors
+in this order: (a) mode conflicts (`--config` vs `--cluster` vs
+`--cluster-control/--cluster-data`, an unpaired split flag), (b) flags that
+do not fit the mode, from the single `FLAG_RULES` table (flag spellings and
+the modes they are allowed in), (c) only then file loads
+(`--dynamo-auth`, S3 credentials, the config file). So `--cluster 3
+--cluster-control 1 --cores 4` reports the conflict, not `--cores`. In
+`--cluster-control/--cluster-data` mode the flags that path never honoured
+are hard errors, not silent gaps: `--label*`, `--advertise-host`, the four
+throttle flags, `--stream-seal-*`/`--stream-retention`, `--segment-store`,
+`--backup-store`, `--s3-credentials`, `--allow-insecure-s3`,
+`--export-s3-*`, plus the already-rejected `--tls-*`, `--max-connections`/
+`--max-inflight`/`--queued-bytes-budget`, `--encryption-key` and the
+config-only knobs. Honoured there: `--dir`, `--ip`, `--ephemeral`,
+`--auto-split-*`, `--orphan-sweep-after`, `--quiesce-after`, the
+heartbeat/shared-wal toggles, `--dynamo-auth`. A new flag goes in the table
+(its `seen_flags` spelling is recorded in the parse loop), with a test in
+`main.rs`'s `mode_check` group.
+
 `main.rs --help` (or the `gen-config`/`join`/`control`/`data` subcommand
 help) prints the full invocation reference (durable LSM backend by
 default; `--ephemeral` selects the volatile memory engine). Notes not
@@ -2006,10 +2026,10 @@ loopback. Reaches `run` (`--config`/`--node` and `--cluster N`),
 `run_control`, and — since issue #676 — `join` and `data --seed` too (the
 two real growth paths, threaded through `run_node_join_with_settings`/
 `run_node_data_join_with_settings`). **`--cluster-control`/`--cluster-data`
-and `data --config` remain a documented gap**: the former's
-`start_split_cluster_with_growth` hardcodes the default `Cluster` store for
-every data-role node it stands up (no CLI route at all on that dev-only
-path), and the latter has no `cluster_settings`-shaped route to either
+hard-errors on both flags (issue #1422; `start_split_cluster_with_growth`
+hardcodes the default `Cluster` store for every data-role node it stands up,
+so they used to be silently ignored), and `data --config` remains a
+documented gap**: it has no `cluster_settings`-shaped route to either
 store the way it does for `quiesce_after_secs`/`heartbeat_batch`/
 `shared_wal`.
 
@@ -8292,12 +8312,19 @@ default to a test-sized interval), restart/durability across every
 deployment shape, and the `WatchMetadata`/system-table/OTel/metrics support
 surfaces.
 `support/mod.rs` holds the shared bring-up helpers — `bring_up_deadline`/
-`bring_up_deadline_tls`/`start_single_node` bind-and-hold every node's
+`bring_up_deadline_with` (a `&mut ClusterConfig` hook: `dynamo_auth`,
+`cluster_settings`)/`bring_up_deadline_with_start` (also a per-node start hook,
+paired with `animusd::run_bound_node_with_*`, for non-default start knobs such
+as a pinned `orphan_sweep_after` or throttle defaults)/`bring_up_deadline_labeled`
+(per-node labels, which are consumed at bind time so a config hook cannot set
+them)/`bring_up_deadline_tls`/`start_single_node` bind-and-hold every node's
 listeners before starting any of them (issue #627, no port-TOCTOU, no
 retry loop; see this file's own "Every in-crate bring-up retries the
 port-TOCTOU race" entry above and `docs/lessons/testing/2026-09-20-
 allocate-test-ports-by-binding-and-holding-never-probe-and-release.md`),
-while `free_addrs`'s own probe-then-release allocator survives only for
+while converting a hand-rolled `bring_up` copy must keep any readiness gate
+the copy carried (`docs/lessons/testing/2026-10-30-converting-a-bring-up-copy-
+keep-its-readiness-gate.md`; #1421), and `free_addrs`'s own probe-then-release allocator survives only for
 the callers that need a not-yet-bound address ahead of a **joiner or
 growth** path binding it itself (`grow_deadline`, the four `join_*_
 deadline` helpers, `bring_up_split`) — plus split-cluster bring-up,
@@ -12809,3 +12836,28 @@ before healing; see
 - `txn_resolver_decided_pass` is paged (`TXN_DECIDED_BATCH`/`TXN_REAP_BATCH` = 128, per-tablet `decided_cursor`). Gate open: verify (`txn_participants_clear`), `txn_settle` the clear batch, grace-delayed resolve then re-verify for the rest, then the reaper (`settled_reapable` + `txn_reap`). Gate closed: the old resolve-and-keep path.
 - The reap age (`TXN_SETTLED_REAP_AGE`) is tied to `TXN_IDEMPOTENCY_TTL_SECS + 2 * CLIENT_TIMEOUT` by a compile-time assertion in `dynamo.rs`; the safety argument is in ADR 0018's 2026-10-27 amendment.
 - `/admin/txns?limit=` (default 200, max 5000) plus `*_total` fields; `sim_cluster_txn_settled.rs` is the regression (seeded, restart, negative control); a restarted `SimCluster` group never re-quiesces, so it asserts the tracker, not quiescence (`docs/lessons/testing/2026-10-27-...`). Mixed-version cell `release9_to_release10_txn_settle_gate`.
+
+## Corpus-oracle gotchas from issue #1271 (2026-10-30)
+
+- `sim_cluster_mixed_version_corpus` negative controls assert "the old replica never
+  appended the bad entry" as `last_log_index(OLD) < ProposeResult::Accepted.index`
+  (`old_appended_bad_entry`), never a before/after length delta (an unrelated entry
+  can land between), and move leadership with `move_leadership_off_old` (retried,
+  bounded). Positive cells that compare `post_log != pre_log` over a refused relay
+  are the same hazard if they ever flake.
+- `sim_world_mrec_corpus`: a plan with `conflict_round` ends with one round where
+  every region writes `k0` before anything ships, so `mrec_negative_lww_by_arrival`
+  has a conflicting pair on every seed.
+- `sim_cluster_mrsc` `revert_*`: with a KEPT-Region node down the removed replicas
+  deliberately keep their voter seats and may still lead
+  (`RaftKvNode::reconfigure_step` steps 5/6 need every desired member caught up),
+  so those cells check the metadata revert and availability, not full convergence,
+  until the node returns (`revert_kept_region_node_kill` pins this). `SimCluster`
+  drops not-leader hints (addresses have no `:port`, issue #1431), so a client on a
+  non-hosting node cannot reach such a leader in the sim.
+
+- **Eventual reads (issues #1419/#1424):** the three forwarded `stale: true`
+  arms share `ClientCtx::serve_stale_read` (`forwarding.rs`); a read that serves
+  nothing refunds its pre-charge (`throttle_refund_read`), locally too; a failed
+  scan is a `"; retry"` error, never an empty page. Pinned by
+  `sim_cluster_eventual_reads`.

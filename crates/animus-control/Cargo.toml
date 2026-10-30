@@ -81,3 +81,8 @@ required-features = ["prod-heavy"]
 name = "control_membership_prod"
 path = "tests/control_membership_prod.rs"
 required-features = ["prod-heavy"]
+
+[[test]]
+name = "probe_free_space_prod"
+path = "tests/probe_free_space_prod.rs"
+required-features = ["prod-heavy"]
