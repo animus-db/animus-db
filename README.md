@@ -71,6 +71,7 @@ leaderless AP plane, which is deferred and its code deleted.
 | `animus-test` | Elle-style consistency checker + fault-injecting corpora for the CP data plane (raftkv, cross-tablet txn, streams, backfill) |
 | `animus-node` | The `Env`-generic node core: routing, forwarding, the wire surface, background loops, transaction coordination — carved out of `animusd` so it needs no real clock/socket/`tokio` (ADR 0061) |
 | `animusd` | Node server: assembles the control plane + CP data plane + wire edges (DynamoDB, admin, console) over `ProdEnv` (runnable `--cluster` mode) |
+| `animus-web` | The browser build: a wasm-bindgen shell over `animusd`'s `embedded` cluster (the deterministic simulator on a virtual clock) that powers the website's [live demo](website/demo.html) (ADR 0082) |
 | `animus-cli` | Operator/client CLI (`status` / `put` / `get`) |
 | `animus-operator` | Kubernetes operator (`kube-rs`) reconciling the `AnimusCluster` custom resource into a running per-process AnimusDB deployment |
 

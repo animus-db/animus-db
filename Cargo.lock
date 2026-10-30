@@ -322,6 +322,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "animus-web"
+version = "0.1.0-alpha.0"
+dependencies = [
+ "animusd",
+ "js-sys",
+ "serde",
+ "serde_json",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "animusd"
 version = "0.1.0-alpha.0"
 dependencies = [
