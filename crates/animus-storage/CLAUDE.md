@@ -990,3 +990,5 @@ puts): compaction input bytes per ingested byte 7.1 at the fixed 64 KiB, 1.35 wi
 7.1 with 4096 other active engines (the negative control). `animusd --memtable-budget-bytes N`
 (`cluster_settings.memtable_budget_bytes`, 0 = off) sets it via `BackgroundBudget::flush_budget()`.
 
+
+- Write-stall controls over the wire (`animusd` `sim_cluster_lsm_stall`) cannot see L0: L0 growth per burst round is seed-dependent, so the OldGate control loops rounds (bounded) until the sim panics instead of a fixed count (#1271; `docs/lessons/testing/2026-10-30-wire-level-negative-control-must-loop-until-its-trigger-fires.md`).
