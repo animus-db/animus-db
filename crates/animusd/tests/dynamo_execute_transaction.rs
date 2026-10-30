@@ -24,7 +24,7 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use animusd::{ClusterConfig, Node, RoleAddrs};
+use animusd::{ClusterConfig, Node};
 use serde_json::Value;
 use tokio::time::sleep;
 
@@ -35,52 +35,9 @@ use support::dynamo;
 // Shared bring-up + protocol helpers (mirrors dynamo_txn_cancellation.rs).
 // ---------------------------------------------------------------------------
 
+/// Thin wrapper over `support::bring_up_deadline` (bind-and-hold, no retry loop; issue #1421).
 async fn bring_up(n: usize, dir: &std::path::Path) -> (Vec<Node>, ClusterConfig) {
-    for attempt in 0..16 {
-        let addrs = support::free_addrs(n * 6);
-        let nodes_cfg: Vec<RoleAddrs> = (0..n)
-            .map(|i| RoleAddrs {
-                id: animusd::config::node_id(i),
-                role: animusd::config::NodeRole::Both,
-                internal: addrs[6 * i],
-                client: addrs[6 * i + 1],
-                dynamo: addrs[6 * i + 2],
-                admin: addrs[6 * i + 3],
-                intra: addrs[6 * i + 4],
-                console: addrs[6 * i + 5],
-                advertise_host: None,
-                tls: None,
-                encryption_key_path: None,
-                labels: Default::default(),
-                overload: None,
-            })
-            .collect();
-        let config = ClusterConfig {
-            version: animusd::config::CLUSTER_CONFIG_VERSION,
-            nodes: nodes_cfg,
-            dynamo_auth: None,
-            cluster_settings: None,
-        };
-        let mut nodes = Vec::new();
-        let mut failed = false;
-        for i in 0..n {
-            match animusd::run_node(&config, i, dir.join(format!("node-{attempt}-{i}"))).await {
-                Ok(node) => nodes.push(node),
-                Err(_) => {
-                    failed = true;
-                    break;
-                }
-            }
-        }
-        if !failed {
-            return (nodes, config);
-        }
-        for node in &nodes {
-            node.shutdown_graceful().await;
-        }
-        sleep(Duration::from_millis(50)).await;
-    }
-    panic!("could not bring up cluster after retries (ports kept getting stolen)");
+    support::bring_up_deadline(n, dir, support::JOIN_DEADLINE).await
 }
 
 /// `dynamo`, retried on a transient `500` — the identical helper every
