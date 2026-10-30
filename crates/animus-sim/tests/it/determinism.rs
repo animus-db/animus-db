@@ -413,3 +413,47 @@ fn seed_from_env(default: u64) -> u64 {
         Err(_) => default,
     }
 }
+
+/// `Simulator::set_trace_cap` bounds only what is *retained*: the capped run
+/// executes identically (same final time, same last events), the default stays
+/// unbounded, and `Some(0)` records nothing.
+#[test]
+fn trace_cap_bounds_retention_without_changing_execution() {
+    let run = |cap: Option<Option<usize>>| {
+        let mut sim = Simulator::new(7);
+        if let Some(c) = cap {
+            sim.set_trace_cap(c);
+        }
+        build_ring(&sim);
+        sim.run_for(Duration::from_millis(50));
+        (sim.now(), sim.trace_lines())
+    };
+
+    let (now_full, full) = run(None);
+    assert!(
+        full.len() > 8,
+        "the ring must trace more than the cap under test ({} events)",
+        full.len()
+    );
+
+    let (now_capped, capped) = run(Some(Some(5)));
+    assert_eq!(now_capped, now_full, "a cap must not change execution");
+    assert_eq!(
+        capped,
+        full[full.len() - 5..],
+        "a cap keeps exactly the most recent events"
+    );
+
+    let (now_off, off) = run(Some(Some(0)));
+    assert_eq!(
+        now_off, now_full,
+        "turning the trace off must not change execution"
+    );
+    assert!(off.is_empty(), "Some(0) records nothing");
+
+    let (_, explicit_unbounded) = run(Some(None));
+    assert_eq!(
+        explicit_unbounded, full,
+        "None restores the unbounded default"
+    );
+}
