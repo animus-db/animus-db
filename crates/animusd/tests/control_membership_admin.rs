@@ -146,54 +146,10 @@ fn voters_of(body: &serde_json::Value) -> Option<Vec<animus_env::NodeId>> {
     })
 }
 
-/// Bring up an `n`-node **combined-mode** core, one process per node — the
-/// same shape `tests/decommission.rs::bring_up` uses.
+/// Bring up an `n`-node cluster via `support::bring_up_deadline` (bind-and-hold,
+/// no retry loop; issue #1421).
 async fn bring_up_combined(n: usize, dir: &Path) -> (Vec<Node>, ClusterConfig) {
-    for attempt in 0..16 {
-        let addrs = support::free_addrs(n * 6);
-        let nodes_cfg: Vec<RoleAddrs> = (0..n)
-            .map(|i| RoleAddrs {
-                id: animusd::config::node_id(i),
-                role: NodeRole::Both,
-                internal: addrs[6 * i],
-                client: addrs[6 * i + 1],
-                dynamo: addrs[6 * i + 2],
-                admin: addrs[6 * i + 3],
-                intra: addrs[6 * i + 4],
-                console: addrs[6 * i + 5],
-                advertise_host: None,
-                tls: None,
-                encryption_key_path: None,
-                labels: Default::default(),
-                overload: None,
-            })
-            .collect();
-        let config = ClusterConfig {
-            version: animusd::config::CLUSTER_CONFIG_VERSION,
-            nodes: nodes_cfg,
-            dynamo_auth: None,
-            cluster_settings: None,
-        };
-        let mut nodes = Vec::new();
-        let mut failed = false;
-        for i in 0..n {
-            match animusd::run_node(&config, i, dir.join(format!("core-{attempt}-{i}"))).await {
-                Ok(node) => nodes.push(node),
-                Err(_) => {
-                    failed = true;
-                    break;
-                }
-            }
-        }
-        if !failed {
-            return (nodes, config);
-        }
-        for node in &nodes {
-            node.shutdown_graceful().await;
-        }
-        sleep(Duration::from_millis(50)).await;
-    }
-    panic!("could not bring up the combined core after retries");
+    support::bring_up_deadline(n, dir, support::JOIN_DEADLINE).await
 }
 
 fn leader_index(nodes: &[Node]) -> usize {

@@ -17993,6 +17993,113 @@ pub async fn run_bound_node_with(
     .await
 }
 
+/// Like [`run_node_with_streams_quiesce_and_backup_store`], but for an
+/// already-[`Node::bind`]-bound node (the bound-node dual, as
+/// [`run_bound_node_with`] is of [`run_node_with`]). Every knob this wrapper
+/// does not take is defaulted exactly as the non-bound wrapper defaults it.
+/// Test-support surface for `tests/support::bring_up_deadline_with_start`
+/// (issue #1421): the in-place-split e2e tests pin `orphan_sweep_after` and
+/// `quiesce_after` and so cannot use [`run_bound_node`].
+///
+/// # Errors
+/// As [`run_node_with`].
+#[allow(clippy::too_many_arguments)]
+pub async fn run_bound_node_with_streams_quiesce_and_backup_store(
+    bound: BoundNode,
+    config: &ClusterConfig,
+    index: usize,
+    backend: StorageBackend,
+    orphan_sweep_after: Duration,
+    stream_seal_knobs: StreamSealKnobs,
+    segment_store_config: SegmentStoreConfig,
+    stream_retention: Duration,
+    quiesce_after: Duration,
+    backup_store_config: BackupStoreConfig,
+) -> std::io::Result<Node> {
+    start_bound_node_with_streams_quiesce_and_ttl_sweep_interval(
+        bound,
+        config,
+        index,
+        backend,
+        orphan_sweep_after,
+        stream_seal_knobs,
+        segment_store_config,
+        stream_retention,
+        quiesce_after,
+        false,
+        None,
+        None,
+        None,
+        ttl_reaper::DEFAULT_TTL_SWEEP_INTERVAL,
+        backup_store_config,
+        pitr_janitor::DEFAULT_PITR_SNAPSHOT_CADENCE,
+        None,
+        None,
+        None,
+        None,
+        None,
+        false,
+    )
+    .await
+}
+
+/// Like [`run_node_with_cluster_settings`], but for an already-[`Node::bind`]-
+/// bound node (the bound-node dual). Test-support surface for
+/// `tests/support::bring_up_deadline_with_start` (issue #1421): the throttle
+/// tests pass the cluster-wide throttle and tablet-ceiling knobs explicitly.
+///
+/// # Errors
+/// As [`run_node_with`].
+#[allow(clippy::too_many_arguments)]
+pub async fn run_bound_node_with_cluster_settings(
+    bound: BoundNode,
+    config: &ClusterConfig,
+    index: usize,
+    backend: StorageBackend,
+    orphan_sweep_after: Duration,
+    stream_seal_knobs: StreamSealKnobs,
+    segment_store_config: SegmentStoreConfig,
+    stream_retention: Duration,
+    quiesce_after: Duration,
+    heartbeat_batch: bool,
+    auto_split_bytes: Option<u64>,
+    auto_split_change_rate: Option<u64>,
+    auto_split_ops_rate: Option<u64>,
+    backup_store_config: BackupStoreConfig,
+    throttle_read_units: Option<u64>,
+    throttle_write_units: Option<u64>,
+    tablet_max_read_units: Option<u64>,
+    tablet_max_write_units: Option<u64>,
+    export_s3: Option<ExportS3Config>,
+    shared_wal: bool,
+) -> std::io::Result<Node> {
+    start_bound_node_with_streams_quiesce_and_ttl_sweep_interval(
+        bound,
+        config,
+        index,
+        backend,
+        orphan_sweep_after,
+        stream_seal_knobs,
+        segment_store_config,
+        stream_retention,
+        quiesce_after,
+        heartbeat_batch,
+        auto_split_bytes,
+        auto_split_change_rate,
+        auto_split_ops_rate,
+        ttl_reaper::DEFAULT_TTL_SWEEP_INTERVAL,
+        backup_store_config,
+        pitr_janitor::DEFAULT_PITR_SNAPSHOT_CADENCE,
+        throttle_read_units,
+        throttle_write_units,
+        tablet_max_read_units,
+        tablet_max_write_units,
+        export_s3,
+        shared_wal,
+    )
+    .await
+}
+
 /// Start node `index` from `config` as a **control-only** node (ADR 0035
 /// PR3, `animusd control`): binds only the control internal `ProdEnv` role
 /// plus the client + admin listeners, and runs only the control [`RaftNode`]
