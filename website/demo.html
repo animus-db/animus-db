@@ -1,0 +1,301 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Try AnimusDB in your browser: a live cluster in this tab</title>
+<meta name="description" content="Run a real AnimusDB cluster in this browser tab on the deterministic simulator: send DynamoDB requests, crash nodes, partition the network, and watch Raft recover. Nothing is installed and nothing leaves your machine.">
+<link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
+<link rel="canonical" href="https://animusdb.io/demo.html">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://animusdb.io/demo.html">
+<meta property="og:title" content="Try AnimusDB in your browser: a live cluster in this tab">
+<meta property="og:description" content="A real AnimusDB cluster running in your browser tab on virtual time. Crash a node and watch it recover.">
+<meta property="og:image" content="https://animusdb.io/assets/og-card.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="AnimusDB: the DynamoDB API on infrastructure you own">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="stylesheet" href="assets/tokens.css">
+<link rel="stylesheet" href="assets/site.css">
+<link rel="stylesheet" href="assets/demo.css">
+<script src="assets/site.js" defer></script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+
+<header class="site">
+  <div class="wrap bar">
+    <a class="brand" href="index.html">
+      <svg width="32" height="32" viewBox="-43 -43 86 86" aria-hidden="true">
+        <circle cx="-26.14" cy="-15.09" r="2.4" fill="oklch(0.780 0.012 250.0)"></circle>
+        <circle cx="-26.14" cy="0" r="3.04" fill="oklch(0.754 0.033 250.6)"></circle>
+        <circle cx="-26.14" cy="15.09" r="2.4" fill="oklch(0.780 0.012 250.0)"></circle>
+        <circle cx="-13.07" cy="-22.64" r="3.04" fill="oklch(0.754 0.033 250.6)"></circle>
+        <circle cx="-15.5" cy="-8.95" r="4.89" fill="oklch(0.678 0.093 252.2)"></circle>
+        <circle cx="-15.5" cy="8.95" r="4.89" fill="oklch(0.678 0.093 252.2)"></circle>
+        <circle cx="-13.07" cy="22.64" r="3.04" fill="oklch(0.754 0.033 250.6)"></circle>
+        <circle cx="0" cy="-30.19" r="2.4" fill="oklch(0.780 0.012 250.0)"></circle>
+        <circle cx="0" cy="-17.89" r="4.89" fill="oklch(0.678 0.093 252.2)"></circle>
+        <circle cx="0" cy="0" r="8" fill="oklch(0.550 0.195 255.0)"></circle>
+        <circle cx="0" cy="17.89" r="4.89" fill="oklch(0.678 0.093 252.2)"></circle>
+        <circle cx="0" cy="30.19" r="2.4" fill="oklch(0.780 0.012 250.0)"></circle>
+        <circle cx="13.07" cy="-22.64" r="3.04" fill="oklch(0.754 0.033 250.6)"></circle>
+        <circle cx="15.5" cy="-8.95" r="4.89" fill="oklch(0.678 0.093 252.2)"></circle>
+        <circle cx="15.5" cy="8.95" r="4.89" fill="oklch(0.678 0.093 252.2)"></circle>
+        <circle cx="13.07" cy="22.64" r="3.04" fill="oklch(0.754 0.033 250.6)"></circle>
+        <circle cx="26.14" cy="-15.09" r="2.4" fill="oklch(0.780 0.012 250.0)"></circle>
+        <circle cx="26.14" cy="0" r="3.04" fill="oklch(0.754 0.033 250.6)"></circle>
+        <circle cx="26.14" cy="15.09" r="2.4" fill="oklch(0.780 0.012 250.0)"></circle>
+      </svg>
+      AnimusDB
+    </a>
+    <div class="head-right">
+      <nav class="main" aria-label="Main">
+        <a href="how-it-works.html">How it works</a>
+        <a href="docs.html">Docs</a>
+        <a href="compatibility.html">Compatibility</a>
+        <a class="here" aria-current="page" href="demo.html">Try it</a>
+        <a href="https://github.com/animus-db/animus-db">GitHub</a>
+        <a class="nav-cta" href="install.html">Install</a>
+      </nav>
+      <div class="theme-switch" role="group" aria-label="Theme">
+        <button type="button" data-theme-choice="light" aria-pressed="false" aria-label="Light theme">
+          <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+            <circle cx="8" cy="8" r="3.2"/><path d="M8 .8v2M8 13.2v2M.8 8h2M13.2 8h2M2.9 2.9l1.4 1.4M11.7 11.7l1.4 1.4M13.1 2.9l-1.4 1.4M4.3 11.7l-1.4 1.4"/>
+          </svg>
+        </button>
+        <button type="button" data-theme-choice="dark" aria-pressed="false" aria-label="Dark theme">
+          <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+            <path d="M13.2 9.1A5.6 5.6 0 1 1 6.9 2.8a4.4 4.4 0 0 0 6.3 6.3Z"/>
+          </svg>
+        </button>
+        <button type="button" data-theme-choice="system" aria-pressed="false" aria-label="System theme">
+          <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+            <rect x="1.6" y="2.6" width="12.8" height="8.6" rx="1.4"/><path d="M5.6 14h4.8M8 11.2v2.8"/>
+          </svg>
+        </button>
+      </div>
+    </div>
+  </div>
+</header>
+
+<main id="main">
+
+<div class="page-head">
+  <div class="wrap">
+    <h1>A cluster in this tab</h1>
+    <p>
+      This page runs the real AnimusDB request path (the DynamoDB-compatible edge, the Raft
+      control plane and a Raft group per tablet) compiled to WebAssembly, on the same
+      deterministic simulator the project's tests use. Create a table, write and read items,
+      then crash a node or cut the network and watch the cluster recover.
+    </p>
+  </div>
+</div>
+
+<div class="wrap demo">
+
+  <section class="demo-about" aria-labelledby="about-h">
+    <h2 id="about-h" class="demo-h">What this is, and is not</h2>
+    <div class="cols-2">
+      <div>
+        <h3>What is real</h3>
+        <ul>
+          <li>The DynamoDB JSON request path, from request parsing to the item and table operations, is the same code the server runs.</li>
+          <li>Each node runs a multi-voter control-plane Raft group, and every tablet replica runs its own Raft group. Elections, replication and leader changes all happen.</li>
+          <li>Crashing a node keeps its state for the restart; a partition drops the messages between two nodes.</li>
+        </ul>
+      </div>
+      <div>
+        <h3>What is simulated</h3>
+        <ul>
+          <li><strong>Time is virtual.</strong> The cluster's clock only moves while this tab is visible and not paused, at the speed you pick. A background tab pauses it instead of letting elections flap.</li>
+          <li><strong>Everything is in memory.</strong> There are no sockets, threads or disk. Reloading the page discards the cluster.</li>
+          <li><strong>Seeded.</strong> The same seed builds the same cluster, and the cluster is a pure function of the calls made on it. Your clicks and frame timing are real, so a hand-driven session will not replay byte for byte.</li>
+        </ul>
+      </div>
+    </div>
+    <p class="muted demo-small">
+      Not available here: on-demand backup, PITR restore, table export and import, tagging, and
+      adding or removing a global secondary index or a stream with <code>UpdateTable</code>.
+      Those requests answer with an "unsupported" error. This is a demonstration, not a
+      benchmark: the numbers it shows are virtual milliseconds, not performance.
+    </p>
+  </section>
+
+  <section class="demo-setup" aria-labelledby="setup-h">
+    <h2 id="setup-h" class="demo-h">Cluster</h2>
+    <form id="setup" class="setup-row" autocomplete="off">
+      <label>Nodes
+        <select id="nodes-in">
+          <option value="3" selected>3</option>
+          <option value="5">5</option>
+          <option value="7">7</option>
+        </select>
+      </label>
+      <label>Seed
+        <input id="seed-in" type="number" min="0" step="1" value="42" inputmode="numeric">
+      </label>
+      <button id="start" class="btn primary" type="submit">Start cluster</button>
+      <span class="muted demo-small" id="start-note">Downloads about 1.7&nbsp;MB (compressed) of WebAssembly on first start.</span>
+    </form>
+    <p id="load-error" class="warnbox demo-error" role="alert" hidden></p>
+  </section>
+
+  <div id="live" hidden>
+
+    <section aria-labelledby="view-h">
+      <h2 id="view-h" class="demo-h">Cluster view</h2>
+      <div class="statbar" aria-live="off">
+        <div><span class="k">Virtual clock</span><span class="v mono live" id="clock">0.000 s</span></div>
+        <div><span class="k">Control leader</span><span class="v mono" id="ctl-leader">none</span></div>
+        <div><span class="k">Tables</span><span class="v mono" id="table-count">0</span></div>
+        <div><span class="k">Tablets</span><span class="v mono" id="tablet-count">0</span></div>
+        <div><span class="k">In flight</span><span class="v mono" id="pending">0</span></div>
+      </div>
+
+      <div class="speed-row">
+        <label for="speed">Speed <span class="mono" id="speed-out">1x</span></label>
+        <input id="speed" type="range" min="0" max="6" step="1" value="2" aria-valuetext="1x">
+        <button id="pause" class="btn" type="button" aria-pressed="false">Pause</button>
+        <span class="muted demo-small">Virtual seconds per real second. Slow it down to watch an election; speed it up to wait out a timeout.</span>
+      </div>
+
+      <div id="node-grid" class="node-grid" role="list"></div>
+
+      <div class="fault-row">
+        <fieldset>
+          <legend>Network</legend>
+          <label class="sr-only" for="part-a">Node A</label>
+          <select id="part-a"></select>
+          <span aria-hidden="true">&harr;</span>
+          <label class="sr-only" for="part-b">Node B</label>
+          <select id="part-b"></select>
+          <button id="partition" class="btn" type="button">Partition</button>
+          <button id="heal" class="btn" type="button">Heal all</button>
+        </fieldset>
+        <fieldset>
+          <legend>Membership</legend>
+          <button id="grow" class="btn" type="button">Add a node</button>
+        </fieldset>
+      </div>
+      <p id="partition-list" class="muted demo-small" aria-live="polite"></p>
+
+      <h3 class="demo-h3">Tablets</h3>
+      <div class="table-scroll">
+        <table class="tablets">
+          <thead><tr><th scope="col">Tablet</th><th scope="col">Table</th><th scope="col">Replicas</th><th scope="col">Leader</th><th scope="col">State</th></tr></thead>
+          <tbody id="tablet-rows"><tr><td colspan="5" class="muted">No tables yet. Run CreateTable below.</td></tr></tbody>
+        </table>
+      </div>
+
+      <h3 class="demo-h3">Events</h3>
+      <ol id="events" class="events mono" aria-live="polite"></ol>
+    </section>
+
+    <section aria-labelledby="console-h">
+      <h2 id="console-h" class="demo-h">DynamoDB console</h2>
+      <p class="body-text">
+        Pick an example, edit the JSON if you like, and send it to any node. The request is a
+        DynamoDB JSON body; the target is the <code>X-Amz-Target</code> operation it would carry
+        over HTTP. A request to a crashed node is refused with 503, and a request that gets no
+        answer in 30 virtual seconds returns 504. The examples run in order: start with CreateTable.
+      </p>
+      <div class="console">
+        <div class="console-in">
+          <div class="console-pick">
+            <label>Example
+              <select id="example"></select>
+            </label>
+            <label>Send to node
+              <select id="send-node"></select>
+            </label>
+          </div>
+          <p class="mono target-line"><span class="muted">X-Amz-Target:</span> <span id="target"></span></p>
+          <label class="sr-only" for="body">Request JSON</label>
+          <textarea id="body" class="mono" rows="14" spellcheck="false" autocomplete="off" autocapitalize="off"></textarea>
+          <div class="btn-row">
+            <button id="send" class="btn primary" type="button">Send request</button>
+            <span class="muted demo-small" id="send-hint"></span>
+          </div>
+        </div>
+        <div class="console-out">
+          <p class="resp-head" id="resp-head" aria-live="polite"><span class="muted">No request sent yet.</span></p>
+          <div class="code"><pre id="resp" class="resp mono" tabindex="0" aria-label="Response body"></pre></div>
+        </div>
+      </div>
+      <p class="muted demo-small">
+        Reads in the examples set <code>ConsistentRead</code>, which routes them through the tablet
+        leader. Without it a read is eventually consistent, as in DynamoDB, and may be served by a
+        replica that has not applied the latest write yet.
+      </p>
+    </section>
+
+  </div>
+
+  <p class="ctalink-row">
+    <a class="ctalink" href="install.html">Run a real cluster</a>
+    <a class="ctalink" href="articles/determinism.html">Why determinism matters</a>
+    <a class="ctalink" href="how-it-works.html">How it works</a>
+    <a class="ctalink" href="compatibility.html">What is implemented</a>
+  </p>
+</div>
+
+<script src="assets/demo.js" defer></script>
+</main>
+
+</main>
+
+<footer class="site">
+  <div class="wrap">
+    <div class="foot-grid">
+      <div>
+        <h5>Product</h5>
+        <ul>
+          <li><a href="index.html">Overview</a></li>
+          <li><a href="how-it-works.html">How it works</a></li>
+          <li><a href="install.html">Install</a></li>
+          <li><a href="demo.html">Try it in your browser</a></li>
+          <li><a href="docs.html">Documentation</a></li>
+        </ul>
+      </div>
+      <div>
+        <h5>Reference</h5>
+        <ul>
+          <li><a href="architecture.html">Architecture</a></li>
+          <li><a href="compatibility.html">Compatibility</a></li>
+          <li><a href="performance.html">Performance</a></li>
+          <li><a href="licence.html">Licensing</a></li>
+        </ul>
+      </div>
+      <div>
+        <h5>Writing</h5>
+        <ul>
+          <li><a href="articles/why-lock-in-compounds.html">Why lock-in compounds</a></li>
+          <li><a href="articles/what-self-hosting-costs.html">What self-hosting actually costs</a></li>
+          <li><a href="articles/determinism.html">Determinism, and why you should care</a></li>
+        </ul>
+      </div>
+      <div>
+        <h5>Project</h5>
+        <ul>
+          <li><a href="https://github.com/animus-db/animus-db">GitHub</a></li>
+          <li><a href="https://github.com/animus-db/animus-db/issues">Issues</a></li>
+          <li><a href="https://github.com/animus-db/animus-db/blob/main/CONTRIBUTING.md">Contributing</a></li>
+          <li><a href="https://github.com/animus-db/animus-db/blob/main/docs/adr/README.md">Design records</a></li>
+          <li><a href="https://github.com/animus-db/animus-db/blob/main/LICENSE">Licence text</a></li>
+          <li><a href="https://github.com/animus-db/animus-db/blob/main/CODE_OF_CONDUCT.md">Code of conduct</a></li>
+        </ul>
+      </div>
+    </div>
+    <div class="foot-bottom">
+      <span>Pre-alpha. Not ready for production data.</span>
+      <span class="spacer"></span>
+      <span class="mono">AGPL-3.0 · animusdb.io</span>
+    </div>
+  </div>
+</footer>
+
+</body>
+</html>

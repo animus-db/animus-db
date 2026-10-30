@@ -1,7 +1,8 @@
 # Publish the marketing site (website/) to GitHub Pages.
 #
-# The site is static HTML/CSS/JS with no build step — the job just uploads
-# `website/` as the Pages artifact. `website/CNAME` carries the custom domain
+# The site is static HTML/CSS/JS; the one build step compiles the in-browser
+# demo's WebAssembly (crates/animus-web, ADR 0082) into `website/demo/pkg/`
+# (gitignored), then the job uploads `website/` as the Pages artifact. `website/CNAME` carries the custom domain
 # (animusdb.io) and `website/.nojekyll` stops Pages from running Jekyll over it.
 #
 # Enable once in the repository: Settings → Pages → Source: "GitHub Actions".
@@ -12,6 +13,10 @@ on:
     branches: [main]
     paths:
       - 'website/**'
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'scripts/build-web-demo.sh'
       - '.github/workflows/pages.yml'
   workflow_dispatch:
 
@@ -34,6 +39,29 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/configure-pages@v5
+
+      - name: Install Rust toolchain (1.96) with the wasm target
+        uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      # The CLI must match the `wasm-bindgen` crate version in Cargo.lock
+      # exactly; read it from there so the two cannot drift.
+      - name: Install wasm-bindgen-cli (version from Cargo.lock)
+        run: |
+          v=$(awk '/^name = "wasm-bindgen"$/ {getline; gsub(/[^0-9.]/, "", $0); print; exit}' Cargo.lock)
+          echo "wasm-bindgen ${v}"
+          cargo install wasm-bindgen-cli --version "${v}" --locked
+
+      # No wasm-opt pass: measured on this crate, `wasm-opt -Oz` shrank the raw
+      # file ~13% but grew it ~10% gzipped (what Pages serves), over a build
+      # that is already `opt-level = "s"` + fat LTO (`profile.wasm-release`).
+      - name: Build the browser demo (website/demo/pkg)
+        run: scripts/build-web-demo.sh
+
       - uses: actions/upload-pages-artifact@v3
         with:
           path: website

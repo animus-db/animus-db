@@ -1,7 +1,6 @@
 # animusdb.io — the AnimusDB marketing site
 
-Static HTML/CSS/JS on the "Ledger" design system (ADR 0056), restyled 2026-10-18 as an open layout: Archivo headings at 75% width, white ground, light grey code surface, no black blocks. **No build step,
-no bundler** — edit a file, commit, and it ships. The site makes no third-party requests:
+Static HTML/CSS/JS on the "Ledger" design system (ADR 0056), restyled 2026-10-18 as an open layout: Archivo headings at 75% width, white ground, light grey code surface, no black blocks. **No bundler** — edit a file, commit, and it ships. The one build output is the in-browser demo's WebAssembly (`demo/pkg/`, gitignored; below). The site makes no third-party requests:
 the two faces (Archivo, variable in weight and width, and JetBrains Mono for code only; latin subset, SIL OFL)
 are self-hosted in `assets/fonts/`.
 
@@ -14,6 +13,7 @@ website/
   performance.html      reference: the cost model, the benchmark methodology (no published numbers yet)
   licence.html          reference: AGPL-3.0 scenario by scenario
   docs.html             documentation — concepts, architecture, API, operations
+  demo.html             live demo: a real cluster in the tab (wasm, virtual time; ADR 0082)
   install.html          docker run, build, run a cluster, connect, deploy
   articles/
     why-lock-in-compounds.html
@@ -22,6 +22,8 @@ website/
   assets/
     tokens.css    shared design tokens — byte-identical to crates/animusd/src/tokens.css
     site.css      the site's own skin (geometry) on top of the shared tokens
+    demo.js       the demo page's behaviour (loads demo/pkg lazily, drives the virtual clock)
+    demo.css      the demo page's layout
     site.js       theme switch (light/dark/system; light is the default),
                   copy buttons, docs scrollspy
     favicon.svg
@@ -40,10 +42,27 @@ python3 -m http.server 8000 --directory website
 # then open http://127.0.0.1:8000
 ```
 
+## The in-browser demo
+
+`demo.html` runs `crates/animus-web` (the real request path on the deterministic
+simulator, ADR 0082) compiled to WebAssembly. Build output goes to
+`website/demo/pkg/` and is **not committed**; without it the page loads but
+"Start cluster" reports an error. To preview locally:
+
+```sh
+rustup target add wasm32-unknown-unknown
+cargo install wasm-bindgen-cli --version "$(awk '/^name = "wasm-bindgen"$/ {getline; gsub(/[^0-9.]/,""); print; exit}' Cargo.lock)" --locked
+scripts/build-web-demo.sh
+python3 -m http.server 8000 --directory website
+```
+
+Everything the page says about what is real, simulated and unsupported must stay
+true of `crates/animusd/src/embedded.rs` (its module doc is the source).
+
 ## Deploying
 
-`.github/workflows/pages.yml` uploads `website/` to GitHub Pages on every push
-to `main` that touches it. The repository needs **Settings → Pages → Source:
+`.github/workflows/pages.yml` builds the demo wasm and uploads `website/` to GitHub Pages on every push
+to `main` that touches `website/` or the crates. The repository needs **Settings → Pages → Source:
 "GitHub Actions"** set once, and `animusdb.io` pointed at GitHub Pages in DNS
 (four `A` records for the apex, or a `CNAME` to `animus-db.github.io` for a
 subdomain). Delete `website/CNAME` if the custom domain is not used — otherwise
