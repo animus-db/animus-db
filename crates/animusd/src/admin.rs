@@ -736,6 +736,7 @@ impl AdminHost for ClientCtx {
 /// impl silently narrows production dispatch to whatever the generic
 /// sibling covers; a newtype keeps the production impl's own dispatch
 /// concrete and byte-identical while the sim gets the generic one).
+// Issue #1423 (won't-do): the two `AdminHost` impls stay separate because they differ on `debug_inboxes_view` and `action_data_dynamo`; the trait's no-default methods force both to stay in sync.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct GenericAdminHost<E: Env, R: RelayClient>(pub(crate) ClientCtx<E, R>);
 

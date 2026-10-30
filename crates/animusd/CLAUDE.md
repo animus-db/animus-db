@@ -1910,6 +1910,26 @@ Real-TCP regression: `tests/overload.rs`.
 
 ## CLI reference
 
+**Run-mode validation order (issue #1422).** `run()` derives a `Mode`
+(`Config`/`Cluster`/`Split`/`Idle`) once after argument parsing, then errors
+in this order: (a) mode conflicts (`--config` vs `--cluster` vs
+`--cluster-control/--cluster-data`, an unpaired split flag), (b) flags that
+do not fit the mode, from the single `FLAG_RULES` table (flag spellings and
+the modes they are allowed in), (c) only then file loads
+(`--dynamo-auth`, S3 credentials, the config file). So `--cluster 3
+--cluster-control 1 --cores 4` reports the conflict, not `--cores`. In
+`--cluster-control/--cluster-data` mode the flags that path never honoured
+are hard errors, not silent gaps: `--label*`, `--advertise-host`, the four
+throttle flags, `--stream-seal-*`/`--stream-retention`, `--segment-store`,
+`--backup-store`, `--s3-credentials`, `--allow-insecure-s3`,
+`--export-s3-*`, plus the already-rejected `--tls-*`, `--max-connections`/
+`--max-inflight`/`--queued-bytes-budget`, `--encryption-key` and the
+config-only knobs. Honoured there: `--dir`, `--ip`, `--ephemeral`,
+`--auto-split-*`, `--orphan-sweep-after`, `--quiesce-after`, the
+heartbeat/shared-wal toggles, `--dynamo-auth`. A new flag goes in the table
+(its `seen_flags` spelling is recorded in the parse loop), with a test in
+`main.rs`'s `mode_check` group.
+
 `main.rs --help` (or the `gen-config`/`join`/`control`/`data` subcommand
 help) prints the full invocation reference (durable LSM backend by
 default; `--ephemeral` selects the volatile memory engine). Notes not
@@ -1942,10 +1962,10 @@ loopback. Reaches `run` (`--config`/`--node` and `--cluster N`),
 `run_control`, and — since issue #676 — `join` and `data --seed` too (the
 two real growth paths, threaded through `run_node_join_with_settings`/
 `run_node_data_join_with_settings`). **`--cluster-control`/`--cluster-data`
-and `data --config` remain a documented gap**: the former's
-`start_split_cluster_with_growth` hardcodes the default `Cluster` store for
-every data-role node it stands up (no CLI route at all on that dev-only
-path), and the latter has no `cluster_settings`-shaped route to either
+hard-errors on both flags (issue #1422; `start_split_cluster_with_growth`
+hardcodes the default `Cluster` store for every data-role node it stands up,
+so they used to be silently ignored), and `data --config` remains a
+documented gap**: it has no `cluster_settings`-shaped route to either
 store the way it does for `quiesce_after_secs`/`heartbeat_batch`/
 `shared_wal`.
 
