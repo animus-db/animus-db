@@ -43,7 +43,7 @@ fn seeds() -> Vec<u64> {
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(1)
         .max(8);
-    (0..depth).map(|i| 0x1132_0000 + i).collect()
+    animus_test::corpus::shard_retain((0..depth).map(|i| 0x1132_0000 + i).collect())
 }
 
 /// A small deterministic stream of choices derived from the seed (the sim's

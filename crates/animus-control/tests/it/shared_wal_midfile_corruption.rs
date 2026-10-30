@@ -40,7 +40,7 @@ fn seeds() -> Vec<u64> {
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(1)
         .max(8);
-    (0..depth).map(|i| 0x5113_0000 + i).collect()
+    animus_test::corpus::shard_retain((0..depth).map(|i| 0x5113_0000 + i).collect())
 }
 
 struct Choices(u64);

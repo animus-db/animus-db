@@ -436,7 +436,7 @@ fn kind_eval_replay_corpus() {
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(4)
             .max(1);
-        (0..k).map(|i| SEED + 100 + i * 7919).collect()
+        animus_test::corpus::shard_retain((0..k).map(|i| SEED + 100 + i * 7919).collect())
     };
     for seed in seeds {
         run_schedule(seed);

@@ -36,7 +36,7 @@ fn seeds() -> Vec<u64> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(1)
         .max(1);
-    (0..k).map(|i| 0x0081_2000 + i).collect()
+    animus_test::corpus::shard_retain((0..k).map(|i| 0x0081_2000 + i).collect())
 }
 
 fn put_body(id: &str) -> String {

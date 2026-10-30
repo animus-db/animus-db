@@ -50,6 +50,8 @@ pub(crate) const TIMEOUT: Duration = Duration::from_millis(800);
 pub(crate) const SKEW_MS: u64 = 500;
 
 pub(crate) fn seeds() -> Vec<u64> {
+    // Index-addressed seed list (`seeds()[0]`, `.take(2)`): not splittable.
+    animus_test::corpus::reject_shard("sim_world_mrec_tests");
     if let Some(s) = std::env::var("ANIMUS_SEED")
         .ok()
         .and_then(|s| s.parse().ok())

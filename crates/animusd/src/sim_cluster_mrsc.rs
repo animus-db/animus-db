@@ -80,7 +80,9 @@ const JITTER: Duration = Duration::from_millis(30);
 const TAIL_JITTER: Duration = Duration::from_millis(250);
 const TAIL_PROB: f64 = 0.10;
 
-fn seeds() -> Vec<u64> {
+/// Every seed of the run (`ANIMUS_SEED` replay, else the depth knob), before
+/// `ANIMUS_SEED_SHARD` takes its slice.
+fn all_seeds() -> Vec<u64> {
     if let Some(s) = std::env::var("ANIMUS_SEED")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
@@ -89,6 +91,14 @@ fn seeds() -> Vec<u64> {
     }
     let k = animus_test::corpus::seeds_from_env("ANIMUS_MRSC_SEEDS") as u64;
     (0..k).map(|i| 0x6D00_0000 + i).collect()
+}
+
+/// This worker's seeds (`ANIMUS_SEED_SHARD`; a replay is never sharded).
+fn seeds() -> Vec<u64> {
+    if std::env::var("ANIMUS_SEED").is_ok() {
+        return all_seeds();
+    }
+    animus_test::corpus::shard_retain(all_seeds())
 }
 
 fn cell_selected(name: &str) -> bool {
@@ -1521,9 +1531,14 @@ fn mrsc_negative_preferred_leader_disabled() {
 /// violation and a Region loss costs it its quorum.
 #[test]
 fn mrsc_negative_unpinned_policy() {
+    // Aggregate over the whole seed set ("some seed doubles a Region"), so it
+    // cannot be split by seed: shard 0 runs it in full, the others skip it.
+    if !animus_test::corpus::owns_unsharded() {
+        return;
+    }
     let mut violated = 0usize;
     let mut quorum_lost = 0usize;
-    let all = seeds();
+    let all = all_seeds();
     for seed in all.iter().copied() {
         let mut run = Run::boot(seed);
         run.create_table("plain");

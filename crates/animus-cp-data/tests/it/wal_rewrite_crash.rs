@@ -203,7 +203,7 @@ fn a_whole_cluster_crash_at_any_point_of_a_staged_wal_rewrite_loses_no_acked_wri
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(0x1116);
-    for k in 0..depth() {
+    for k in animus_test::corpus::shard_range(depth()) {
         for (n, &ms) in OFFSETS_MS.iter().enumerate() {
             let seed = base + k * 1000 + n as u64;
             run_cell(seed, Duration::from_millis(ms), false);
@@ -217,7 +217,7 @@ fn the_same_crash_sweep_with_torn_and_corrupted_wal_tails() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(0x1116_0001);
-    for k in 0..depth() {
+    for k in animus_test::corpus::shard_range(depth()) {
         for (n, &ms) in OFFSETS_MS.iter().enumerate() {
             let seed = base + k * 1000 + n as u64;
             run_cell(seed, Duration::from_millis(ms), true);

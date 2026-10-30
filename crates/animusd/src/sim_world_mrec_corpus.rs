@@ -71,7 +71,7 @@ fn seeds() -> Vec<u64> {
         return vec![s];
     }
     let k = animus_test::corpus::seeds_from_env("ANIMUS_MREC_SEEDS") as u64;
-    (0..k).map(|i| 0x4D52_0000 + i).collect()
+    animus_test::corpus::shard_retain((0..k).map(|i| 0x4D52_0000 + i).collect())
 }
 
 fn cell_selected(name: &str) -> bool {

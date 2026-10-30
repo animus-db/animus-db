@@ -35,6 +35,10 @@ properties; it also hosts cross-crate fault sweeps.
   dependency, by `animus-cp-data`'s and `animus-control`'s corpus test
   files — a dev-dependency cycle Cargo permits, since neither crate's
   library needs the other to build.
+  **Seed sharding** (`ANIMUS_SEED_SHARD=i/n`, issue #1271) lives here too —
+  see the knob table below and the lesson
+  `docs/lessons/testing/2026-10-30-shard-a-deep-corpus-by-seed-not-by-depth.md`
+  (any aggregate-over-seeds control must be pinned to shard 0).
 - `src/shrink.rs` (ADR 0061 rung B4) — the generic failure-minimization
   engine every corpus can wire in: `minimize` (greedy delta-debugging over a
   caller-supplied `candidates`/`still_fails` pair), `ShrinkBudget`/
@@ -90,6 +94,7 @@ Env knobs at a glance (details in the sections below):
 | Knob | Default | Effect |
 |------|---------|--------|
 | `ANIMUS_SEED` | unset | replay one failed sim run from its printed seed (repo-wide convention) |
+| `ANIMUS_SEED_SHARD=i/n` | unset | run only seed variants with index `% n == i` (0-based `i`, `n >= 1`; malformed panics). The shards partition the unsharded seed set exactly; variant 0 (the canonical cell) is in shard 0. Applied inside `seed_expand`/`for_each_seed`/`corpus_cells`; a corpus with its own seed list uses `corpus::shard_retain(vec)` / `shard_range(k)` / `shard_range_usize(k)`; one that cannot be split calls `corpus::reject_shard(name)` (panics if set); an aggregate negative control or whole-cell-set meta-test returns early unless `corpus::owns_unsharded()` and reads the unsharded list. Replay (`ANIMUS_SEED`) is never sharded. Tests: `corpus.rs` unit tests (partition, disjoint, variant 0, unset unchanged) and `tests/seed_shard_env.rs` (the env parse, in a child process) |
 | `ANIMUS_RAFTKV_SEEDS=K` | 1 | K seed variants per raftkv-corpus cell |
 | `ANIMUS_RAFTKV_LSM=1` | off | run the whole raftkv corpus over `LsmEngine<SimEnv>` |
 | `ANIMUS_RAFTKV_WAL_FAULTS=1` | off | run a second pass of the raftkv corpus's `LeaderKill`/`FollowerKill` cells with `torn_tail_on_crash`+`corrupt_on_crash` armed for the whole run |
