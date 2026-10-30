@@ -1651,6 +1651,19 @@ async fn admin_ready_is_200_while_leaderless_with_metadata() {
         .await
         .expect("a healthy 3-node cluster must report /admin/health and /admin/ready 200");
 
+        // The survivor must be a FOLLOWER. A control leader that loses its
+        // followers keeps refreshing its own leader contact (there is no
+        // check-quorum step-down), so `/admin/health` would stay 200 and the
+        // 503 below would never come: the test failed whenever node 0 won the
+        // election (issue #1421 batch 4 root-caused this; it also failed ~1 in
+        // 4 runs on main before).
+        let follower = nodes
+            .iter()
+            .position(|n| !n.is_control_leader())
+            .expect("a 3-node cluster has a follower");
+        nodes.swap(0, follower);
+        let survivor_addr = nodes[0].admin_addr();
+
         // Lose the control quorum: stop the other two voters.
         let two = nodes.split_off(1);
         for n in &two {
