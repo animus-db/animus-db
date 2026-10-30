@@ -54,11 +54,13 @@ shrank the raw file but grew the gzipped one. Size on 2026-10-30: 5.7 MB raw,
 scripts/demo-browser-smoke.mjs chromium|firefox|webkit [--shots DIR] [--exe PATH]`.
 It runs the whole visitor flow (start, CreateTable/PutItem/GetItem/Query/Scan/PartiQL,
 crash the control leader, write through a survivor, restart, partition, heal, add a
-node, speed, pause) and fails on any console or page error. Not in CI.
+node, speed, pause) and fails on any console or page error. CI runs it in Chromium and
+Firefox (Playwright's builds) in `.github/workflows/demo-browsers.yml`, path-filtered to
+the demo's inputs.
 
-Browsers: Chromium 153 verified (2026-10-30). Firefox: not yet run. Playwright's
-Firefox needs `playwright install firefox` (host `playwright.download.prss.microsoft.com`,
-blocked in the agent sandbox); a stock Firefox cannot be driven by Playwright (it needs
+Browsers: Chromium 153 verified locally (2026-10-30); Firefox is verified by the
+`demo-browsers` CI job. Locally, Playwright's Firefox needs `playwright install firefox`
+(host `playwright.download.prss.microsoft.com`, blocked in the agent sandbox); a stock Firefox cannot be driven by Playwright (it needs
 Playwright's patched build), so use Playwright's build or drive stock Firefox through
 geckodriver. Static audit: the wasm uses only bulk-memory, multivalue, reference-types,
 nontrapping-fptoint, sign-ext and mutable-globals (rustc's wasm32 defaults), all in

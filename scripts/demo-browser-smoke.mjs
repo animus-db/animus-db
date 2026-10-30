@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// End-to-end browser check of the in-browser demo (ADR 0082). Not part of CI.
+// End-to-end browser check of the in-browser demo (ADR 0082). CI: .github/workflows/demo-browsers.yml.
 //
 //   scripts/build-web-demo.sh
 //   python3 -m http.server 8000 --directory website &
