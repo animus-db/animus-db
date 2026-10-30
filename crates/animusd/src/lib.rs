@@ -18285,6 +18285,7 @@ pub async fn run_bound_node_with(
 ///
 /// # Errors
 /// As [`run_node_with`].
+#[cfg(feature = "server")]
 #[allow(clippy::too_many_arguments)]
 pub async fn run_bound_node_with_streams_quiesce_and_backup_store(
     bound: BoundNode,
@@ -18332,6 +18333,7 @@ pub async fn run_bound_node_with_streams_quiesce_and_backup_store(
 ///
 /// # Errors
 /// As [`run_node_with`].
+#[cfg(feature = "server")]
 #[allow(clippy::too_many_arguments)]
 pub async fn run_bound_node_with_cluster_settings(
     bound: BoundNode,
