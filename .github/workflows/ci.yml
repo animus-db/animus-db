@@ -230,6 +230,12 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
 
+      # rust-toolchain.toml pins channel `1.96`, which rustup treats as a different
+      # toolchain from the action's `1.96.0`, so the target above lands on the wrong
+      # one. Add it to the toolchain cargo will actually use.
+      - name: Add the wasm32 target to the pinned toolchain
+        run: rustup target add wasm32-unknown-unknown
+
       - name: Set up sccache
         uses: mozilla-actions/sccache-action@v0.0.9
 
