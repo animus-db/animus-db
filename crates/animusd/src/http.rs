@@ -30,6 +30,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// `Content-Length` validation, header lowercasing/comma-joining) happens in
 /// `animus_node::http::parse_request_head`; this function does only the
 /// socket reads.
+#[cfg(feature = "server")]
 pub(crate) async fn read_http_request<S: AsyncRead + Unpin>(
     stream: &mut S,
     buf: &mut Vec<u8>,
@@ -40,17 +41,20 @@ pub(crate) async fn read_http_request<S: AsyncRead + Unpin>(
 /// ADR 0080 section 5 (4.6): once the first byte of a request has arrived, the
 /// whole header block must follow within this long, or the connection is
 /// closed (a slow-header client otherwise holds a connection permit forever).
+#[cfg(feature = "server")]
 pub(crate) const HEADER_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// ADR 0080 section 5 (4.6): an idle keep-alive connection (no byte of a new
 /// request) is closed after this long. The AWS SDK pools keep idle
 /// connections for less than this, and an SDK retries a request that finds its
 /// pooled connection closed.
+#[cfg(feature = "server")]
 pub(crate) const KEEPALIVE_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// [`read_http_request`] with explicit timeouts (the test seam). An idle
 /// timeout before any byte of a new request is a clean close (`Ok(None)`); a
 /// header block that does not complete within `header` is a `TimedOut` error.
+#[cfg(feature = "server")]
 pub(crate) async fn read_http_request_with<S: AsyncRead + Unpin>(
     stream: &mut S,
     buf: &mut Vec<u8>,

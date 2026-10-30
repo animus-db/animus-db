@@ -24,7 +24,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+#[cfg(feature = "server")]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+#[cfg(feature = "server")]
 use tokio::net::TcpStream;
 
 use animus_env::MetricsHandle;
@@ -251,9 +253,11 @@ impl LeaderlessTracker {
 /// beyond this is closed without a response.
 const SHED_TASK_SLOTS: usize = 64;
 /// Longest a refusal task spends writing its response.
+#[cfg(feature = "server")]
 const SHED_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
 /// Longest a refusal task keeps draining the peer's unread request so the
 /// close is a FIN, not an RST that could destroy the response in flight.
+#[cfg(feature = "server")]
 const SHED_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// The per-node overload state carried on `ClientCtx`: the DynamoDB
@@ -321,6 +325,7 @@ impl Default for OverloadState {
 /// `None` (a TLS listener cannot speak plaintext HTTP before its handshake) or
 /// no refusal slot is free, just drop the stream. Returns immediately — the
 /// caller's accept loop never waits on a refused peer.
+#[cfg(feature = "server")]
 pub(crate) fn shed_connection(
     mut stream: TcpStream,
     response: Option<Arc<str>>,

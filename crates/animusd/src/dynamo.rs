@@ -186,10 +186,13 @@ use animus_dynamo::{
     TXN_IDEMPOTENCY_TABLE, TableSchema, index as dynamo_index, schema as schema_bridge,
     storage_key,
 };
-use animus_env::{Clock, Env, MaybeTlsStream, Metric, NodeId, Rng};
+#[cfg(feature = "server")]
+use animus_env::MaybeTlsStream;
+use animus_env::{Clock, Env, Metric, NodeId, Rng};
 use animus_node::host::RelayClient;
 use animus_tablet::{TOKEN_BYTES, TabletId, TabletState, partition_token};
 use tokio::io::{AsyncRead, AsyncWrite};
+#[cfg(feature = "server")]
 use tokio::net::TcpListener;
 
 use crate::authz::{self, Principal};
@@ -484,6 +487,7 @@ fn reject_empty_key_value(v: &AttributeValue) -> Result<(), WireError> {
 /// address and the connection dropped; the loop keeps serving. **A failed
 /// `accept()` itself also never stops this loop** (issue #592,
 /// `crate::ACCEPT_ERROR_BACKOFF`'s own doc).
+#[cfg(feature = "server")]
 pub(crate) async fn serve(
     listener: TcpListener,
     ctx: ClientCtx,
@@ -545,6 +549,7 @@ pub(crate) async fn serve(
     }
 }
 
+#[cfg(feature = "server")]
 async fn handle_conn<S: AsyncRead + AsyncWrite + Unpin>(
     mut stream: S,
     ctx: ClientCtx,
@@ -707,6 +712,7 @@ fn sigv4_error_body(err: &animus_dynamo::sigv4::SigV4Error) -> String {
 /// Delegates to [`execute_routed_as`], the fork's single implementation —
 /// `principal` is this connection's own SigV4-resolved [`Principal`] (ADR
 /// 0066 §5, `handle_conn`'s own gate).
+#[cfg(feature = "server")]
 async fn dispatch(
     ctx: &ClientCtx,
     request: &http::HttpRequest,
@@ -734,6 +740,7 @@ async fn dispatch(
 /// matching 2026-09-08 entry for why a second, general-purpose "run
 /// whatever operation a client asks for" proxy needed a genuine newtype
 /// split rather than a single widened impl.
+#[cfg(feature = "server")]
 pub(crate) async fn execute_routed(ctx: &ClientCtx, target: &str, body: &[u8]) -> (u16, String) {
     execute_routed_as(ctx, &Principal::unrestricted(), target, body).await
 }
@@ -746,6 +753,7 @@ pub(crate) async fn execute_routed(ctx: &ClientCtx, target: &str, body: &[u8]) -
 /// real edge's [`dispatch`] and the admin dashboard's write/read proxy
 /// (`POST /admin/data/dynamo`, ADR 0021), so both resolve a target
 /// identically.
+#[cfg(feature = "server")]
 pub(crate) async fn execute_routed_as(
     ctx: &ClientCtx,
     principal: &Principal,
@@ -765,6 +773,7 @@ pub(crate) async fn execute_routed_as(
 /// `dispatch`, via [`execute_routed_as`]); everything else should go through
 /// [`execute_routed_as`] so a `DynamoDBStreams_20120810.*` target isn't
 /// handed to the wrong decoder.
+#[cfg(feature = "server")]
 pub(crate) async fn execute_as(
     ctx: &ClientCtx,
     principal: &Principal,
@@ -864,6 +873,7 @@ fn reject_internal_table(table: &str, ddl: bool) -> Result<(), WireError> {
 }
 
 /// Execute a decoded operation against the data plane via the shared coordinator.
+#[cfg(feature = "server")]
 async fn run_operation(
     ctx: &ClientCtx,
     principal: &Principal,
@@ -2373,6 +2383,7 @@ fn describe_time_to_live<E: Env, R: RelayClient>(
 /// same table (a different key entirely) must not make this call spin past
 /// its deadline just because the *whole* map no longer matches what it
 /// computed before proposing.
+#[cfg(feature = "server")]
 async fn tag_resource(
     ctx: &ClientCtx,
     table: &str,
@@ -2409,6 +2420,7 @@ async fn tag_resource(
 /// `UntagResource`: remove tags from a table by key — [`tag_resource`]'s
 /// mirror, with the identical per-key (rather than whole-map) convergence
 /// check.
+#[cfg(feature = "server")]
 async fn untag_resource(
     ctx: &ClientCtx,
     table: &str,
@@ -3012,6 +3024,7 @@ const CREATE_EXPORT_ID_ATTEMPTS: u32 = 3;
 /// simplification against the on-demand backup train's per-tablet-leader-
 /// driven, crash-resumable design (ADR 0059 §4).
 #[allow(clippy::too_many_arguments)] // mirrors every other DDL-shaped handler's full request shape
+#[cfg(feature = "server")]
 async fn create_export(
     ctx: &ClientCtx,
     table: &str,
@@ -3269,6 +3282,7 @@ struct ExportDataFile {
 /// a true point-in-time reconstruction as of the requested instant — a
 /// real gap against ADR 0068 §1's own "served through the PITR machinery"
 /// design intent, tracked as a follow-up rather than silently claimed.
+#[cfg(feature = "server")]
 async fn run_export_job(
     ctx: ClientCtx,
     export_id: String,
@@ -3304,6 +3318,7 @@ async fn run_export_job(
 /// [`run_export_job`]'s actual work — factored out so the caller can turn
 /// any `Err` into a `FailExport` proposal uniformly. Returns `(item_count,
 /// billed_size_bytes, export_manifest_s3_key)` on success.
+#[cfg(feature = "server")]
 async fn run_export_job_inner(
     ctx: &ClientCtx,
     export_id: &str,
@@ -3451,6 +3466,7 @@ async fn run_export_job_inner(
 
 /// gzip-compress `bytes` at the default compression level — the `.json.gz`
 /// data-file format DynamoDB's own S3 export layout expects (ADR 0068 §1).
+#[cfg(feature = "server")]
 fn gzip_bytes(bytes: &[u8]) -> Vec<u8> {
     use std::io::Write;
     let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
@@ -3511,6 +3527,7 @@ const CREATE_IMPORT_ID_ATTEMPTS: u32 = 3;
 ///    blocking wait: the import driver does the actual read/seed/activate
 ///    sequence in the background, so `DescribeTable` reports `CREATING`
 ///    ([`table_status`]) until it converges.
+#[cfg(feature = "server")]
 async fn create_import(
     ctx: &ClientCtx,
     s3_bucket: &str,
@@ -3563,6 +3580,7 @@ struct ImportProvision {
     throughput: Option<animus_control::ProvisionedThroughput>,
 }
 
+#[cfg(feature = "server")]
 async fn provision_import_target(
     ctx: &ClientCtx,
     params: &wire::TableCreationParameters,
@@ -3668,6 +3686,7 @@ fn active_replicas_for_new_tablet(meta: &Metadata) -> Vec<NodeId> {
 /// `replicas: []` tablet outright. The caller still owns the "still empty
 /// after waiting → skip this propose, retry with a fresh id" decision — this
 /// helper only waits and logs, it never itself decides to give up.
+#[cfg(feature = "server")]
 async fn await_active_metadata_for_new_tablet(ctx: &ClientCtx) -> Metadata {
     let deadline = tokio::time::Instant::now() + SCHEMA_COMMIT_TIMEOUT;
     loop {
@@ -3710,6 +3729,7 @@ async fn await_active_metadata_for_new_tablet(ctx: &ClientCtx) -> Metadata {
 /// function's own per-attempt [`SCHEMA_COMMIT_TIMEOUT`]) for at least one
 /// `Active` member before minting, and skipping the propose (retrying with
 /// a fresh id) if the wait still ends empty.
+#[cfg(feature = "server")]
 async fn finish_import_kickoff(
     ctx: &ClientCtx,
     s3_bucket: &str,
@@ -3946,6 +3966,7 @@ const RESTORE_ID_ATTEMPTS: u32 = 3;
 ///    (the base schema + any LSIs) — the target's GSIs are not yet visible
 ///    at all (a deliberate Train 2 deviation from AWS, which shows them
 ///    `CREATING`/backfilling immediately; see the ADR's own as-built note).
+#[cfg(feature = "server")]
 async fn restore_table_from_backup(
     ctx: &ClientCtx,
     backup_arn: &str,
@@ -4017,6 +4038,7 @@ struct RestoreProvision {
     gsi_defs: Vec<IndexDef>,
 }
 
+#[cfg(feature = "server")]
 async fn provision_restore_target(
     ctx: &ClientCtx,
     target_table_name: &str,
@@ -4172,6 +4194,7 @@ async fn provision_restore_target(
 /// bounded by this function's own per-attempt [`SCHEMA_COMMIT_TIMEOUT`], for
 /// at least one `Active` member before minting, and skip the propose
 /// (retrying with a fresh id) if the wait still ends empty.
+#[cfg(feature = "server")]
 async fn finish_restore_kickoff(
     ctx: &ClientCtx,
     backup_id: &str,
@@ -4276,6 +4299,7 @@ async fn finish_restore_kickoff(
 ///    (`crate::backup_restore`) does the actual seeding-plus-replay in the
 ///    background exactly like an ordinary on-demand restore, just with one
 ///    more source of `SeedRow`s to sweep (see that module's own doc).
+#[cfg(feature = "server")]
 async fn restore_table_to_point_in_time(
     ctx: &ClientCtx,
     source_table_name: &str,

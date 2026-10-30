@@ -24,6 +24,13 @@
 //!
 //! The default backend is [`SimEngineBackend::Memory`]: every pre-existing
 //! `SimCluster` constructor still builds exactly what it always did.
+#![cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "the embedded build exposes a subset of this fixture through `EmbeddedCluster`; the rest is the SimCluster test tier's surface"
+    )
+)]
 
 use std::collections::BTreeSet;
 

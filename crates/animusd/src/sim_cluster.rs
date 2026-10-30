@@ -141,6 +141,13 @@
 //! convergence proof it's closed). See `crates/animusd/CLAUDE.md`'s own D4
 //! PR 1 entry and ADR 0061's matching 2026-09-07 amendment for the full
 //! account of all of the above.
+#![cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "the embedded build exposes a subset of this fixture through `EmbeddedCluster`; the rest is the SimCluster test tier's surface"
+    )
+)]
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::net::SocketAddr;

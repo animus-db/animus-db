@@ -872,6 +872,7 @@ const MREC_LOOP_INTERVAL: Duration = Duration::from_millis(200);
     clippy::disallowed_methods,
     reason = "a concrete ClientCtx (E = ProdEnv) process-boundary background loop, same class as index_drain::change_consumer_loop; SimWorld drives mrec_ship_table directly"
 )]
+#[cfg(feature = "server")]
 pub(crate) async fn mrec_ship_loop(ctx: ClientCtx) {
     let mut client: Option<std::sync::Arc<crate::mrec_peer::ProdPeerClient>> = None;
     loop {

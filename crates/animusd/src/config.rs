@@ -390,6 +390,7 @@ impl TlsSection {
     /// through `serde_json`, see this type's own doc; `animusd` itself
     /// always enables that feature).
     #[must_use]
+    #[cfg(feature = "server")]
     pub fn to_tls_config(&self) -> animus_env::TlsConfig {
         animus_env::TlsConfig {
             cert_path: self.cert_path.clone(),

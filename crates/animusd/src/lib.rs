@@ -24,6 +24,28 @@
 //! [`BoundNode::start`]. [`bind_cluster`] / [`start_cluster`] do this for an
 //! in-process cluster (used by the binary's `--cluster` mode and the tests).
 
+// The `embedded`-only build (no `server`) reaches the generic client path
+// through `EmbeddedCluster` alone, so a great deal of code that is live in a
+// `server` build — and is linted for dead code there, in the default and
+// `--all-features` clippy runs — is legitimately unreachable, and many imports
+// exist only for the `server`-gated items. Silence those two lint families for
+// that build only; every other lint stays on.
+#![cfg_attr(
+    not(feature = "server"),
+    allow(
+        dead_code,
+        unused_imports,
+        unused_variables,
+        reason = "the embedded-only build reaches a subset of the client path; the same code is dead-code-linted in every server build"
+    )
+)]
+
+#[cfg(not(any(feature = "server", feature = "embedded")))]
+compile_error!(
+    "animusd needs at least one of the `server` (default) or `embedded` features: \
+     `server` is the real node process, `embedded` the in-process simulated cluster"
+);
+
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -31,12 +53,28 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub mod config;
+#[cfg(feature = "server")]
 pub mod control_recover;
+#[cfg(feature = "embedded")]
+pub mod embedded;
 #[deny(clippy::disallowed_methods)]
 mod index_drain;
 mod min_tablets;
+#[cfg(feature = "server")]
 pub mod node_labels;
+#[cfg(feature = "server")]
 pub mod otel;
+/// The `embedded` build has no OpenTelemetry exporter (the crates are
+/// `server`-only); the two propagation hooks the `E: Env`-generic client path
+/// calls are inert, exactly as they are in a `server` build with no
+/// `OTEL_EXPORTER_OTLP_ENDPOINT` configured.
+#[cfg(not(feature = "server"))]
+mod otel {
+    pub(crate) fn current_traceparent() -> Option<String> {
+        None
+    }
+    pub(crate) fn set_parent_traceparent(_span: &tracing::Span, _traceparent: &str) {}
+}
 pub use config::{ClusterConfig, DynamoAuthConfig};
 // Re-exported so callers (CLI, tests, operators) can inspect a node's cached
 // cluster metadata — membership status and the tablet map — without depending on
@@ -89,14 +127,17 @@ use animus_node::host::RelayClient;
 // is the hole this rung closes.
 mod admin;
 mod authz;
+#[cfg(feature = "server")]
 mod backup_capture;
 #[deny(clippy::disallowed_methods)]
 mod backup_completion;
 #[deny(clippy::disallowed_methods)]
 mod backup_janitor;
+#[cfg(feature = "server")]
 mod backup_restore;
 mod client_ctx_host;
 mod console;
+#[cfg(feature = "server")]
 mod control_handle;
 mod dashboard;
 mod dynamo;
@@ -106,6 +147,7 @@ mod forwarding;
 #[deny(clippy::disallowed_methods)]
 mod global_tables;
 mod http;
+#[cfg(feature = "server")]
 mod import;
 #[deny(clippy::disallowed_methods)]
 mod index_backfill;
@@ -141,7 +183,15 @@ mod version_wiring;
 #[deny(clippy::disallowed_methods)]
 mod write_path;
 
+#[cfg(feature = "server")]
 use control_handle::{AnimusdRelayClient, ControlHandle, RemoteControlClient};
+/// The `RelayClient` the bare `ClientCtx` means: the TCP-dialling
+/// [`AnimusdRelayClient`] in a `server` build, the simulator's in-process relay
+/// in an `embedded`-only build.
+#[cfg(feature = "server")]
+type DefaultRelay = AnimusdRelayClient;
+#[cfg(not(feature = "server"))]
+type DefaultRelay = animus_node::sim_relay::SimRelayClient<DefaultEnv>;
 
 use animus_control::node::{DEFAULT_ORPHAN_SWEEP_AFTER, HEARTBEAT_INTERVAL, send_heartbeat};
 use animus_control::{PlacementPolicy, ProposeResult, RaftNode, SharedWal};
@@ -151,11 +201,29 @@ use animus_cp_data::{
     AppliedWatch, FastRead, KindBatchOutcome, KvCommand, KvState, RaftKvNode, ResolveOutcome,
     SHARED_WAL, StageOutcome, TxnDecisionStatus, TxnId, TxnOutcome, TxnRecordView,
 };
+use animus_env::{CLIENT_PROTOCOL, Clock, Env, Metric, MetricsHandle, Nanos, NodeId};
+#[cfg(feature = "server")]
 use animus_env::{
-    CLIENT_PROTOCOL, Clock, Env, FsSegmentStore, MaybeTlsStream, Metric, MetricsHandle, Nanos,
-    NodeId, PreambleError, ProdEnv, TlsMaterial, exchange_preamble_with, read_preamble,
-    write_own_preamble_with,
+    FsSegmentStore, MaybeTlsStream, PreambleError, ProdEnv, TlsMaterial, exchange_preamble_with,
+    read_preamble, write_own_preamble_with,
 };
+
+/// The `Env` the bare (type-parameter-defaulted) `ClientCtx`/`CpGroup`/
+/// `ClusterEdgeState`/`CpRoute` names mean. `ProdEnv` in a `server` build
+/// (unchanged); the simulator's `SimEnv` in an `embedded`-only build, which has
+/// no `ProdEnv` at all (the `compile_error!` above guarantees `embedded` is on
+/// when `server` is off).
+#[cfg(feature = "server")]
+type DefaultEnv = ProdEnv;
+#[cfg(not(feature = "server"))]
+type DefaultEnv = animus_sim::SimEnv;
+
+/// Stand-in for `animus_env::TlsMaterial` in an `embedded`-only build:
+/// uninhabited, so `ClientCtx::tls` is always `None` there and the TLS-only
+/// code paths are provably unreachable.
+#[cfg(not(feature = "server"))]
+#[derive(Clone, Debug)]
+pub(crate) enum TlsMaterial {}
 use animus_storage::{
     Key, LsmEngine, LsmOptions, MemoryEngine, SsTableView, StorageEngine, StorageError,
     VersionedValue, WalRecordView,
@@ -164,6 +232,7 @@ use animus_tablet::{KeyRange, TabletId, TabletState};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+#[cfg(feature = "server")]
 use tokio::net::{TcpListener, TcpStream};
 use tracing::Instrument;
 // Pure CP-topology decision logic (routing predicates), extracted into
@@ -577,7 +646,7 @@ fn outcome_to_status(o: &TxnOutcome) -> TxnDecisionStatus {
 /// instantiation site" equivalent, containing the blast radius to this
 /// definition rather than touching every call site.
 #[derive(Clone)]
-enum CpGroup<E: Env = ProdEnv> {
+enum CpGroup<E: Env = DefaultEnv> {
     /// Durable on-disk LSM (default; survives a restart).
     Lsm(RaftKvNode<E, LsmEngine<E>>),
     /// Volatile in-memory engine (ephemeral runs).
@@ -586,7 +655,14 @@ enum CpGroup<E: Env = ProdEnv> {
 
 impl<E: Env> CpGroup<E> {
     /// Test-only: `role@term` for a corpus's convergence-timeout dump.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "embedded"))]
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "fixture helper: used by the SimCluster test tier; an embedded build does not call it"
+        )
+    )]
     fn role_term(&self) -> String {
         match self {
             CpGroup::Lsm(n) => format!("{:?}@{}", n.role(), n.term()),
@@ -597,7 +673,14 @@ impl<E: Env> CpGroup<E> {
     /// The group's feature-gate handle (ADR 0073 Phase 2): the node's own
     /// control-fed handle when the reconciler injected it, else a private
     /// floor handle. Test-only: nothing in production reads it back.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "embedded"))]
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "fixture helper: used by the SimCluster test tier; an embedded build does not call it"
+        )
+    )]
     fn features(&self) -> animus_control::version::ClusterFeatures {
         match self {
             CpGroup::Lsm(n) => n.features(),
@@ -607,7 +690,14 @@ impl<E: Env> CpGroup<E> {
 
     /// The applied index `peer` last reported to this group's leader
     /// (issue #1330). Test-only.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "embedded"))]
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "fixture helper: used by the SimCluster test tier; an embedded build does not call it"
+        )
+    )]
     fn peer_applied_index(&self, peer: &NodeId) -> Option<u64> {
         match self {
             CpGroup::Lsm(n) => n.peer_applied_index(peer),
@@ -1127,7 +1217,14 @@ impl<E: Env> CpGroup<E> {
     /// a real in-place split's own data-plane fork (`KvCommand::
     /// SplitTablet`, which shares this same latch) reaches, without waiting
     /// out the fork/cutover window itself.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "embedded"))]
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "fixture helper: used by the SimCluster test tier; an embedded build does not call it"
+        )
+    )]
     pub(crate) fn propose_freeze(&self) -> ProposeResult {
         match self {
             CpGroup::Lsm(n) => n.propose_freeze(),
@@ -1151,7 +1248,14 @@ impl<E: Env> CpGroup<E> {
     /// Highest committed log index this replica knows of (a follower learns it
     /// only from the leader's next AppendEntries/heartbeat). Test-only: the
     /// `SimCluster` replica catch-up poll's input.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "embedded"))]
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "fixture helper: used by the SimCluster test tier; an embedded build does not call it"
+        )
+    )]
     pub(crate) fn commit_index(&self) -> u64 {
         match self {
             CpGroup::Lsm(n) => n.commit_index(),
@@ -1299,7 +1403,14 @@ impl<E: Env> CpGroup<E> {
     /// `flush_pending` check (`animus-cp-data`'s `CLAUDE.md`), distinct from
     /// [`is_stopped`](Self::is_stopped) (whether the driver has actually
     /// exited yet). See [`RaftKvNode::is_halted`].
-    #[cfg(test)]
+    #[cfg(any(test, feature = "embedded"))]
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "fixture helper: used by the SimCluster test tier; an embedded build does not call it"
+        )
+    )]
     fn is_halted(&self) -> bool {
         match self {
             CpGroup::Lsm(n) => n.is_halted(),
@@ -1988,7 +2099,7 @@ impl<E: Env> CpGroup<E> {
 // Boxing `Local`'s `CpGroup` would put a heap allocation on the read/write hot
 // path just to shrink a stack value that lives for one match.
 #[allow(clippy::large_enum_variant)]
-enum CpRoute<E: Env = ProdEnv> {
+enum CpRoute<E: Env = DefaultEnv> {
     /// This node hosts the current leader — serve from `leader` directly.
     Local(CpGroup<E>),
     /// Forward to the leader's node at this client-API address (ADR 0017
@@ -2592,6 +2703,7 @@ const CLIENT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 ///
 /// `role` is `"accept"` or `"dial"`, only for the log line; `peer_desc` is
 /// the peer's address as this side knows it.
+#[cfg(feature = "server")]
 fn classify_client_handshake_error(
     err: PreambleError,
     role: &'static str,
@@ -2651,6 +2763,7 @@ fn classify_client_handshake_error(
 /// the peer's address as this side knows it. On any failure the connection
 /// is simply not usable any further — the caller closes it (by dropping
 /// it) without ever entering the frame loop.
+#[cfg(feature = "server")]
 async fn perform_client_handshake<S: AsyncRead + AsyncWrite + Unpin>(
     conn: &mut S,
     role: &'static str,
@@ -2702,6 +2815,7 @@ async fn perform_client_handshake<S: AsyncRead + AsyncWrite + Unpin>(
 /// only a small, bounded amount before reading anything (a preamble, plus
 /// on our side one request frame), so neither side's write can ever block
 /// on the other side's own unread output for long enough to matter.
+#[cfg(feature = "server")]
 async fn client_request_pipelined<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     peer_desc: &str,
@@ -2790,6 +2904,7 @@ async fn client_request_pipelined<S: AsyncRead + AsyncWrite + Unpin>(
 /// # Errors
 /// Propagates a connect failure, or a handshake failure/refusal/timeout —
 /// see [`perform_client_handshake`].
+#[cfg(feature = "server")]
 pub async fn connect_client(addr: impl tokio::net::ToSocketAddrs) -> std::io::Result<TcpStream> {
     let mut stream = TcpStream::connect(addr).await?;
     perform_client_handshake(
@@ -3246,6 +3361,7 @@ pub(crate) fn advertised_addr(advertise_host: Option<&str>, bind_addr: SocketAdd
 /// A node whose listeners are bound but whose protocols are not yet started.
 /// Expose the bound addresses, assemble the cluster peer book, then
 /// [`start`](BoundNode::start).
+#[cfg(feature = "server")]
 pub struct BoundNode {
     id: NodeId,
     env: ProdEnv,
@@ -4199,6 +4315,7 @@ trait ConsoleDispatch<E: Env, R: RelayClient>: Send + Sync {
 struct ProductionDispatch;
 
 #[async_trait::async_trait]
+#[cfg(feature = "server")]
 impl ConsoleDispatch<ProdEnv, AnimusdRelayClient> for ProductionDispatch {
     async fn execute(ctx: &ClientCtx, target: &str, body: &[u8]) -> (u16, String) {
         crate::dynamo::execute_routed(ctx, target, body).await
@@ -4871,6 +4988,7 @@ async fn console_op_get_stream_records<E: Env, R: RelayClient, D: ConsoleDispatc
 /// `docs/engineering-lessons.md`'s matching 2026-09-08 entry for why the
 /// two must stay genuinely separate impls.
 #[async_trait::async_trait]
+#[cfg(feature = "server")]
 impl console::ConsoleBackend for ClientCtx {
     async fn create_table(
         &self,
@@ -5183,6 +5301,7 @@ fn stream_view_type_label(view_type: animus_control::StreamViewType) -> &'static
 /// every role — a control-only node registers a real `internal` address
 /// too, since it needs it for its own control Raft).
 #[allow(clippy::too_many_arguments)] // node assembly: control handle + edge + role + admin + routing
+#[cfg(feature = "server")]
 fn spawn_common_tail(
     control: ControlHandle,
     edge: ClusterEdgeState,
@@ -5455,6 +5574,7 @@ fn spawn_common_tail(
 /// converged-or-timeout poll on the actual resource (e.g. re-binding each
 /// address), never a single check immediately after the failing call
 /// returns.
+#[cfg(feature = "server")]
 struct StartupTasks {
     tasks: Vec<tokio::task::JoinHandle<()>>,
     envs: Vec<ProdEnv>,
@@ -5465,6 +5585,7 @@ struct StartupTasks {
     armed: bool,
 }
 
+#[cfg(feature = "server")]
 impl StartupTasks {
     /// Start tracking `envs` (in practice always exactly this node's one
     /// shared internal `ProdEnv`, cloned — see [`Node`]'s own `envs` field
@@ -5496,6 +5617,7 @@ impl StartupTasks {
     }
 }
 
+#[cfg(feature = "server")]
 impl std::ops::Deref for StartupTasks {
     type Target = Vec<tokio::task::JoinHandle<()>>;
     fn deref(&self) -> &Self::Target {
@@ -5503,12 +5625,14 @@ impl std::ops::Deref for StartupTasks {
     }
 }
 
+#[cfg(feature = "server")]
 impl std::ops::DerefMut for StartupTasks {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.tasks
     }
 }
 
+#[cfg(feature = "server")]
 impl Drop for StartupTasks {
     fn drop(&mut self) {
         if !self.armed {
@@ -5529,6 +5653,7 @@ impl Drop for StartupTasks {
     }
 }
 
+#[cfg(feature = "server")]
 impl BoundNode {
     /// Set the max inter-region round trip (ADR 0075 section 3.4) — see
     /// `ClusterSettings::max_region_rtt_ms`. Inert unless some group spans more
@@ -6714,6 +6839,7 @@ impl BoundNode {
 /// is `Option` internally; the public accessor below still
 /// return a bare `SocketAddr` (panicking if absent) so every existing
 /// combined-mode caller — which only ever holds a `Some` — is unaffected.
+#[cfg(feature = "server")]
 pub struct Node {
     /// This node's control-plane access (ADR 0035 PR1/PR4) — `Local` for
     /// combined mode and a control-only node (both hold a real local
@@ -6812,6 +6938,7 @@ fn load_encryption_key(
         .transpose()
 }
 
+#[cfg(feature = "server")]
 impl Node {
     /// Bind this node's listeners (the one internal env + the client TCP
     /// server + the DynamoDB HTTP endpoint) and create its data
@@ -7510,6 +7637,7 @@ impl Node {
 /// `shutdown()` call still leaves its tasks running exactly as before this
 /// fix (see `shutdown()`'s own doc); only the durability assert those tasks
 /// can now safely race against an eventual abrupt stop is fixed.
+#[cfg(feature = "server")]
 impl Drop for Node {
     fn drop(&mut self) {
         self.edge.halt_hosted_cp_groups();
@@ -7531,6 +7659,7 @@ const NODE_SHUTDOWN_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 /// were already aborted; the caller proceeds regardless), matching
 /// `shutdown`'s existing fire-and-forget failure mode for the pathological
 /// case, while still turning the common case into a genuine guarantee.
+#[cfg(feature = "server")]
 async fn wait_all_finished(tasks: &[tokio::task::JoinHandle<()>]) {
     let poll = async {
         loop {
@@ -7566,6 +7695,7 @@ const CP_GC_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 /// never hosts a tablet or speaks a data-plane wire protocol). See
 /// [`Node::bind_control`] to construct one and
 /// [`start_control_with`](Self::start_control_with) to start it.
+#[cfg(feature = "server")]
 pub struct BoundControlNode {
     id: NodeId,
     env: ProdEnv,
@@ -7612,6 +7742,7 @@ pub struct BoundControlNode {
     overload: Option<config::OverloadSection>,
 }
 
+#[cfg(feature = "server")]
 impl BoundControlNode {
     /// Set the max inter-region round trip (ADR 0075 section 3.4) — see
     /// `ClusterSettings::max_region_rtt_ms`. Inert unless some group spans more
@@ -8065,6 +8196,7 @@ impl BoundControlNode {
 /// 0040 PR1) plus the client/dynamo/admin TCP listeners; no local
 /// control `RaftCore`, no bootstrap. See [`Node::bind_data`] to
 /// construct one and [`start_data_with`](Self::start_data_with) to start it.
+#[cfg(feature = "server")]
 pub struct BoundDataNode {
     id: NodeId,
     env: ProdEnv,
@@ -8134,6 +8266,7 @@ pub struct BoundDataNode {
     overload: Option<config::OverloadSection>,
 }
 
+#[cfg(feature = "server")]
 impl BoundDataNode {
     /// Set the max inter-region round trip (ADR 0075 section 3.4) — see
     /// `ClusterSettings::max_region_rtt_ms`. Inert unless some group spans more
@@ -8935,7 +9068,7 @@ impl BoundDataNode {
 /// binding is not part of this rung's cut — see `ClientCtx::control`'s own
 /// note).
 #[derive(Clone)]
-pub struct ClusterEdgeState<E: Env = ProdEnv> {
+pub struct ClusterEdgeState<E: Env = DefaultEnv> {
     /// This **node's own** control `RaftNode` handle (at most one entry — see
     /// [`register_control`](Self::register_control)), so `propose_schema` can
     /// propose a schema `MetaCommand` **locally** when this node is the
@@ -9128,7 +9261,14 @@ impl<E: Env> ClusterEdgeState<E> {
     /// in place onto a reused `ClusterEdgeState` — a real process restart
     /// always builds a brand-new one — so this method's only caller is
     /// `SimCluster::restart`.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "embedded"))]
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "fixture helper: used by the SimCluster test tier; an embedded build does not call it"
+        )
+    )]
     fn replace_control(&self, raft: RaftNode<E>) {
         let mut guard = self.control.lock().expect("control handles poisoned");
         guard.clear();
@@ -9144,7 +9284,14 @@ impl<E: Env> ClusterEdgeState<E> {
     /// slot cycle, found and fixed the same day) and `docs/engineering-
     /// lessons.md`'s matching entry. `#[cfg(test)]`-only: a pure diagnostic
     /// with no production caller.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "embedded"))]
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "fixture helper: used by the SimCluster test tier; an embedded build does not call it"
+        )
+    )]
     pub(crate) fn downgrade_control(&self) -> std::sync::Weak<Mutex<Vec<RaftNode<E>>>> {
         Arc::downgrade(&self.control)
     }
@@ -9243,6 +9390,7 @@ impl<E: Env> ClusterEdgeState<E> {
     /// deleting a dropped tablet's files. Bounded by `CP_GC_STOP_TIMEOUT`; a group
     /// that doesn't stop in time is logged and left for the subsequent hard abort
     /// (the process is exiting either way).
+    #[cfg(feature = "server")]
     async fn shutdown_all_cp_groups(&self) {
         let groups = self.halt_hosted_cp_groups();
         let deadline = tokio::time::Instant::now() + CP_GC_STOP_TIMEOUT;
@@ -9491,12 +9639,14 @@ pub const DEFAULT_SHARED_WAL: bool = true;
 /// ::Cluster`/`BackupStoreHandle::Cluster` keep exactly one variant each,
 /// never a fourth `EncryptedCluster` arm.
 #[derive(Clone)]
+#[cfg(feature = "server")]
 pub(crate) enum LocalSegmentStore {
     Plain(FsSegmentStore),
     Encrypted(animus_env::EncryptedSegmentStore<FsSegmentStore, ProdEnv>),
 }
 
 #[async_trait::async_trait]
+#[cfg(feature = "server")]
 impl animus_env::SegmentStore for LocalSegmentStore {
     async fn put(&self, id: &str, bytes: &[u8]) -> std::io::Result<()> {
         match self {
@@ -9543,6 +9693,7 @@ impl animus_env::SegmentStore for LocalSegmentStore {
 /// # Errors
 /// The loud-refusal marker check (a key/directory mismatch, in either
 /// direction).
+#[cfg(feature = "server")]
 async fn local_cluster_store(
     env: &ProdEnv,
     dir: PathBuf,
@@ -9576,7 +9727,9 @@ async fn local_cluster_store(
 /// consistency the operator is choosing to accept).
 #[derive(Clone)]
 pub(crate) enum SegmentStoreHandle {
+    #[cfg(feature = "server")]
     Cluster(animus_cp_data::cluster_segment_store::ClusterSegmentStore<ProdEnv, LocalSegmentStore>),
+    #[cfg(feature = "server")]
     Fs(FsSegmentStore),
     /// The `--encryption-key`-sealed sibling of [`Fs`](Self::Fs) (ADR 0069,
     /// S-03 PR 2) — every object this node writes/reads through this
@@ -9586,6 +9739,7 @@ pub(crate) enum SegmentStoreHandle {
     /// this store must be configured with the *same* key file). Handled
     /// identically to `Fs` in every method below — no per-node replica
     /// concept either way.
+    #[cfg(feature = "server")]
     EncryptedFs(animus_env::EncryptedSegmentStore<FsSegmentStore, ProdEnv>),
     /// `--segment-store s3://bucket[/prefix]?endpoint=...` (S-04 PR 2) — a
     /// `Arc<dyn SegmentStore>` rather than a concrete
@@ -9620,12 +9774,15 @@ impl SegmentStoreHandle {
     /// read path, a later PR, is what interprets it).
     async fn put_sealed(&self, id: &str, bytes: &[u8]) -> std::io::Result<Vec<NodeId>> {
         match self {
+            #[cfg(feature = "server")]
             SegmentStoreHandle::Cluster(c) => c.put_replicated(id, bytes).await,
+            #[cfg(feature = "server")]
             SegmentStoreHandle::Fs(fs) => {
                 use animus_env::SegmentStore;
                 fs.put(id, bytes).await?;
                 Ok(Vec::new())
             }
+            #[cfg(feature = "server")]
             SegmentStoreHandle::EncryptedFs(fs) => {
                 use animus_env::SegmentStore;
                 fs.put(id, bytes).await?;
@@ -9656,8 +9813,11 @@ impl SegmentStoreHandle {
     ) -> std::io::Result<Option<Vec<u8>>> {
         use animus_env::SegmentStore;
         match self {
+            #[cfg(feature = "server")]
             SegmentStoreHandle::Cluster(c) => c.get_from(replicas, id).await,
+            #[cfg(feature = "server")]
             SegmentStoreHandle::Fs(fs) => fs.get(id).await,
+            #[cfg(feature = "server")]
             SegmentStoreHandle::EncryptedFs(fs) => fs.get(id).await,
             SegmentStoreHandle::S3(s3) => s3.get(id).await,
         }
@@ -9676,8 +9836,11 @@ impl SegmentStoreHandle {
     pub(crate) async fn delete_sealed(&self, replicas: &[NodeId], id: &str) -> std::io::Result<()> {
         use animus_env::SegmentStore;
         match self {
+            #[cfg(feature = "server")]
             SegmentStoreHandle::Cluster(c) => c.delete_from(replicas, id).await,
+            #[cfg(feature = "server")]
             SegmentStoreHandle::Fs(fs) => fs.delete(id).await,
+            #[cfg(feature = "server")]
             SegmentStoreHandle::EncryptedFs(fs) => fs.delete(id).await,
             SegmentStoreHandle::S3(s3) => s3.delete(id).await,
         }
@@ -9705,10 +9868,13 @@ impl SegmentStoreHandle {
         target_k: usize,
     ) -> std::io::Result<Vec<NodeId>> {
         match self {
+            #[cfg(feature = "server")]
             SegmentStoreHandle::Cluster(c) => c.repair(id, bytes, surviving, target_k).await,
-            SegmentStoreHandle::Fs(_)
-            | SegmentStoreHandle::EncryptedFs(_)
-            | SegmentStoreHandle::S3(_) => Ok(surviving.to_vec()),
+            #[cfg(feature = "server")]
+            SegmentStoreHandle::Fs(_) | SegmentStoreHandle::EncryptedFs(_) => {
+                Ok(surviving.to_vec())
+            }
+            SegmentStoreHandle::S3(_) => Ok(surviving.to_vec()),
         }
     }
 
@@ -9725,8 +9891,11 @@ impl SegmentStoreHandle {
     pub(crate) async fn list_local(&self, prefix: &str) -> std::io::Result<Vec<String>> {
         use animus_env::SegmentStore;
         match self {
+            #[cfg(feature = "server")]
             SegmentStoreHandle::Cluster(c) => c.local().list(prefix).await,
+            #[cfg(feature = "server")]
             SegmentStoreHandle::Fs(fs) => fs.list(prefix).await,
+            #[cfg(feature = "server")]
             SegmentStoreHandle::EncryptedFs(fs) => fs.list(prefix).await,
             SegmentStoreHandle::S3(s3) => s3.list(prefix).await,
         }
@@ -9739,8 +9908,11 @@ impl SegmentStoreHandle {
     pub(crate) async fn get_local(&self, id: &str) -> std::io::Result<Option<Vec<u8>>> {
         use animus_env::SegmentStore;
         match self {
+            #[cfg(feature = "server")]
             SegmentStoreHandle::Cluster(c) => c.local().get(id).await,
+            #[cfg(feature = "server")]
             SegmentStoreHandle::Fs(fs) => fs.get(id).await,
+            #[cfg(feature = "server")]
             SegmentStoreHandle::EncryptedFs(fs) => fs.get(id).await,
             SegmentStoreHandle::S3(s3) => s3.get(id).await,
         }
@@ -9755,8 +9927,11 @@ impl SegmentStoreHandle {
     pub(crate) async fn delete_local(&self, id: &str) -> std::io::Result<()> {
         use animus_env::SegmentStore;
         match self {
+            #[cfg(feature = "server")]
             SegmentStoreHandle::Cluster(c) => c.local().delete(id).await,
+            #[cfg(feature = "server")]
             SegmentStoreHandle::Fs(fs) => fs.delete(id).await,
+            #[cfg(feature = "server")]
             SegmentStoreHandle::EncryptedFs(fs) => fs.delete(id).await,
             SegmentStoreHandle::S3(s3) => s3.delete(id).await,
         }
@@ -9779,11 +9954,13 @@ impl SegmentStoreHandle {
 /// plane-follower-less growth node in this PR anyway (see
 /// [`BoundNode::start_with_streams`]'s own doc).
 #[derive(Clone)]
+#[cfg(feature = "server")]
 struct ControlPlacementView {
     control: ControlHandle,
     self_id: NodeId,
 }
 
+#[cfg(feature = "server")]
 impl animus_cp_data::cluster_segment_store::PlacementView for ControlPlacementView {
     fn self_id(&self) -> NodeId {
         self.self_id.clone()
@@ -9897,6 +10074,7 @@ pub enum SegmentStoreConfig {
 /// A transport for a credential endpoint: TLS for `https://`, plain HTTP for
 /// `http://` (IMDS and ECS/Pod Identity are link-local plain HTTP by
 /// design; an `http://` STS endpoint is a local-test knob).
+#[cfg(feature = "server")]
 fn credential_endpoint_transport(
     url: &str,
 ) -> std::io::Result<animus_s3::prod::HyperRustlsTransport> {
@@ -9916,6 +10094,7 @@ fn credential_endpoint_transport(
 /// # Errors
 /// A transport can't be built, or `Container` is selected without the
 /// `AWS_CONTAINER_CREDENTIALS_*` environment.
+#[cfg(feature = "server")]
 fn s3_credential_provider(
     source: &S3CredentialSource,
     region: &str,
@@ -9978,6 +10157,7 @@ fn s3_credential_provider(
 /// "already installed by this same call" is not an error), the credential
 /// provider can't be built, or virtual-hosted addressing is asked for
 /// against an IP endpoint / non-DNS bucket name.
+#[cfg(feature = "server")]
 fn s3_segment_store<E: animus_env::Clock + animus_env::Rng>(
     s3: &S3StoreConfig,
     env: E,
@@ -10060,6 +10240,7 @@ pub type ExportStoreFactory = Arc<
 /// `create_export` maps it to `ValidationException`) rather than a panic —
 /// a node with no `--export-s3-endpoint`/`--export-s3-region` configured
 /// simply cannot serve `ExportTableToPointInTime` yet.
+#[cfg(feature = "server")]
 fn default_export_store_factory<E: animus_env::Clock + animus_env::Rng + Clone + 'static>(
     export_s3: Option<ExportS3Config>,
     env: E,
@@ -10083,6 +10264,21 @@ fn default_export_store_factory<E: animus_env::Clock + animus_env::Rng + Clone +
         let store: Arc<dyn animus_env::SegmentStore> =
             Arc::new(s3_segment_store(&s3, env.clone())?);
         Ok(store)
+    })
+}
+
+/// The `embedded` build has no S3 transport, so no export store can ever be
+/// built: the factory always returns the same clear "not configured" error a
+/// `server` node with no `--export-s3-*` flags returns.
+#[cfg(not(feature = "server"))]
+fn default_export_store_factory<E: animus_env::Clock + animus_env::Rng + Clone + 'static>(
+    _export_s3: Option<ExportS3Config>,
+    _env: E,
+) -> ExportStoreFactory {
+    Arc::new(|_bucket: &str, _prefix: Option<&str>| {
+        Err(std::io::Error::other(
+            "S3 export is not available in the embedded build",
+        ))
     })
 }
 
@@ -10338,6 +10534,7 @@ mod s3_store_handle_tests {
 /// The `S3` variant can fail (see [`s3_segment_store`]'s own doc); every
 /// variant can fail the loud-refusal marker check above (a key/store
 /// mismatch).
+#[cfg(feature = "server")]
 async fn build_segment_store(
     env: &ProdEnv,
     dir: &Path,
@@ -10416,12 +10613,15 @@ async fn build_segment_store(
 /// manifest object — see each module's own doc.
 #[derive(Clone)]
 pub(crate) enum BackupStoreHandle {
+    #[cfg(feature = "server")]
     Cluster(animus_cp_data::cluster_segment_store::ClusterSegmentStore<ProdEnv, LocalSegmentStore>),
+    #[cfg(feature = "server")]
     Fs(FsSegmentStore),
     /// The `--encryption-key`-sealed sibling of [`Fs`](Self::Fs) — see
     /// [`SegmentStoreHandle::EncryptedFs`]'s own doc (ADR 0069, S-03 PR 2);
     /// identical shape and cluster-wide key-scope contract, just for the
     /// backup store's own object namespace.
+    #[cfg(feature = "server")]
     EncryptedFs(animus_env::EncryptedSegmentStore<FsSegmentStore, ProdEnv>),
     /// `--backup-store s3://bucket[/prefix]?endpoint=...` (S-04 PR 2) — see
     /// [`SegmentStoreHandle::S3`]'s doc for why this holds a
@@ -10439,12 +10639,15 @@ impl BackupStoreHandle {
     /// replica concept, ask any node" signal).
     pub(crate) async fn put(&self, id: &str, bytes: &[u8]) -> std::io::Result<Vec<NodeId>> {
         match self {
+            #[cfg(feature = "server")]
             BackupStoreHandle::Cluster(c) => c.put_replicated(id, bytes).await,
+            #[cfg(feature = "server")]
             BackupStoreHandle::Fs(fs) => {
                 use animus_env::SegmentStore;
                 fs.put(id, bytes).await?;
                 Ok(Vec::new())
             }
+            #[cfg(feature = "server")]
             BackupStoreHandle::EncryptedFs(fs) => {
                 use animus_env::SegmentStore;
                 fs.put(id, bytes).await?;
@@ -10470,8 +10673,11 @@ impl BackupStoreHandle {
     ) -> std::io::Result<Option<Vec<u8>>> {
         use animus_env::SegmentStore;
         match self {
+            #[cfg(feature = "server")]
             BackupStoreHandle::Cluster(c) => c.get_from(replicas, id).await,
+            #[cfg(feature = "server")]
             BackupStoreHandle::Fs(fs) => fs.get(id).await,
+            #[cfg(feature = "server")]
             BackupStoreHandle::EncryptedFs(fs) => fs.get(id).await,
             BackupStoreHandle::S3(s3) => s3.get(id).await,
         }
@@ -10493,8 +10699,11 @@ impl BackupStoreHandle {
     pub(crate) async fn get_any(&self, id: &str) -> std::io::Result<Option<Vec<u8>>> {
         use animus_env::SegmentStore;
         match self {
+            #[cfg(feature = "server")]
             BackupStoreHandle::Cluster(c) => c.get(id).await,
+            #[cfg(feature = "server")]
             BackupStoreHandle::Fs(fs) => fs.get(id).await,
+            #[cfg(feature = "server")]
             BackupStoreHandle::EncryptedFs(fs) => fs.get(id).await,
             BackupStoreHandle::S3(s3) => s3.get(id).await,
         }
@@ -10509,8 +10718,11 @@ impl BackupStoreHandle {
     pub(crate) async fn delete(&self, replicas: &[NodeId], id: &str) -> std::io::Result<()> {
         use animus_env::SegmentStore;
         match self {
+            #[cfg(feature = "server")]
             BackupStoreHandle::Cluster(c) => c.delete_from(replicas, id).await,
+            #[cfg(feature = "server")]
             BackupStoreHandle::Fs(fs) => fs.delete(id).await,
+            #[cfg(feature = "server")]
             BackupStoreHandle::EncryptedFs(fs) => fs.delete(id).await,
             BackupStoreHandle::S3(s3) => s3.delete(id).await,
         }
@@ -10530,8 +10742,11 @@ impl BackupStoreHandle {
     pub(crate) async fn list_local(&self, prefix: &str) -> std::io::Result<Vec<String>> {
         use animus_env::SegmentStore;
         match self {
+            #[cfg(feature = "server")]
             BackupStoreHandle::Cluster(c) => c.local().list(prefix).await,
+            #[cfg(feature = "server")]
             BackupStoreHandle::Fs(fs) => fs.list(prefix).await,
+            #[cfg(feature = "server")]
             BackupStoreHandle::EncryptedFs(fs) => fs.list(prefix).await,
             BackupStoreHandle::S3(s3) => s3.list(prefix).await,
         }
@@ -10544,8 +10759,11 @@ impl BackupStoreHandle {
     pub(crate) async fn delete_local(&self, id: &str) -> std::io::Result<()> {
         use animus_env::SegmentStore;
         match self {
+            #[cfg(feature = "server")]
             BackupStoreHandle::Cluster(c) => c.local().delete(id).await,
+            #[cfg(feature = "server")]
             BackupStoreHandle::Fs(fs) => fs.delete(id).await,
+            #[cfg(feature = "server")]
             BackupStoreHandle::EncryptedFs(fs) => fs.delete(id).await,
             BackupStoreHandle::S3(s3) => s3.delete(id).await,
         }
@@ -10561,8 +10779,11 @@ impl BackupStoreHandle {
     pub(crate) async fn get_local(&self, id: &str) -> std::io::Result<Option<Vec<u8>>> {
         use animus_env::SegmentStore;
         match self {
+            #[cfg(feature = "server")]
             BackupStoreHandle::Cluster(c) => c.local().get(id).await,
+            #[cfg(feature = "server")]
             BackupStoreHandle::Fs(fs) => fs.get(id).await,
+            #[cfg(feature = "server")]
             BackupStoreHandle::EncryptedFs(fs) => fs.get(id).await,
             BackupStoreHandle::S3(s3) => s3.get(id).await,
         }
@@ -10622,6 +10843,7 @@ pub enum BackupStoreConfig {
 /// # Errors
 /// See [`build_segment_store`]'s own doc — the `S3` variant can fail, and
 /// every variant can fail the loud-refusal marker check.
+#[cfg(feature = "server")]
 async fn build_backup_store(
     env: &ProdEnv,
     dir: &Path,
@@ -11692,7 +11914,7 @@ struct DataRole {
 /// bound already carries, so this mirrors an established precedent rather
 /// than inventing a new one.
 #[derive(Clone)]
-pub(crate) struct ClientCtx<E: Env = ProdEnv, R: RelayClient = AnimusdRelayClient> {
+pub(crate) struct ClientCtx<E: Env = DefaultEnv, R: RelayClient = DefaultRelay> {
     /// This node's MREC peer settings and receiver concurrency gauge (ADR 0075
     /// section 4.3, G-d M3). Default (no region, no peers) outside a
     /// configured production node.
@@ -13497,6 +13719,7 @@ pub(crate) enum RegisterOutcome {
 /// from a bare node count. In combined mode (every node `Both`, still the
 /// only shape any entry point actually assembles) this is every control id's
 /// paired `raftkv_id`, unchanged from before this ADR.
+#[cfg(feature = "server")]
 async fn bootstrap(raft: RaftNode<ProdEnv>, raftkv_ids: Vec<NodeId>) {
     loop {
         if raft.is_leader() {
@@ -13790,6 +14013,7 @@ const PEER_SYNC_INTERVAL: Duration = Duration::from_millis(200);
 /// of the real cluster's `node_addrs` — instead of its own
 /// never-replicated local raft; every other node is unaffected (`effective_metadata`
 /// passes through to `raft.metadata()` there).
+#[cfg(feature = "server")]
 async fn peer_sync_loop(ctx: ClientCtx, env: ProdEnv, static_peers: BTreeMap<NodeId, String>) {
     loop {
         let mut book = static_peers.clone();
@@ -13819,6 +14043,7 @@ async fn peer_sync_loop(ctx: ClientCtx, env: ProdEnv, static_peers: BTreeMap<Nod
 /// never-replicated local raft. `client_route`'s value is now the same
 /// `host:port` string `Metadata.node_addrs[*].client` already carries — no
 /// parse/re-stringify boundary crossing left at this join point.
+#[cfg(feature = "server")]
 async fn route_sync_loop(ctx: ClientCtx, static_route: BTreeMap<NodeId, String>) {
     loop {
         let mut book = static_route.clone();
@@ -13844,6 +14069,7 @@ async fn route_sync_loop(ctx: ClientCtx, static_route: BTreeMap<NodeId, String>)
 /// node's very first mirror-poll attempt see zero addresses and never
 /// recover (this loop's *next* tick can't help, since `remote_metadata_sync_
 /// loop` captures its `seeds` argument once, at spawn time).
+#[cfg(feature = "server")]
 async fn intra_route_sync_loop(ctx: ClientCtx, static_route: BTreeMap<NodeId, String>) {
     loop {
         let mut book = static_route.clone();
@@ -13886,6 +14112,7 @@ async fn intra_route_sync_loop(ctx: ClientCtx, static_route: BTreeMap<NodeId, St
 /// static-list contract; this is an animusd-local wrapper around the
 /// already-`pub` [`send_heartbeat`] built specifically for the two real-node
 /// call sites ([`BoundNode::start_with`], [`BoundNode::start_data_with`]).
+#[cfg(feature = "server")]
 async fn heartbeat_loop_live(ctx: ClientCtx, env: ProdEnv, static_control_ids: Vec<NodeId>) {
     loop {
         let control_ids: Vec<NodeId> = match ctx.control.config() {
@@ -13943,6 +14170,7 @@ const REMOTE_WATCH_RETRY_BACKOFF: Duration = Duration::from_millis(500);
 /// `seeds` is empty — the case for every node that *is* a real control-group
 /// voter, since `effective_metadata` then passes straight through to
 /// `self.control.metadata_cached()` and nothing needs mirroring.
+#[cfg(feature = "server")]
 async fn remote_metadata_sync_loop(ctx: ClientCtx, seeds: Vec<String>) {
     if seeds.is_empty() {
         return;
@@ -13982,6 +14210,7 @@ async fn remote_metadata_sync_loop(ctx: ClientCtx, seeds: Vec<String>) {
 /// transport level, a plain `Status` poll plus [`REMOTE_WATCH_RETRY_BACKOFF`]
 /// always separates consecutive attempts — there is no code path that retries
 /// immediately in a tight loop.
+#[cfg(feature = "server")]
 async fn remote_metadata_watch_loop(remote: RemoteControlClient, seeds: Vec<String>) {
     loop {
         let last_seen = remote.metadata_watch().latest();
@@ -14099,7 +14328,7 @@ async fn remote_metadata_watch_loop(remote: RemoteControlClient, seeds: Vec<Stri
 /// parameter, not a rename + separate alias, is this rung's containment
 /// mechanism.
 #[derive(Clone)]
-enum SharedEngine<E: Env = ProdEnv> {
+enum SharedEngine<E: Env = DefaultEnv> {
     /// Durable on-disk LSM (default; survives a restart).
     Lsm(LsmEngine<E>),
     /// Volatile in-memory engine (ephemeral runs).
@@ -14223,6 +14452,7 @@ fn parse_tablet_id_from_lsm_filename(filename: &str) -> Option<TabletId> {
 /// The [`LsmEngine`] implementation of the per-tablet engine seam (ADR 0050
 /// rung 1): one private on-disk engine per hosted tablet, opened/probed/
 /// destroyed by filename prefix over this node's one `ProdEnv` disk.
+#[cfg(feature = "server")]
 struct LsmTabletFactory {
     env: ProdEnv,
     /// ADR 0079 layer 3: every tablet engine this factory opens takes its
@@ -14236,6 +14466,7 @@ struct LsmTabletFactory {
     files: animus_cp_data::tablet_files::TabletFileIndex<ProdEnv>,
 }
 
+#[cfg(feature = "server")]
 impl LsmTabletFactory {
     fn new(
         env: ProdEnv,
@@ -14254,6 +14485,7 @@ impl LsmTabletFactory {
     }
 }
 
+#[cfg(feature = "server")]
 impl LsmTabletFactory {
     /// Install the node-shared seams on a tablet engine: the compaction pool
     /// and write budget (ADR 0079 layer 3, ADR 0081 decision 3) and the stall
@@ -14275,7 +14507,9 @@ impl LsmTabletFactory {
 }
 
 #[async_trait::async_trait]
+#[cfg(feature = "server")]
 impl animus_cp_data::host::EngineFactory<LsmEngine<ProdEnv>> for LsmTabletFactory {
+    #[cfg(feature = "server")]
     async fn open(&self, tablet: TabletId) -> Result<LsmEngine<ProdEnv>, String> {
         self.files.note_open(tablet);
         let engine = LsmEngine::open_with(
@@ -14302,6 +14536,7 @@ impl animus_cp_data::host::EngineFactory<LsmEngine<ProdEnv>> for LsmTabletFactor
         }
     }
 
+    #[cfg(feature = "server")]
     async fn flush_engine(&self, engine: &LsmEngine<ProdEnv>) -> Result<(), String> {
         // ADR 0073 Phase 0 layer 4: isolate a freshly stamped layout marker
         // in its own SSTable so it never widens the first kind-row table
@@ -14309,6 +14544,7 @@ impl animus_cp_data::host::EngineFactory<LsmEngine<ProdEnv>> for LsmTabletFactor
         engine.flush_now().await.map_err(|e| e.to_string())
     }
 
+    #[cfg(feature = "server")]
     async fn clone_engine(
         &self,
         source: &LsmEngine<ProdEnv>,
@@ -14413,11 +14649,13 @@ mod lsm_tablet_filename_tests {
 /// generic over the concrete storage engine type, but a node's backend choice
 /// is a runtime value (`StorageBackend`), so this enum picks the
 /// instantiation exactly like `CpGroup` does for `RaftKvNode` itself.
+#[cfg(feature = "server")]
 enum CpReconciler {
     Lsm(Reconciler<ProdEnv, LsmEngine<ProdEnv>>),
     Mem(Reconciler<ProdEnv, MemoryEngine>),
 }
 
+#[cfg(feature = "server")]
 impl CpReconciler {
     /// One reconcile tick — see [`Reconciler::tick`]'s doc for the pure
     /// `plan` decision plus its own execution of the returned actions.
@@ -14626,6 +14864,7 @@ const INPLACE_SPLIT_RECONCILE_INTERVAL: Duration = Duration::from_millis(50);
 /// mirror specifically — `Remote` keeps its own, read straight through
 /// `metadata_cached()`); without this third term the guard would never
 /// release a data-only node's reconciler, ever.
+#[cfg(feature = "server")]
 async fn tablet_host_reconciler_loop(ctx: ClientCtx, mut reconciler: CpReconciler) {
     let watch = ctx.control.metadata_watch();
     let mut last_seen = watch.latest();
@@ -14784,6 +15023,7 @@ const TXN_REAP_BATCH: usize = 128;
 /// loop owned both halves a `Pending` record anchored on a later tablet — or
 /// on a tablet this node had only just become leader of — waited for the
 /// whole backlog, so a read of a key under its intent failed for as long.
+#[cfg(feature = "server")]
 async fn txn_resolver_loop(ctx: ClientCtx) {
     let mut state = TxnResolverState::default();
     loop {
@@ -14795,6 +15035,7 @@ async fn txn_resolver_loop(ctx: ClientCtx) {
 /// The **decided-record sweep** (issue #1369): the second half of what
 /// [`txn_resolver_loop`] used to do, on its own task so its length can never
 /// delay an in-doubt recovery. See [`txn_resolver_decided_pass`].
+#[cfg(feature = "server")]
 async fn txn_decided_sweep_loop(ctx: ClientCtx) {
     let mut state = TxnResolverState::default();
     loop {
@@ -15158,6 +15399,7 @@ pub(crate) struct MetricsSample {
 /// Real wall-clock sleep/timestamp: `animusd` is outside the `Env` determinism
 /// boundary (ADR 0003 only binds sim-tested core crates), so this is exactly
 /// as legitimate as the other `tokio::time`-driven loops in this file.
+#[cfg(feature = "server")]
 async fn metrics_sample_loop(ctx: ClientCtx) {
     loop {
         tokio::time::sleep(METRICS_SAMPLE_INTERVAL).await;
@@ -15782,6 +16024,7 @@ async fn median_split_key<E: Env>(group: &CpGroup<E>) -> Option<Vec<u8>> {
 /// genuine panic (something this loop should never silently swallow) and
 /// at most `debug` if it was merely cancelled/aborted (the ordinary
 /// shutdown path, not a defect).
+#[cfg(feature = "server")]
 async fn serve_requests(
     // `Arc`-wrapped (issue #1060) — this function only ever calls `.accept()`
     // via `&self`, so the `Arc` costs nothing extra here; it exists so
@@ -15962,6 +16205,7 @@ impl<R: AsyncRead + Unpin> AsyncRead for Rewindable<R> {
 ///
 /// Never returns `Err` to its caller — a read error IS the signal this
 /// function exists to produce, not a failure of the function itself.
+#[cfg(feature = "server")]
 async fn peer_closed(read_half: &mut Rewindable<tokio::io::ReadHalf<MaybeTlsStream>>) {
     let mut scratch = [0u8; 1];
     match read_half.read(&mut scratch).await {
@@ -15973,6 +16217,7 @@ async fn peer_closed(read_half: &mut Rewindable<tokio::io::ReadHalf<MaybeTlsStre
     }
 }
 
+#[cfg(feature = "server")]
 async fn handle_connection(
     stream: MaybeTlsStream,
     ctx: ClientCtx,
@@ -16466,6 +16711,7 @@ const CP_CONFIRM_POLL_MAX: Duration = Duration::from_millis(5);
 ///
 /// # Errors
 /// Propagates any bind failure.
+#[cfg(feature = "server")]
 pub async fn bind_cluster(
     n: usize,
     ip: std::net::IpAddr,
@@ -16482,6 +16728,7 @@ pub async fn bind_cluster(
 ///
 /// # Errors
 /// Propagates any bind failure.
+#[cfg(feature = "server")]
 pub async fn bind_cluster_with_advertise_host(
     n: usize,
     ip: std::net::IpAddr,
@@ -16502,6 +16749,7 @@ pub async fn bind_cluster_with_advertise_host(
 /// Propagates any bind / directory-creation failure, including a loud
 /// refusal (`Node::bind` → `ProdEnv::bind_with_tls_and_key`) if a node's
 /// existing data directory is incompatible with the given key.
+#[cfg(feature = "server")]
 pub async fn bind_cluster_with_advertise_host_and_key(
     n: usize,
     ip: std::net::IpAddr,
@@ -16539,6 +16787,7 @@ pub async fn bind_cluster_with_advertise_host_and_key(
 ///
 /// # Errors
 /// Propagates a failure to open any node's CP group engine.
+#[cfg(feature = "server")]
 pub async fn start_cluster(bound: Vec<BoundNode>) -> std::io::Result<Vec<Node>> {
     start_cluster_with(bound, StorageBackend::default()).await
 }
@@ -16547,6 +16796,7 @@ pub async fn start_cluster(bound: Vec<BoundNode>) -> std::io::Result<Vec<Node>> 
 ///
 /// # Errors
 /// Propagates a failure to open any node's CP group engine (LSM backend only).
+#[cfg(feature = "server")]
 pub async fn start_cluster_with(
     bound: Vec<BoundNode>,
     backend: StorageBackend,
@@ -16586,6 +16836,7 @@ pub async fn start_cluster_with(
 ///
 /// # Errors
 /// Propagates a failure to open any node's CP group engine.
+#[cfg(feature = "server")]
 pub async fn start_cluster_with_auto_split_bytes(
     bound: Vec<BoundNode>,
     backend: StorageBackend,
@@ -16626,6 +16877,7 @@ pub async fn start_cluster_with_auto_split_bytes(
 /// # Errors
 /// Propagates a failure to open any node's CP group engine.
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "server")]
 pub async fn start_cluster_with_streams(
     bound: Vec<BoundNode>,
     backend: StorageBackend,
@@ -16666,6 +16918,7 @@ pub async fn start_cluster_with_streams(
 /// # Errors
 /// Propagates a failure to open any node's CP group engine.
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "server")]
 pub async fn start_cluster_with_growth(
     bound: Vec<BoundNode>,
     backend: StorageBackend,
@@ -16712,6 +16965,7 @@ pub async fn start_cluster_with_growth(
 /// # Errors
 /// Propagates a failure to open any node's CP group engine.
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "server")]
 pub async fn start_cluster_with_quiesce_after(
     bound: Vec<BoundNode>,
     backend: StorageBackend,
@@ -16781,6 +17035,7 @@ pub async fn start_cluster_with_quiesce_after(
 /// # Errors
 /// Propagates a failure to open any node's CP group engine.
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "server")]
 pub async fn start_cluster_with_growth_and_quiesce_after(
     bound: Vec<BoundNode>,
     backend: StorageBackend,
@@ -16825,6 +17080,7 @@ pub async fn start_cluster_with_growth_and_quiesce_after(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "server")]
 async fn start_cluster_inner(
     bound: Vec<BoundNode>,
     backend: StorageBackend,
@@ -16972,6 +17228,7 @@ async fn start_cluster_inner(
 /// # Errors
 /// Propagates any bind failure or a failure to open a data node's CP group
 /// engine (LSM backend only).
+#[cfg(feature = "server")]
 pub async fn start_split_cluster_with(
     control_n: usize,
     data_n: usize,
@@ -17001,6 +17258,7 @@ pub async fn start_split_cluster_with(
 /// # Errors
 /// As [`start_split_cluster_with`].
 #[allow(clippy::too_many_arguments)] // mirrors `start_split_cluster_with`'s own arity plus one knob
+#[cfg(feature = "server")]
 pub async fn start_split_cluster_with_orphan_sweep_after(
     control_n: usize,
     data_n: usize,
@@ -17061,6 +17319,7 @@ pub async fn start_split_cluster_with_orphan_sweep_after(
 /// # Errors
 /// As [`start_split_cluster_with`].
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "server")]
 pub async fn start_split_cluster_with_growth(
     control_n: usize,
     data_n: usize,
@@ -17260,6 +17519,7 @@ pub async fn start_split_cluster_with_growth(
 /// # Errors
 /// Returns `InvalidInput` if `index` is out of range, or propagates a bind /
 /// engine-open failure.
+#[cfg(feature = "server")]
 pub async fn run_node(
     config: &ClusterConfig,
     index: usize,
@@ -17272,6 +17532,7 @@ pub async fn run_node(
 ///
 /// # Errors
 /// As [`run_node`].
+#[cfg(feature = "server")]
 pub async fn run_node_with(
     config: &ClusterConfig,
     index: usize,
@@ -17288,6 +17549,7 @@ pub async fn run_node_with(
 ///
 /// # Errors
 /// As [`run_node_with`].
+#[cfg(feature = "server")]
 pub async fn run_node_with_orphan_sweep_after(
     config: &ClusterConfig,
     index: usize,
@@ -17318,6 +17580,7 @@ pub async fn run_node_with_orphan_sweep_after(
 /// # Errors
 /// As [`run_node_with`].
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "server")]
 pub async fn run_node_with_streams(
     config: &ClusterConfig,
     index: usize,
@@ -17353,6 +17616,7 @@ pub async fn run_node_with_streams(
 /// # Errors
 /// As [`run_node_with`].
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "server")]
 pub async fn run_node_with_streams_and_quiesce_after(
     config: &ClusterConfig,
     index: usize,
@@ -17408,6 +17672,7 @@ pub async fn run_node_with_streams_and_quiesce_after(
 /// # Errors
 /// As [`run_node_with`].
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "server")]
 pub async fn run_node_with_streams_and_pitr_snapshot_cadence(
     config: &ClusterConfig,
     index: usize,
@@ -17459,6 +17724,7 @@ pub async fn run_node_with_streams_and_pitr_snapshot_cadence(
 /// # Errors
 /// As [`run_node_with`].
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "server")]
 pub async fn run_node_with_streams_quiesce_and_backup_store(
     config: &ClusterConfig,
     index: usize,
@@ -17537,6 +17803,7 @@ pub async fn run_node_with_streams_quiesce_and_backup_store(
 /// # Errors
 /// As [`run_node_with`].
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "server")]
 pub async fn run_node_with_cluster_settings(
     config: &ClusterConfig,
     index: usize,
@@ -17629,6 +17896,7 @@ pub async fn run_node_with_cluster_settings(
 /// # Errors
 /// As [`run_node_with`].
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "server")]
 pub async fn run_node_with_streams_quiesce_and_ttl_sweep_interval(
     config: &ClusterConfig,
     index: usize,
@@ -17762,6 +18030,7 @@ fn node_election_backpressure<E: Env>(
 /// entry point does the same; the bound-node start half is the one place all
 /// of its callers (`run_bound_node*` included) pass through, so it is applied
 /// here rather than at each caller.
+#[cfg(feature = "server")]
 fn apply_cluster_settings_to_bound(
     bound: BoundNode,
     config: &ClusterConfig,
@@ -17828,6 +18097,7 @@ fn apply_cluster_settings_to_bound(
 /// # Errors
 /// As [`run_node_with`].
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "server")]
 pub async fn start_bound_node_with_streams_quiesce_and_ttl_sweep_interval(
     bound: BoundNode,
     config: &ClusterConfig,
@@ -17947,6 +18217,7 @@ pub async fn start_bound_node_with_streams_quiesce_and_ttl_sweep_interval(
 ///
 /// # Errors
 /// As [`run_node`].
+#[cfg(feature = "server")]
 pub async fn run_bound_node(
     bound: BoundNode,
     config: &ClusterConfig,
@@ -17960,6 +18231,7 @@ pub async fn run_bound_node(
 ///
 /// # Errors
 /// As [`run_node_with`].
+#[cfg(feature = "server")]
 pub async fn run_bound_node_with(
     bound: BoundNode,
     config: &ClusterConfig,
@@ -18018,6 +18290,7 @@ pub async fn run_bound_node_with(
 /// Returns `InvalidInput` if `index` is out of range or does not run the
 /// control role, or propagates a bind failure or a system-keyspace-engine-open
 /// failure.
+#[cfg(feature = "server")]
 pub async fn run_node_control(
     config: &ClusterConfig,
     index: usize,
@@ -18041,6 +18314,7 @@ pub async fn run_node_control(
 ///
 /// # Errors
 /// As [`run_node_control`].
+#[cfg(feature = "server")]
 pub async fn run_node_control_with_orphan_sweep_after(
     config: &ClusterConfig,
     index: usize,
@@ -18075,6 +18349,7 @@ pub async fn run_node_control_with_orphan_sweep_after(
 /// # Errors
 /// As [`run_node_control`].
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "server")]
 pub async fn run_node_control_with_stores(
     config: &ClusterConfig,
     index: usize,
@@ -18172,6 +18447,7 @@ pub async fn run_node_control_with_stores(
 /// Returns `InvalidInput` if `index` is out of range, does not run the data
 /// role, or `config` has no control-role entry for this node to mirror; or
 /// propagates a bind / engine-open failure.
+#[cfg(feature = "server")]
 pub async fn run_node_data(
     config: &ClusterConfig,
     index: usize,
@@ -18247,6 +18523,7 @@ pub async fn run_node_data(
 /// # Errors
 /// As [`run_node_data`].
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "server")]
 pub async fn run_node_data_with_cluster_settings(
     config: &ClusterConfig,
     index: usize,
@@ -18412,6 +18689,7 @@ pub async fn run_node_data_with_cluster_settings(
 ///
 /// # Errors
 /// As [`run_node_with`].
+#[cfg(feature = "server")]
 pub async fn run_node_growth(
     config: &ClusterConfig,
     index: usize,
@@ -18502,6 +18780,7 @@ const JOIN_DISCOVERY_BUDGET: Duration = SCHEMA_COMMIT_TIMEOUT;
 /// fresh connection per seed per pass, exactly the unpooled shape that
 /// helper's own doc names, so pipelining the handshake with the request
 /// frame here saves one round trip per attempt.
+#[cfg(feature = "server")]
 async fn join_request(seeds: &[String], request: &ClientRequest) -> Option<ClientResponse> {
     // A joiner has no `Metadata` yet, so it sends at the **floor** (every era
     // and version gate closed): its requests are `Status`/`JoinInfo` and the
@@ -18529,6 +18808,7 @@ async fn join_request(seeds: &[String], request: &ClientRequest) -> Option<Clien
 ///
 /// # Errors
 /// A `TimedOut` error if no seed answers within `budget`.
+#[cfg(feature = "server")]
 async fn poll_seeds_for(
     seeds: &[String],
     request: &ClientRequest,
@@ -18594,6 +18874,7 @@ async fn poll_seeds_for(
 /// [`JOIN_DISCOVERY_BUDGET`], `AlreadyExists` if an explicit `--id` collides
 /// with a different existing registration, or (as [`run_node_growth`]) a
 /// bind / engine-open failure.
+#[cfg(feature = "server")]
 pub async fn run_node_join(
     seeds: Vec<String>,
     id: Option<NodeId>,
@@ -18647,6 +18928,7 @@ pub async fn run_node_join(
 /// flag here simply sets the value directly, the same shape
 /// `--tls-cert`/`--encryption-key` already have on this path.
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "server")]
 pub async fn run_node_join_with_settings(
     seeds: Vec<String>,
     id: Option<NodeId>,
@@ -18751,6 +19033,7 @@ pub async fn run_node_join_with_settings(
 /// (one identity per node, ADR 0040 PR1 — the pre-growth control ids ARE the
 /// pre-growth data ids), never including this node.
 #[allow(clippy::too_many_arguments)] // a join's id + addrs + discovered sets, no natural grouping
+#[cfg(feature = "server")]
 async fn finish_combined_join(
     bound: BoundNode,
     my_id: NodeId,
@@ -18834,6 +19117,7 @@ async fn finish_combined_join(
 /// verbatim instead of duplicating the poll/match/error-format boilerplate):
 /// polls `seeds` for a [`ClientResponse::JoinInfo`] reply within
 /// [`JOIN_DISCOVERY_BUDGET`].
+#[cfg(feature = "server")]
 async fn discover_join_info(
     seeds: &[String],
 ) -> std::io::Result<(
@@ -18885,6 +19169,7 @@ const MAX_JOIN_MINT_ATTEMPTS: u32 = MAX_MINT_ATTEMPTS;
 /// a `ClientRequest::Status` reply's `node_addrs` for the same observable
 /// outcome `register_node` confirms — `Registered` once it holds exactly
 /// `addrs`, `Collision` once it visibly holds something else.
+#[cfg(feature = "server")]
 async fn register_node_over_wire(
     seeds: &[String],
     node: &NodeId,
@@ -18932,6 +19217,7 @@ async fn register_node_over_wire(
 /// `BoundNode::start_with_growth`'s `mine`). Used only by
 /// [`run_node_join_with_settings`]'s explicit-`--id` bind-then-claim path
 /// (issue #1042) — see that call site's own doc.
+#[cfg(feature = "server")]
 fn bound_node_addrs(bound: &BoundNode, role: &str) -> NodeAddrs {
     NodeAddrs {
         internal: advertised_addr(bound.advertise_host.as_deref(), bound.internal_addr()),
@@ -18944,6 +19230,7 @@ fn bound_node_addrs(bound: &BoundNode, role: &str) -> NodeAddrs {
 
 /// [`bound_node_addrs`]'s data-only dual, for [`run_node_data_join_with_settings`]'s
 /// identical bind-then-claim path.
+#[cfg(feature = "server")]
 fn bound_data_node_addrs(bound: &BoundDataNode, role: &str) -> NodeAddrs {
     NodeAddrs {
         internal: advertised_addr(bound.advertise_host.as_deref(), bound.internal_addr),
@@ -18964,6 +19251,7 @@ fn bound_data_node_addrs(bound: &BoundDataNode, role: &str) -> NodeAddrs {
 /// [`MAX_JOIN_MINT_ATTEMPTS`] tries (astronomically unlikely to ever be
 /// needed — a 128-bit mint colliding once is already vanishing, so this
 /// bound only guards against a genuine bug looping forever).
+#[cfg(feature = "server")]
 async fn claim_join_identity(
     seeds: &[String],
     explicit_id: Option<NodeId>,
@@ -19024,6 +19312,7 @@ async fn claim_join_identity(
 /// wrong role shape, `TimedOut` if no seed answers within
 /// [`JOIN_DISCOVERY_BUDGET`], `AlreadyExists` if an explicit `--id` collides
 /// with a different existing registration, or a bind / engine-open failure.
+#[cfg(feature = "server")]
 pub async fn run_node_data_join(
     seeds: Vec<String>,
     id: Option<NodeId>,
@@ -19065,6 +19354,7 @@ pub async fn run_node_data_join(
 /// resolving the identical flag set the identical "no config file, so no
 /// conflict to check" way.
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "server")]
 pub async fn run_node_data_join_with_settings(
     seeds: Vec<String>,
     id: Option<NodeId>,
@@ -19141,6 +19431,7 @@ pub async fn run_node_data_join_with_settings(
 /// discovered peers/route/admin → derive control seeds → `start_data_with`"
 /// tail of [`run_node_data_join`].
 #[allow(clippy::too_many_arguments)] // mirrors `finish_combined_join`'s shape
+#[cfg(feature = "server")]
 async fn finish_data_join(
     bound: BoundDataNode,
     my_id: NodeId,
@@ -19284,6 +19575,7 @@ pub use animus_node::MAX_FRAME_LEN;
 /// two sentinels below: a pipelined handshake failure is still resolved
 /// (or times out) inside the same outer `timeout(..)`, so it still comes
 /// out as `RELAY_TRANSPORT_FAILURE`/`RELAY_HOP_TIMEOUT` exactly as before.
+#[cfg(feature = "server")]
 async fn relay_request_with_timeout(
     addr: String,
     request: &ClientRequest,
@@ -23024,7 +23316,7 @@ mod two_node_relay_tests {
 /// identical "descendant of the crate root, so `ClientCtx`'s private
 /// fields are reachable with no visibility widened" property this file's
 /// two in-line harnesses rely on).
-#[cfg(test)]
+#[cfg(any(test, feature = "embedded"))]
 mod sim_cluster;
 
 /// The first cycles/durability corpus over [`sim_cluster`] (ADR 0061 rung
@@ -23065,7 +23357,7 @@ mod sim_cluster_gsi_frozen_endgame;
 /// surface).
 #[cfg(test)]
 mod sim_cluster_hosting_ramp;
-#[cfg(test)]
+#[cfg(any(test, feature = "embedded"))]
 mod sim_cluster_lsm;
 /// ADR 0073 Phase 2, P2-D: the mixed-version (rolling Phase 1 -> B2) corpus over
 /// `SimCluster`. Run via `cargo test -p animusd --lib sim_cluster_mixed_version`;

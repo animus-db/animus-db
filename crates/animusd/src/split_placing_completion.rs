@@ -153,6 +153,7 @@ pub(crate) const SPLIT_PLACING_DONE_SETTLE: Duration = Duration::from_millis(1_5
 
 /// Every led tablet's own completion check, once per
 /// [`SPLIT_PLACING_COMPLETION_INTERVAL`] tick.
+#[cfg(feature = "server")]
 pub(crate) async fn split_placing_completion_loop(ctx: ClientCtx) {
     let mut first_seen_converged: BTreeMap<TabletId, Nanos> = BTreeMap::new();
     loop {
