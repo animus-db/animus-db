@@ -57,7 +57,7 @@ jobs:
   # cargo-nextest and every compile job shares an sccache compile cache.
   gates:
     name: gates
-    needs: [lint, test-shard, test-doc]
+    needs: [lint, wasm, test-shard, test-doc]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -66,10 +66,12 @@ jobs:
           lint="${{ needs.lint.result }}"
           shards="${{ needs.test-shard.result }}"
           doc="${{ needs.test-doc.result }}"
+          wasm="${{ needs.wasm.result }}"
           echo "lint (fmt, fixtures, clippy, build, deny): ${lint}"
           echo "test-shard (all shards): ${shards}"
           echo "test-doc: ${doc}"
-          if [ "${lint}" != "success" ] || [ "${shards}" != "success" ] || [ "${doc}" != "success" ]; then
+          echo "wasm (browser build): ${wasm}"
+          if [ "${wasm}" != "success" ] || [ "${lint}" != "success" ] || [ "${shards}" != "success" ] || [ "${doc}" != "success" ]; then
             echo "::error::one or more gates jobs failed"
             exit 1
           fi
@@ -156,6 +158,11 @@ jobs:
       - name: format fixtures are append-only (ADR 0073)
         run: scripts/check-format-fixtures.sh
 
+      # animusd has `autotests = false` (ADR 0082): an unlisted tests/*.rs is
+      # silently never built. Pure shell, no compile.
+      - name: animusd tests/*.rs are all listed in Cargo.toml
+        run: scripts/check-animusd-test-list.sh
+
       # GitHub rejects a workflow with more than 25 `workflow_dispatch`
       # inputs, silently killing every run of it (corpus-deep.yml crossed
       # the cap twice through merges).
@@ -187,6 +194,73 @@ jobs:
 
       - name: cargo-deny check
         run: cargo deny --log-level warn --all-features check
+
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats
+
+  # The browser build (ADR 0082): animusd without its `server` feature, and the
+  # `animus-web` wasm-bindgen shell over it, for wasm32-unknown-unknown. Also
+  # asserts the server-only dependency families (sockets, TLS, OpenTelemetry)
+  # stay out of the wasm graph, and runs the embedded-cluster tests natively.
+  # No `-D warnings` clippy on the embedded-only build: it warns that
+  # clippy.toml's paths are unreachable there (the full-feature clippy in
+  # `lint` already covers the code).
+  wasm:
+    name: wasm
+    runs-on: ubuntu-latest
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo rm -rf /usr/local/share/boost
+          df -h /
+
+      - name: Install Rust toolchain (1.96)
+        uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: "false"
+
+      - name: check animus-web (wasm32)
+        run: cargo check -p animus-web --target wasm32-unknown-unknown --locked
+
+      - name: check animusd embedded-only (wasm32)
+        run: cargo check -p animusd --lib --no-default-features --features embedded --target wasm32-unknown-unknown --locked
+
+      # `cargo tree -i X` exits non-zero when X is not in the graph, which is
+      # what we want; a zero exit means the browser build pulled it in.
+      - name: server-only crates stay out of the wasm graph
+        run: |
+          for crate in socket2 tokio-rustls opentelemetry; do
+            if cargo tree -p animus-web --target wasm32-unknown-unknown -e normal -i "${crate}" --locked >/dev/null 2>&1; then
+              echo "::error::${crate} is in animus-web's wasm dependency graph (a server-only dependency leaked out of animusd's \`server\` feature)"
+              cargo tree -p animus-web --target wasm32-unknown-unknown -e normal -i "${crate}" --locked || true
+              exit 1
+            fi
+          done
+
+      - name: embedded cluster tests (native)
+        run: cargo test -p animusd --lib --features embedded embedded --locked
+
+      - name: animus-web tests (native)
+        run: cargo test -p animus-web --locked
 
       - name: sccache stats
         if: always()
