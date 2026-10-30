@@ -741,7 +741,7 @@ fn seeds_per_scenario() -> usize {
 #[test]
 fn learner_corpus_runs_at_configured_depth() {
     let k = seeds_per_scenario();
-    for i in 0..k {
+    for i in corpus::shard_range_usize(k) {
         let catch_up_seed = if i == 0 {
             0x1EA5_0001
         } else {

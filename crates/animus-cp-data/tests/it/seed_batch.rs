@@ -229,7 +229,7 @@ fn seeds_per_cell() -> u64 {
 /// the exact final row set. Seed-scaled via `ANIMUS_SPLIT_SEEDS`.
 #[test]
 fn corpus_child_leader_crash_mid_seed_reseeds_to_convergence() {
-    for round in 0..seeds_per_cell() {
+    for round in corpus::shard_range(seeds_per_cell()) {
         let seed_n = 4242 + round;
         let (mut sim, _parent, child, engines) = parent_and_child(seed_n);
         settle(&mut sim);

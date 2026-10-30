@@ -44,7 +44,7 @@ fn seeds(base: u64) -> Vec<u64> {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(1);
-    (0..k).map(|i| base + i * 0x9E37).collect()
+    animus_test::corpus::shard_retain((0..k).map(|i| base + i * 0x9E37).collect())
 }
 
 /// splitmix64: a tiny seeded generator for the pure cells.

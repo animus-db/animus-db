@@ -82,7 +82,7 @@ fn seeds() -> Vec<u64> {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(12);
-    (0..k.max(1)).map(|i| 0x26_0000 + i * 0x9E37).collect()
+    animus_test::corpus::shard_retain((0..k.max(1)).map(|i| 0x26_0000 + i * 0x9E37).collect())
 }
 
 #[derive(Default)]

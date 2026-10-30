@@ -496,7 +496,7 @@ fn splitmix64(mut x: u64) -> u64 {
 #[test]
 fn late_joining_learner_corpus_runs_at_configured_depth() {
     let k = corpus::seeds_from_env("ANIMUS_LEARNER_SNAPSHOT_LIVELOCK_SEEDS");
-    for i in 0..k {
+    for i in corpus::shard_range_usize(k) {
         let seed = if i == 0 {
             BASE_LATE_JOIN_SEED
         } else {

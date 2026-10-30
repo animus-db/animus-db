@@ -323,7 +323,7 @@ fn grown_group_elects_after_leader_loss() {
 #[test]
 fn grown_group_elects_after_leader_loss_corpus() {
     let k = corpus::seeds_from_env("ANIMUS_LEARNER_PENDING_CHECK_SEEDS").max(8);
-    for i in 0..k {
+    for i in corpus::shard_range_usize(k) {
         let seed = if i == 0 {
             0x1131_0001
         } else {

@@ -394,7 +394,7 @@ fn promoted_candidate_wins_election_after_leader_dies_right_after_commit() {
 #[test]
 fn promoted_candidate_wins_election_corpus_runs_at_configured_depth() {
     let k = corpus::seeds_from_env("ANIMUS_LEARNER_SEEDS").max(8);
-    for i in 0..k {
+    for i in corpus::shard_range_usize(k) {
         let seed = if i == 0 {
             0x1061_0002
         } else {
@@ -415,7 +415,7 @@ fn promoted_candidate_wins_election_corpus_runs_at_configured_depth() {
 #[test]
 fn learner_promotion_leader_crash_corpus_runs_at_configured_depth() {
     let k = corpus::seeds_from_env("ANIMUS_LEARNER_SEEDS").max(8);
-    for i in 0..k {
+    for i in corpus::shard_range_usize(k) {
         let seed = if i == 0 {
             0x1019_0001
         } else {

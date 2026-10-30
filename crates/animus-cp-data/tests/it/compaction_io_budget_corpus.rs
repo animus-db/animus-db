@@ -60,7 +60,7 @@ fn seeds() -> Vec<u64> {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(1);
-    (0..k.max(1)).map(|i| 0x1081 + i).collect()
+    animus_test::corpus::shard_retain((0..k.max(1)).map(|i| 0x1081 + i).collect())
 }
 
 fn cell_enabled(name: &str) -> bool {

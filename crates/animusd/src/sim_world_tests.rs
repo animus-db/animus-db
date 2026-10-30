@@ -13,6 +13,8 @@ use std::time::Duration;
 use super::sim_world::{LinkConfig, PeerClient, PeerError, PeerHandler, SimWorld};
 
 fn seeds() -> Vec<u64> {
+    // Index-addressed seed list (`seeds()[0]`, `.take(2)`): not splittable.
+    animus_test::corpus::reject_shard("sim_world_tests");
     if let Some(s) = std::env::var("ANIMUS_SEED")
         .ok()
         .and_then(|s| s.parse().ok())

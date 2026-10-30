@@ -49,7 +49,7 @@ fn seeds() -> Vec<u64> {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(1);
-    (0..k * 24).map(|i| 0xC0FFEE + i).collect()
+    animus_test::corpus::shard_retain((0..k * 24).map(|i| 0xC0FFEE + i).collect())
 }
 
 fn upsert(meta: &mut Metadata, id: u64, status: NodeStatus) {

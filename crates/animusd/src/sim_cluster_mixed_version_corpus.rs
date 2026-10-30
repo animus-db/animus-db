@@ -1078,6 +1078,23 @@ fn light_cluster(seed: u64) -> SimCluster {
     cluster
 }
 
+/// Move control leadership off `OLD`, retrying the transfer until it moves.
+///
+/// One transfer attempt can be lost (a vote round racing a heartbeat), so a
+/// single fixed wait is a seed-dependent flake (issue #1271, mrec_overrides
+/// s29). This is a converged-or-bounded poll: re-issue the transfer and let
+/// the sim run until the leader is elsewhere; the bound only exists so a real
+/// regression fails loudly instead of hanging, and callers check the result.
+fn move_leadership_off_old(cluster: &mut SimCluster, w: &mut Watch) {
+    for _ in 0..15 {
+        if control_leader(cluster) != OLD {
+            return;
+        }
+        let _ = cluster.transfer_leadership(OLD, 0);
+        w.run(cluster, Duration::from_millis(500));
+    }
+}
+
 fn control_leader(cluster: &mut SimCluster) -> u64 {
     let idx = cluster.control_leader_index();
     cluster.control_node_id(idx)
@@ -1280,10 +1297,7 @@ fn run_ladder_negative(c: &Cell, neg: Neg) -> Verdict {
     ladder_to_v2(&mut cluster, &mut w);
     let setup = std::mem::take(&mut w.violations);
     // A leader that is not the previous-release node.
-    if control_leader(&mut cluster) == OLD {
-        let _ = cluster.transfer_leadership(OLD, 0);
-        w.run(&mut cluster, Duration::from_secs(2));
-    }
+    move_leadership_off_old(&mut cluster, &mut w);
     let leader = control_leader(&mut cluster);
     let mut v: Vec<String> = setup;
     if leader == OLD {
@@ -1293,7 +1307,6 @@ fn run_ladder_negative(c: &Cell, neg: Neg) -> Verdict {
     if !pre.is_empty() {
         v.push(format!("violations before the bad emit: {pre:?}"));
     }
-    let pre_log = cluster.control_last_log_index(OLD);
     let accepted = match neg {
         Neg::UngatedVariant => cluster.propose_meta_ungated(marked(SYNTHETIC_GATE_LABEL, 3)),
         Neg::UngatedField => {
@@ -1350,7 +1363,7 @@ fn run_ladder_negative(c: &Cell, neg: Neg) -> Verdict {
             w.violations
         ));
     }
-    if cluster.control_last_log_index(OLD) != pre_log {
+    if old_appended_bad_entry(&cluster, &accepted) {
         v.push("the previous-release replica appended the gate-3 value".into());
     }
     verdict_of(c, v, cap_fired)
@@ -1542,10 +1555,7 @@ fn run_global_negative(c: &Cell) -> Verdict {
     let mut w = Watch::new(true);
     global_setup(&mut cluster, &mut w, false);
     let setup = std::mem::take(&mut w.violations);
-    if control_leader(&mut cluster) == OLD {
-        let _ = cluster.transfer_leadership(OLD, 0);
-        w.run(&mut cluster, Duration::from_secs(2));
-    }
+    move_leadership_off_old(&mut cluster, &mut w);
     let mut v: Vec<String> = setup;
     if control_leader(&mut cluster) == OLD {
         v.push("could not move leadership off the previous-release node".into());
@@ -1554,7 +1564,6 @@ fn run_global_negative(c: &Cell) -> Verdict {
     if !pre.is_empty() {
         v.push(format!("violations before the bad emit: {pre:?}"));
     }
-    let pre_log = cluster.control_last_log_index(OLD);
     let accepted = cluster.propose_meta_ungated(convert_cmd());
     if !matches!(accepted, ProposeResult::Accepted { .. }) {
         v.push(format!("the bad emit was not accepted: {accepted:?}"));
@@ -1573,7 +1582,7 @@ fn run_global_negative(c: &Cell) -> Verdict {
             w.violations
         ));
     }
-    if cluster.control_last_log_index(OLD) != pre_log {
+    if old_appended_bad_entry(&cluster, &accepted) {
         v.push("the previous-release replica appended the GlobalTables value".into());
     }
     verdict_of(c, v, cap_fired)
@@ -1811,10 +1820,7 @@ fn run_mrec_negative(c: &Cell) -> Verdict {
     let others: Vec<u64> = (0..NODES).filter(|&n| n != OLD).collect();
     roll_to_release3(&mut cluster, &mut w, &others);
     let setup = std::mem::take(&mut w.violations);
-    if control_leader(&mut cluster) == OLD {
-        let _ = cluster.transfer_leadership(OLD, 0);
-        w.run(&mut cluster, Duration::from_secs(2));
-    }
+    move_leadership_off_old(&mut cluster, &mut w);
     let mut v: Vec<String> = setup;
     if control_leader(&mut cluster) == OLD {
         v.push("could not move leadership off the Release(2) node".into());
@@ -1823,7 +1829,6 @@ fn run_mrec_negative(c: &Cell) -> Verdict {
     if !pre.is_empty() {
         v.push(format!("violations before the bad emit: {pre:?}"));
     }
-    let pre_log = cluster.control_last_log_index(OLD);
     let accepted = cluster.propose_meta_ungated(mrec_convert_cmd());
     if !matches!(accepted, ProposeResult::Accepted { .. }) {
         v.push(format!("the bad emit was not accepted: {accepted:?}"));
@@ -1850,7 +1855,7 @@ fn run_mrec_negative(c: &Cell) -> Verdict {
     {
         v.push("the early MREC application went unnoticed".into());
     }
-    if cluster.control_last_log_index(OLD) != pre_log {
+    if old_appended_bad_entry(&cluster, &accepted) {
         v.push("the Release(2) replica appended the MrecReplication value".into());
     }
     verdict_of(c, v, cap_fired)
@@ -2205,6 +2210,22 @@ fn run_node_capacity_gate(c: &Cell) -> Verdict {
     verdict_of(c, w.violations, false)
 }
 
+/// Whether the old replica's log reached the bad entry's own index.
+///
+/// The oracle is "the old replica never appended THE bad entry", i.e. its last
+/// index stays below the index `propose` assigned to it. A before/after
+/// comparison of the log length is wrong: an unrelated entry (a heartbeat
+/// bookkeeping write, a capacity sync) can land between the snapshot and the
+/// bad emit and move the old replica's log without it having taken the bad
+/// entry (issue #1271: pre 41, bad entry at 43, old replica stopped at 42).
+fn old_appended_bad_entry(cluster: &SimCluster, accepted: &ProposeResult) -> bool {
+    match accepted {
+        ProposeResult::Accepted { index, .. } => cluster.control_last_log_index(OLD) >= *index,
+        // Not accepted: the cell already reports that; nothing to compare.
+        _ => false,
+    }
+}
+
 /// N7: `SetNodeCapacity` appended ungated at version 4 with a `Release(4)`
 /// voter. The oracle MUST report the capped rejection at exactly that voter
 /// (wedged, never appended) and the capacity applied before its gate on the
@@ -2216,10 +2237,7 @@ fn run_node_capacity_negative(c: &Cell) -> Verdict {
     let others: Vec<u64> = (0..NODES).filter(|&n| n != OLD).collect();
     roll_to_release5(&mut cluster, &mut w, &others);
     let setup = std::mem::take(&mut w.violations);
-    if control_leader(&mut cluster) == OLD {
-        let _ = cluster.transfer_leadership(OLD, 0);
-        w.run(&mut cluster, Duration::from_secs(2));
-    }
+    move_leadership_off_old(&mut cluster, &mut w);
     let mut v: Vec<String> = setup;
     if control_leader(&mut cluster) == OLD {
         v.push("could not move leadership off the Release(4) node".into());
@@ -2228,7 +2246,6 @@ fn run_node_capacity_negative(c: &Cell) -> Verdict {
     if !pre.is_empty() {
         v.push(format!("violations before the bad emit: {pre:?}"));
     }
-    let pre_log = cluster.control_last_log_index(OLD);
     let accepted = cluster.propose_meta_ungated(MetaCommand::SetNodeCapacity {
         node: nid(DATA),
         capacity: DECLARED,
@@ -2257,7 +2274,7 @@ fn run_node_capacity_negative(c: &Cell) -> Verdict {
     {
         v.push("the early capacity application went unnoticed".into());
     }
-    if cluster.control_last_log_index(OLD) != pre_log {
+    if old_appended_bad_entry(&cluster, &accepted) {
         v.push("the Release(4) replica appended the NodeCapacity value".into());
     }
     verdict_of(c, v, cap_fired)
@@ -2657,10 +2674,7 @@ fn run_mrsc_removal_negative(c: &Cell) -> Verdict {
     let others: Vec<u64> = (0..NODES).filter(|&n| n != OLD).collect();
     roll_to_release7(&mut cluster, &mut w, &others);
     let setup = std::mem::take(&mut w.violations);
-    if control_leader(&mut cluster) == OLD {
-        let _ = cluster.transfer_leadership(OLD, 0);
-        w.run(&mut cluster, Duration::from_secs(2));
-    }
+    move_leadership_off_old(&mut cluster, &mut w);
     let mut v: Vec<String> = setup;
     if control_leader(&mut cluster) == OLD {
         v.push("could not move leadership off the Release(6) node".into());
@@ -2669,7 +2683,6 @@ fn run_mrsc_removal_negative(c: &Cell) -> Verdict {
     if !pre.is_empty() {
         v.push(format!("violations before the bad emit: {pre:?}"));
     }
-    let pre_log = cluster.control_last_log_index(OLD);
     let accepted = cluster.propose_meta_ungated(revert_cmd());
     if !matches!(accepted, ProposeResult::Accepted { .. }) {
         v.push(format!("the bad emit was not accepted: {accepted:?}"));
@@ -2696,7 +2709,7 @@ fn run_mrsc_removal_negative(c: &Cell) -> Verdict {
     {
         v.push("the early revert application went unnoticed".into());
     }
-    if cluster.control_last_log_index(OLD) != pre_log {
+    if old_appended_bad_entry(&cluster, &accepted) {
         v.push("the Release(6) replica appended the revert value".into());
     }
     verdict_of(c, v, cap_fired)
@@ -2907,10 +2920,7 @@ fn run_mrec_overrides_negative(c: &Cell) -> Verdict {
     let others: Vec<u64> = (0..NODES).filter(|&n| n != OLD).collect();
     roll_to_release(&mut cluster, &mut w, &others, 8);
     let setup = std::mem::take(&mut w.violations);
-    if control_leader(&mut cluster) == OLD {
-        let _ = cluster.transfer_leadership(OLD, 0);
-        w.run(&mut cluster, Duration::from_secs(2));
-    }
+    move_leadership_off_old(&mut cluster, &mut w);
     let mut v: Vec<String> = setup;
     if control_leader(&mut cluster) == OLD {
         v.push("could not move leadership off the Release(7) node".into());
@@ -2919,7 +2929,6 @@ fn run_mrec_overrides_negative(c: &Cell) -> Verdict {
     if !pre.is_empty() {
         v.push(format!("violations before the bad emit: {pre:?}"));
     }
-    let pre_log = cluster.control_last_log_index(OLD);
     let accepted = cluster.propose_meta_ungated(ovr_cmd());
     if !matches!(accepted, ProposeResult::Accepted { .. }) {
         v.push(format!("the bad emit was not accepted: {accepted:?}"));
@@ -2946,7 +2955,7 @@ fn run_mrec_overrides_negative(c: &Cell) -> Verdict {
     {
         v.push("the early override application went unnoticed".into());
     }
-    if cluster.control_last_log_index(OLD) != pre_log {
+    if old_appended_bad_entry(&cluster, &accepted) {
         v.push("the Release(7) replica appended the override value".into());
     }
     verdict_of(c, v, cap_fired)
@@ -3099,10 +3108,7 @@ fn run_legacy_global_negative(c: &Cell) -> Verdict {
     let others: Vec<u64> = (0..NODES).filter(|&n| n != OLD).collect();
     roll_to_release(&mut cluster, &mut w, &others, 9);
     let setup = std::mem::take(&mut w.violations);
-    if control_leader(&mut cluster) == OLD {
-        let _ = cluster.transfer_leadership(OLD, 0);
-        w.run(&mut cluster, Duration::from_secs(2));
-    }
+    move_leadership_off_old(&mut cluster, &mut w);
     let mut v: Vec<String> = setup;
     if control_leader(&mut cluster) == OLD {
         v.push("could not move leadership off the Release(8) node".into());
@@ -3111,7 +3117,6 @@ fn run_legacy_global_negative(c: &Cell) -> Verdict {
     if !pre.is_empty() {
         v.push(format!("violations before the bad emit: {pre:?}"));
     }
-    let pre_log = cluster.control_last_log_index(OLD);
     let accepted = cluster.propose_meta_ungated(legacy_cmd());
     if !matches!(accepted, ProposeResult::Accepted { .. }) {
         v.push(format!("the bad emit was not accepted: {accepted:?}"));
@@ -3138,7 +3143,7 @@ fn run_legacy_global_negative(c: &Cell) -> Verdict {
     {
         v.push("the early legacy conversion went unnoticed".into());
     }
-    if cluster.control_last_log_index(OLD) != pre_log {
+    if old_appended_bad_entry(&cluster, &accepted) {
         v.push("the Release(8) replica appended the legacy conversion".into());
     }
     verdict_of(c, v, cap_fired)
@@ -3458,13 +3463,28 @@ fn run_joiner_range(c: &Cell) -> Verdict {
 
 /// One test per cell family so nextest spreads them across its shards.
 fn run_family(prefix: &str) {
-    let cs: Vec<Cell> = corpus_cells()
+    let sharded = std::env::var_os(corpus::SHARD_VAR).is_some();
+    // N1's "fired on at least one seed" is an aggregate over the whole seed
+    // set, which a seed shard cannot see: it runs over every variant on shard 0
+    // (the family is cheap) and the other shards skip it.
+    let aggregate = prefix == "negative_control_premature";
+    if sharded && aggregate && !corpus::owns_unsharded() {
+        return;
+    }
+    let all = if sharded && aggregate {
+        corpus::corpus_cells_unsharded(cells(), "ANIMUS_UPGRADE_SEEDS", "ANIMUS_UPGRADE_CELL")
+    } else {
+        corpus_cells()
+    };
+    let cs: Vec<Cell> = all
         .into_iter()
         .filter(|c| c.name.starts_with(prefix))
         .collect();
     let narrowed = std::env::var("ANIMUS_UPGRADE_CELL").is_ok();
+    // A shard may own no variant of a family at a small depth K; the
+    // whole-cell-set meta-test checks every family is non-empty.
     assert!(
-        narrowed || !cs.is_empty(),
+        narrowed || sharded || !cs.is_empty(),
         "no cell selected for family {prefix}"
     );
     let mut fired = false;
@@ -3522,6 +3542,10 @@ fn sim_cluster_mixed_version_corpus_negative_control_is_caught() {
 /// either fails per push, not only at the nightly's depth.
 #[test]
 fn sim_cluster_mixed_version_corpus_issue_1249_pinned_seeds() {
+    // Fixed seeds, not split by seed: shard 0 only.
+    if !corpus::owns_unsharded() {
+        return;
+    }
     let pinned: [(&str, Kind, u64); 5] = [
         (
             "kill_b2_leader",
@@ -3672,7 +3696,11 @@ fn sim_cluster_mixed_version_corpus_txn_settle_gate() {
 
 #[test]
 fn sim_cluster_mixed_version_cell_names_and_seeds_are_unique() {
-    let cs = corpus::seed_expand(cells(), 3);
+    // A whole-cell-set meta-test: shard 0 only, over every variant.
+    if !corpus::owns_unsharded() {
+        return;
+    }
+    let cs = corpus::seed_expand_sharded(cells(), 3, None);
     let names: BTreeSet<_> = cs.iter().map(|c| c.name.clone()).collect();
     let seeds: BTreeSet<_> = cs.iter().map(|c| c.seed).collect();
     assert_eq!(names.len(), cs.len(), "duplicate cell name");
@@ -3717,6 +3745,10 @@ fn sim_cluster_mixed_version_cell_names_and_seeds_are_unique() {
 
 #[test]
 fn sim_cluster_mixed_version_run_is_deterministic() {
+    // One fixed cell, not split by seed: shard 0 only.
+    if !corpus::owns_unsharded() {
+        return;
+    }
     let c = cell("roll_ascending", Kind::Roll(0));
     let a = run_cell(&c);
     let b = run_cell(&c);

@@ -241,6 +241,7 @@ assertion messages; replay with `ANIMUS_SEED=<seed> cargo test <name>`. The
 | Env var | Default | Effect |
 |---------|---------|--------|
 | `ANIMUS_SEED` | unset | replay one sim run from its printed seed |
+| `ANIMUS_SEED_SHARD=i/n` | unset | split any corpus's seed variants across `n` parallel workers (issue #1271): worker `i` (0-based) runs only the variants with index `% n == i`, so the `n` shards together run exactly the unsharded seed set and variant 0 (the canonical cell) runs in shard 0. Honoured by `animus-test` `corpus.rs` (`seed_expand`, `for_each_seed`, `corpus_cells`) and by every corpus that builds its own seed list (`corpus::shard_retain` / `shard_range`); a malformed value panics, unset changes nothing. Aggregate negative controls and whole-cell-set meta-tests run in full on shard 0 only (`corpus::owns_unsharded`). The PR job `corpus-changed` fans a corpus out over the `shards` column of `scripts/pr-corpus-depth.sh` (`mrsc_cluster`: 3) |
 | `ANIMUS_RAFTKV_SEEDS=K` | 1 | raftkv-corpus depth (`animus-test`) |
 | `ANIMUS_RAFTKV_LSM=1` | off | run the whole raftkv corpus over `LsmEngine<SimEnv>` |
 | `ANIMUS_RAFTKV_WAL_FAULTS=1` | off | run a second pass of the raftkv corpus's crash-based cells (`LeaderKill`/`FollowerKill`) with `torn_tail_on_crash`+`corrupt_on_crash` armed for the whole run |
@@ -315,6 +316,16 @@ assertion messages; replay with `ANIMUS_SEED=<seed> cargo test <name>`. The
 
 The deep corpus tiers run nightly in CI
 (`.github/workflows/corpus-deep.yml`), not per-push.
+**Exception (issue #1271): a PR that changes a corpus's test file runs that
+corpus at its nightly depth** (CI job `corpus-changed`, driven by the table in
+`scripts/pr-corpus-depth.sh`: `select <base>` / `matrix <base>` (the CI
+`{corpus, shard, of}` matrix) / `run-shard <id> <i> <n>` / `run <base>` /
+`check` (table vs `corpus-deep.yml`, and the `shards` column) / `list-filters`
+(every name filter matches tests)). The table's `shards` column splits a slow
+corpus across parallel workers with `ANIMUS_SEED_SHARD` (about 10 minutes per
+worker); a `corpus-select` job emits the matrix, `corpus-shard` runs it, and
+`corpus-changed` is the aggregate that fails if any shard did. A new
+corpus needs a nightly step AND a row there; `check` fails otherwise.
 
 ## The load-bearing constraint: determinism
 

@@ -43,7 +43,7 @@ fn seeds() -> Vec<u64> {
         return vec![s];
     }
     let k = animus_test::corpus::seeds_from_env("ANIMUS_ZONE_PLACEMENT_SEEDS") as u64;
-    (0..k).map(|i| 7_100 + i).collect()
+    animus_test::corpus::shard_retain((0..k).map(|i| 7_100 + i).collect())
 }
 
 fn zone_of_node(n: u64) -> &'static str {

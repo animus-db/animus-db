@@ -1539,7 +1539,7 @@ matrix on a three-replica and a witness table), `animus-control`
 `global_table_apply::revert_*` (apply, idempotency, rejections, convergence from every
 spread, a down node in the kept Region, zone spread, gate row, JSON pin). Cluster tier:
 `sim_cluster_mrsc` cells `revert_keep_preferred`, `revert_control_leader_kill`,
-`revert_tablet_leader_kill`, `revert_witness_form_partition` (6 nodes, 3 Regions x 2,
+`revert_tablet_leader_kill`, `revert_kept_region_node_kill`, `revert_witness_form_partition` (6 nodes, 3 Regions x 2,
 WAN links, cluster version 7 through the real finalize path; no acked write lost,
 every replica converges into the kept Region, removed replicas leave their nodes,
 transactions and TTL become allowed, the old Regions drain, a killed leader or a

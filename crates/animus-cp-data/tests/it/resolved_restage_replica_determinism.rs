@@ -51,7 +51,7 @@ fn seeds() -> Vec<u64> {
     {
         return vec![s];
     }
-    (0..k).map(|i| BASE_SEED + i * 0x9E37).collect()
+    animus_test::corpus::shard_retain((0..k).map(|i| BASE_SEED + i * 0x9E37).collect())
 }
 
 type KvNode = RaftKvNode<SimEnv, MemoryEngine>;

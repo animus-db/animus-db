@@ -550,11 +550,13 @@ fn txn_replay_corpus() {
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(2)
             .max(1);
-        KNOWN_FAILING_SEEDS
-            .iter()
-            .copied()
-            .chain((0..k).map(|i| BASE_SEED + i * 7919))
-            .collect()
+        animus_test::corpus::shard_retain(
+            KNOWN_FAILING_SEEDS
+                .iter()
+                .copied()
+                .chain((0..k).map(|i| BASE_SEED + i * 7919))
+                .collect(),
+        )
     };
     for seed in seeds {
         run_schedule(seed, 2);
@@ -578,11 +580,13 @@ fn txn_replay_corpus_at_cluster_version_1() {
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(2)
             .max(1);
-        KNOWN_FAILING_SEEDS_V1
-            .iter()
-            .copied()
-            .chain((0..k).map(|i| BASE_SEED + i * 7919))
-            .collect()
+        animus_test::corpus::shard_retain(
+            KNOWN_FAILING_SEEDS_V1
+                .iter()
+                .copied()
+                .chain((0..k).map(|i| BASE_SEED + i * 7919))
+                .collect(),
+        )
     };
     for seed in seeds {
         run_schedule(seed, 1);
