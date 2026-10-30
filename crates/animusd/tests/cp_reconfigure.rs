@@ -25,8 +25,8 @@ use std::time::Duration;
 use animus_env::NodeId;
 use animus_tablet::{Epoch, TabletId};
 use animusd::{
-    ClientRequest, ClientResponse, ClusterConfig, MetaCommand, Node, NodeStatus, RoleAddrs,
-    bind_cluster, read_frame, start_cluster,
+    ClientRequest, ClientResponse, ClusterConfig, MetaCommand, Node, NodeStatus, bind_cluster,
+    read_frame, start_cluster,
 };
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
@@ -106,58 +106,9 @@ async fn group_view(admin_addr: SocketAddr) -> Option<(bool, Vec<NodeId>)> {
     Some((g["is_leader"].as_bool().unwrap_or(false), voters))
 }
 
-/// Bring up `n` nodes one-process-per-node (node-local admin views), retrying the
-/// (alloc fresh ports + start) unit on a bind race. Returns the bound config.
+/// Thin wrapper over `support::bring_up_deadline` (bind-and-hold, no retry loop; issue #1421).
 async fn bring_up(n: usize, dir: &std::path::Path) -> (Vec<Node>, ClusterConfig) {
-    for attempt in 0..16 {
-        let a: Vec<SocketAddr> = {
-            let ls: Vec<std::net::TcpListener> = (0..n * 6)
-                .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
-                .collect();
-            ls.iter().map(|l| l.local_addr().unwrap()).collect()
-        };
-        let cfg = ClusterConfig {
-            version: animusd::config::CLUSTER_CONFIG_VERSION,
-            nodes: (0..n)
-                .map(|i| RoleAddrs {
-                    id: animusd::config::node_id(i),
-                    role: animusd::config::NodeRole::Both,
-                    internal: a[6 * i],
-                    client: a[6 * i + 1],
-                    dynamo: a[6 * i + 2],
-                    admin: a[6 * i + 3],
-                    intra: a[6 * i + 4],
-                    console: a[6 * i + 5],
-                    advertise_host: None,
-                    tls: None,
-                    encryption_key_path: None,
-                    labels: Default::default(),
-                    overload: None,
-                })
-                .collect(),
-            dynamo_auth: None,
-            cluster_settings: None,
-        };
-        let mut nodes = Vec::new();
-        let mut ok = true;
-        for i in 0..n {
-            match animusd::run_node(&cfg, i, dir.join(format!("node-{attempt}-{i}"))).await {
-                Ok(node) => nodes.push(node),
-                Err(_) => {
-                    ok = false;
-                    break;
-                }
-            }
-        }
-        if ok {
-            return (nodes, cfg);
-        }
-        for node in &nodes {
-            node.shutdown_graceful().await;
-        }
-        sleep(Duration::from_millis(50)).await;
-    }
-    panic!("could not bring up cluster");
+    support::bring_up_deadline(n, dir, support::JOIN_DEADLINE).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]

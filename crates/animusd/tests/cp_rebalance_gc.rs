@@ -47,8 +47,7 @@ use std::time::Duration;
 use animus_env::NodeId;
 use animus_tablet::TabletId;
 use animusd::{
-    ClientRequest, ClientResponse, ClusterConfig, MetaCommand, Node, RoleAddrs, read_frame,
-    write_frame,
+    ClientRequest, ClientResponse, ClusterConfig, MetaCommand, Node, read_frame, write_frame,
 };
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -59,58 +58,13 @@ const KV_TABLET: TabletId = TabletId(1);
 
 // ---- bring-up + polling helpers (mirrors cp_reconfigure.rs / drop_table_gc.rs) --
 
-/// Bring up an `n`-node cluster, one process per node (node-local admin views +
-/// separate edge state — the real deployment shape), retrying the
-/// (allocate-fresh-ports + start-all) unit on a bind race. Returns the per-node
-/// data dirs so a test can assert on-disk WAL state and restart nodes in place.
+/// Bring up an `n`-node cluster via `support::bring_up_deadline` (bind-and-hold,
+/// no retry loop; issue #1421). Returns the per-node data dirs (`core-{i}`) so a
+/// test can assert on-disk WAL state and restart nodes in place.
 async fn bring_up(n: usize, dir: &Path) -> (Vec<Node>, ClusterConfig, Vec<PathBuf>) {
-    for attempt in 0..16 {
-        let a = support::free_addrs(n * 6);
-        let config = ClusterConfig {
-            version: animusd::config::CLUSTER_CONFIG_VERSION,
-            nodes: (0..n)
-                .map(|i| RoleAddrs {
-                    id: animusd::config::node_id(i),
-                    role: animusd::config::NodeRole::Both,
-                    internal: a[6 * i],
-                    client: a[6 * i + 1],
-                    dynamo: a[6 * i + 2],
-                    admin: a[6 * i + 3],
-                    intra: a[6 * i + 4],
-                    console: a[6 * i + 5],
-                    advertise_host: None,
-                    tls: None,
-                    encryption_key_path: None,
-                    labels: Default::default(),
-                    overload: None,
-                })
-                .collect(),
-            dynamo_auth: None,
-            cluster_settings: None,
-        };
-        let dirs: Vec<PathBuf> = (0..n)
-            .map(|i| dir.join(format!("node-{attempt}-{i}")))
-            .collect();
-        let mut nodes = Vec::new();
-        let mut ok = true;
-        for (i, node_dir) in dirs.iter().enumerate() {
-            match animusd::run_node(&config, i, node_dir).await {
-                Ok(node) => nodes.push(node),
-                Err(_) => {
-                    ok = false;
-                    break;
-                }
-            }
-        }
-        if ok {
-            return (nodes, config, dirs);
-        }
-        for node in &nodes {
-            node.shutdown_graceful().await;
-        }
-        sleep(Duration::from_millis(50)).await;
-    }
-    panic!("could not bring up cluster after retries (ports kept getting stolen)");
+    let (nodes, config) = support::bring_up_deadline(n, dir, support::JOIN_DEADLINE).await;
+    let dirs = (0..n).map(|i| dir.join(format!("core-{i}"))).collect();
+    (nodes, config, dirs)
 }
 
 /// One HTTP/1.0 GET to the admin endpoint; `None` if the node is unreachable
