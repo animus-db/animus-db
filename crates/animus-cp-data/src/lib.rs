@@ -8979,7 +8979,7 @@ async fn recover_kv_wal<E: Env>(
     if let Err(e) = result {
         assert!(
             halted.load(Ordering::SeqCst),
-            "raftkv wal rewrite failed while running: {e}"
+            "raftkv wal recovery (free-space probe or image rewrite) failed while running: {e}"
         );
     }
 }

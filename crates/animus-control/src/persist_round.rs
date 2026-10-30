@@ -296,7 +296,7 @@ const STORAGE_FULL_PROBE_MAX: Duration = Duration::from_secs(2);
 pub const FREE_SPACE_PROBE_BYTES: usize = 64 * 1024;
 
 /// **Cheap free-space canary** (issue #1331): write [`FREE_SPACE_PROBE_BYTES`]
-/// of zeros to `{file}.probe` (`Disk::replace`: create, fsync, rename), then
+/// of zeros to a per-call unique `{file}.probe.<hex>` (`Disk::replace`: create, fsync, rename), then
 /// remove it. `Ok` means a small durable write fits *now*; `Err` (ENOSPC above
 /// all) means the disk is still full.
 ///
@@ -309,7 +309,12 @@ pub const FREE_SPACE_PROBE_BYTES: usize = 64 * 1024;
 /// a fixed 64 KiB however large the log is, and the image is built only once
 /// it passes.
 pub async fn probe_free_space<E: Env>(env: &E, file: &str) -> std::io::Result<()> {
-    let name = format!("{file}.probe");
+    // A unique scratch name per call: under the shared-WAL layout every group
+    // on a node passes the same `file`, and `Disk::replace` stages through
+    // `{name}.tmp`, so a shared name let one probe's cleanup delete another's
+    // in-flight tmp (rename ENOENT, a non-ENOSPC error that panicked the node).
+    // `next_u64` keeps the name seed-deterministic under `SimEnv`.
+    let name = format!("{file}.probe.{:016x}", env.next_u64());
     let r = env.replace(&name, &vec![0u8; FREE_SPACE_PROBE_BYTES]).await;
     // Whatever the outcome, give any half-written bytes back to the volume.
     let _ = env.remove(&name).await;
