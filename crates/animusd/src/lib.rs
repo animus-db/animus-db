@@ -793,7 +793,7 @@ impl<E: Env> CpGroup<E> {
         end: Option<&[u8]>,
         limit: Option<usize>,
         reverse: bool,
-    ) -> Vec<(Vec<u8>, Vec<u8>)> {
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, animus_storage::StorageError> {
         match (self, reverse) {
             (CpGroup::Lsm(n), false) => n.stale_scan(start, end, limit).await,
             (CpGroup::Lsm(n), true) => n.stale_scan_rev(start, end, limit).await,
@@ -805,7 +805,8 @@ impl<E: Env> CpGroup<E> {
     /// An eventually-consistent **kind-scoped** range scan of this replica's
     /// own engine (ADR 0041 §3 scopes; the LSI/GSI-hidden-table read path).
     ///
-    /// This is plain [`RaftKvNode::local_scan_kind`] and needs no
+    /// This is plain [`RaftKvNode::try_local_scan_kind`] (a scan error is
+    /// propagated, never an empty page, issue #1419) and needs no
     /// stale-specific envelope resolution: a non-base scope only ever holds
     /// **committed** values (only `KvCommand::KindBatch` writes them, and it
     /// always commits outright), so there is no intent for an eventual read
@@ -818,12 +819,12 @@ impl<E: Env> CpGroup<E> {
         end: Option<&[u8]>,
         limit: Option<usize>,
         reverse: bool,
-    ) -> Vec<(Vec<u8>, Vec<u8>)> {
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, animus_storage::StorageError> {
         match (self, reverse) {
-            (CpGroup::Lsm(n), false) => n.local_scan_kind(kind, start, end, limit).await,
-            (CpGroup::Lsm(n), true) => n.local_scan_kind_rev(kind, start, end, limit).await,
-            (CpGroup::Mem(n), false) => n.local_scan_kind(kind, start, end, limit).await,
-            (CpGroup::Mem(n), true) => n.local_scan_kind_rev(kind, start, end, limit).await,
+            (CpGroup::Lsm(n), false) => n.try_local_scan_kind(kind, start, end, limit).await,
+            (CpGroup::Lsm(n), true) => n.try_local_scan_kind_rev(kind, start, end, limit).await,
+            (CpGroup::Mem(n), false) => n.try_local_scan_kind(kind, start, end, limit).await,
+            (CpGroup::Mem(n), true) => n.try_local_scan_kind_rev(kind, start, end, limit).await,
         }
     }
 
@@ -2815,6 +2816,15 @@ pub async fn connect_client(addr: impl tokio::net::ToSocketAddrs) -> std::io::Re
 /// ever a fallback signal, never something a client sees.
 const STALE_READ_REFUSAL: &str =
     "no replica here can serve an eventually-consistent read (ADR 0055)";
+
+/// The error for an eventually-consistent scan whose engine scan failed on
+/// the serving replica (issue #1419/#1424). Deliberately a `"; retry"`
+/// error: `map_throttleable_error` renders it as a retryable 503
+/// `ServiceUnavailable`, never an empty page (to a client an empty page is a
+/// fabricated deletion).
+pub(crate) fn stale_scan_failed(e: &animus_storage::StorageError) -> String {
+    format!("eventually-consistent scan failed on the serving replica ({e}); retry")
+}
 
 /// How long a **forwarded** eventually-consistent read (ADR 0055) waits on
 /// its one-shot relay before giving up and falling back to the linearizable
@@ -23052,6 +23062,8 @@ mod sim_cluster_cp_route_fanout;
 /// own `pub(crate)` surface, no further visibility widened).
 #[cfg(test)]
 mod sim_cluster_dynamo_throttle;
+#[cfg(test)]
+mod sim_cluster_eventual_reads;
 /// Issue #1345: a stream grow walk vs a tablet an in-place split retired
 /// before the walk reached it (`SimCluster`).
 #[cfg(test)]

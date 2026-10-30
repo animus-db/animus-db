@@ -2221,11 +2221,13 @@ impl Disk for RawFsDisk {
 
     async fn read_at(&self, file: &str, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
         use tokio::io::{AsyncReadExt, AsyncSeekExt};
-        let mut f = match tokio::fs::File::open(self.path(file)).await {
-            Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(e) => return Err(e),
-        };
+        // A missing file is an **error** (`NotFound`), not an empty read
+        // (issue #1419): every caller reads a file it knows exists (an
+        // SSTable the manifest names), so an empty vector only ever turned a
+        // vanished file into a misleading "short sstable block read" that hid
+        // the cause. Reading past the end of an existing file is still an
+        // empty/short read.
+        let mut f = tokio::fs::File::open(self.path(file)).await?;
         if f.seek(std::io::SeekFrom::Start(offset)).await? != offset {
             return Ok(Vec::new());
         }

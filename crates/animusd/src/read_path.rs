@@ -125,6 +125,18 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             .charge_read(tablet, actual - pre, self.env.now());
     }
 
+    /// Give back a read's pre-charge when nothing was served (maintainer
+    /// decision, issue #1424): an eventual read that is "not served" (the
+    /// replica could not answer, or its scan failed) must not leave the 0.5
+    /// RCU minimum debited, since the client received nothing for it. The
+    /// forwarded (`forwarding.rs`) and local eventual paths both call this,
+    /// so they agree. A no-op when nothing was configured at pre-charge time.
+    pub(crate) fn throttle_refund_read(&self, precharge: Option<(TabletId, f64)>) {
+        if let Some((tablet, pre)) = precharge {
+            self.throttle.charge_read(tablet, -pre, self.env.now());
+        }
+    }
+
     pub(crate) fn cp_stale_local(&self, tablet: TabletId) -> Option<CpGroup<E>> {
         let data = self.data.as_ref()?;
         let group = self.edge.local_cp(tablet)?;
@@ -260,6 +272,7 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
             // engine, post-charge the real byte count after.
             let precharge = self.throttle_precharge_read(table, tablet, false)?;
             let Some(served) = group.stale_get_served(key).await else {
+                self.throttle_refund_read(precharge);
                 return Ok(None);
             };
             self.throttle_postcharge_read(precharge, served.as_ref().map_or(0, Vec::len), false);
@@ -320,7 +333,15 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 return Ok(None);
             }
             let precharge = self.throttle_precharge_read(table, tablet, false)?;
-            let p = group.stale_scan(start, end, limit, reverse).await;
+            let p = match group.stale_scan(start, end, limit, reverse).await {
+                Ok(p) => p,
+                Err(e) => {
+                    // A failed scan is an error, never an empty page (issue
+                    // #1419), and nothing was served, so refund.
+                    self.throttle_refund_read(precharge);
+                    return Err(crate::stale_scan_failed(&e));
+                }
+            };
             let bytes: usize = p.iter().map(|(k, v)| k.len() + v.len()).sum();
             self.throttle_postcharge_read(precharge, bytes, false);
             return Ok(Some(p));
@@ -368,10 +389,17 @@ impl<E: Env, R: RelayClient> ClientCtx<E, R> {
                 return Ok(None);
             }
             let precharge = self.throttle_precharge_read(table, tablet, false)?;
-            self.record_eventual_read(Metric::CpEventualReadsLocal);
-            let p = group
+            let p = match group
                 .stale_scan_kind(kind, start, end, limit, reverse)
-                .await;
+                .await
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    self.throttle_refund_read(precharge);
+                    return Err(crate::stale_scan_failed(&e));
+                }
+            };
+            self.record_eventual_read(Metric::CpEventualReadsLocal);
             let bytes: usize = p.iter().map(|(k, v)| k.len() + v.len()).sum();
             self.throttle_postcharge_read(precharge, bytes, false);
             return Ok(Some(p));

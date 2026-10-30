@@ -12764,3 +12764,9 @@ before healing; see
   until the node returns (`revert_kept_region_node_kill` pins this). `SimCluster`
   drops not-leader hints (addresses have no `:port`, issue #1431), so a client on a
   non-hosting node cannot reach such a leader in the sim.
+
+- **Eventual reads (issues #1419/#1424):** the three forwarded `stale: true`
+  arms share `ClientCtx::serve_stale_read` (`forwarding.rs`); a read that serves
+  nothing refunds its pre-charge (`throttle_refund_read`), locally too; a failed
+  scan is a `"; retry"` error, never an empty page. Pinned by
+  `sim_cluster_eventual_reads`.
