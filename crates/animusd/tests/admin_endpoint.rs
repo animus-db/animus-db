@@ -1589,6 +1589,22 @@ async fn admin_ready_is_200_while_leaderless_with_metadata() {
         nodes.swap(0, follower);
         let survivor_addr = nodes[0].admin_addr();
 
+        // The convergence wait above polled the ORIGINAL node 0; the follower
+        // swapped in may not have applied a committed entry yet
+        // (`metadata_synced` is false until it has), and once the quorum is
+        // gone it never will. Wait for the survivor's own readiness first.
+        timeout(Duration::from_secs(20), async {
+            loop {
+                let (r, _) = admin_get(survivor_addr, "/admin/ready").await;
+                if r == 200 {
+                    return;
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("the surviving follower must report /admin/ready 200 before the quorum loss");
+
         // Lose the control quorum: stop the other two voters.
         let two = nodes.split_off(1);
         for n in &two {
