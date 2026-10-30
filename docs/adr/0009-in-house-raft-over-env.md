@@ -1167,9 +1167,14 @@ hand a live follower a pre-vote majority (its forgotten `voted_for` and empty lo
 other test); the follower then sent a real higher-term `RequestVote`, which the leader's lease
 ignores, and a write proposed to that leader in the gap was lost (suspected cause of one CI
 failure of `wiped_voter_refuses_and_the_rest_of_the_cluster_keeps_serving`). The pre-vote grant
-now carries the same `!cluster_check.blocks_voting()` conjunct as the real vote (pending or
-refused both refuse; `CampaignStats::pv_refused_unchecked`). Node-local, no wire change, no
-`Gate`. Liveness: a pending node never contributed a usable real vote, so a 3-node cluster
-with one pending node still elects with the other two; a fresh genesis cluster resolves its
-checks from the first probe answers (`Idle`) before pre-votes matter. Test:
-`leader_lease::wiped_voter_with_pending_check_refuses_pre_vote` (fails without the conjunct).
+now consults the cluster check (`CampaignStats::pv_refused_unchecked`). **Refinement (PR
+#1426 CI):** the first form refused whenever the check was `Pending`, but every ordinary
+freshly hosted cp-data replica starts `Pending` (`begin_cluster_check`, all but split
+children), so a genesis group's first pre-vote round was refused and the first election
+delayed by a full election timeout. The rule is now: a `Refused` node always refuses; a
+`Pending` node refuses only when the PreVote's `last_log_index`/`last_log_term` is non-zero,
+i.e. the candidate's log proves the cluster is already established. In genesis every log is
+empty, so pre-votes flow; in the wiped-voter case the live follower's log is non-empty, so
+the wiped node refuses. Node-local, no wire change (the fields are already in `PreVote`), no
+`Gate`. Real votes keep the unconditional `blocks_voting()` gate. Test:
+`leader_lease::wiped_voter_with_pending_check_refuses_pre_vote` (fails without the gate) and `leader_lease::genesis_group_of_pending_nodes_elects_via_pre_vote`.

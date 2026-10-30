@@ -352,3 +352,45 @@ fn wiped_voter_with_pending_check_refuses_pre_vote() {
     }
     assert!(leader.commit_index() > before, "the write commits");
 }
+
+/// Genesis: every freshly hosted replica starts with a pending cluster check
+/// and an empty log. A pending node must still grant a pre-vote to a candidate
+/// with an empty log (the cluster is not yet established), otherwise the first
+/// election waits a full election timeout. A refused node never grants.
+#[test]
+fn genesis_group_of_pending_nodes_elects_via_pre_vote() {
+    let mut nodes: Vec<RaftCore> = (0..3)
+        .map(|i| RaftCore::new(nid(i), &group(), Nanos(0), 7))
+        .collect();
+    let t0 = Nanos(0);
+    // The campaigning voter skips the check (as `start_hosted_campaigning`
+    // does); its two peers are ordinary freshly hosted replicas, check pending.
+    for n in &mut nodes[1..] {
+        let _probes = n.begin_cluster_check(t0, 7);
+        assert!(n.cluster_check_pending());
+    }
+    let (first, rest) = nodes.split_at_mut(1);
+    let candidate = &mut first[0];
+    let outs = candidate.campaign_now(t0, 7);
+    assert!(
+        outs.iter()
+            .any(|(_, m)| matches!(m, RaftMsg::PreVote { .. })),
+        "pre-vote round expected: {outs:?}"
+    );
+    let (b, c) = rest.split_at_mut(1);
+    let resps = deliver(
+        &nid(0),
+        outs,
+        &mut [(nid(1), &mut b[0]), (nid(2), &mut c[0])],
+        t0,
+    );
+    assert_eq!(resps.len(), 2, "{resps:?}");
+    for (_, _, m) in &resps {
+        assert!(
+            matches!(m, RaftMsg::PreVoteResp { granted: true, .. }),
+            "a pending node must grant an empty-log pre-vote: {m:?}"
+        );
+    }
+    assert_eq!(b[0].campaign_stats().pv_refused_unchecked, 0);
+    assert_eq!(c[0].campaign_stats().pv_refused_unchecked, 0);
+}

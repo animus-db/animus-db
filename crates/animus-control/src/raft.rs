@@ -4713,11 +4713,20 @@ where
         // all when `!is_voter()`. A stray/injected `PreVote` reaching a
         // learner can therefore still be granted here without any safety
         // consequence — it simply won't count toward anyone's majority.
-        // ADR 0009 (2026-10-29 amendment): the same gate as the real vote
-        // (issue #667). A wiped voter's forgotten `voted_for` and empty log make
+        // ADR 0009 (2026-10-29 amendment, refined for genesis): the gate of the real vote
+        // (issue #667), relaxed for a Pending node facing an empty-log candidate. A wiped voter's forgotten `voted_for` and empty log make
         // it look like a willing, up-to-date-enough granter; a pre-vote majority
         // it helps form sends a live follower into a real higher-term election.
-        let cluster_checked = !self.cluster_check.blocks_voting();
+        // A `Refused` node always refuses. A `Pending` node (every freshly
+        // hosted replica starts so) refuses only when the candidate's log
+        // proves the cluster is already established (non-empty log): in
+        // genesis every log is empty, so pre-votes must flow or the first
+        // election is delayed by a full election timeout.
+        let cluster_checked = match self.cluster_check {
+            ClusterCheck::Idle => true,
+            ClusterCheck::Refused => false,
+            ClusterCheck::Pending { .. } => last_log_index == 0 && last_log_term == 0,
+        };
         let granted = !has_live_leader && term >= self.current_term && log_ok && cluster_checked;
         if granted && self.role == Role::Candidate {
             // ADR 0009 (2026-10-29 amendment): granting a pre-vote for a later
