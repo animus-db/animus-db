@@ -49,5 +49,19 @@ shrank the raw file but grew the gzipped one. Size on 2026-10-30: 5.7 MB raw,
 ## Testing
 
 `cargo test -p animus-web` (native; about 5 s). The browser run is manual:
-`scripts/build-web-demo.sh`, serve `website/`, drive with Playwright (start the
-cluster, CreateTable/PutItem/GetItem/Query, crash the leader node, write, heal).
+`scripts/build-web-demo.sh`, serve `website/` (`python3 -m http.server 8000
+--directory website`), then `NODE_PATH=$(npm root -g) node
+scripts/demo-browser-smoke.mjs chromium|firefox|webkit [--shots DIR] [--exe PATH]`.
+It runs the whole visitor flow (start, CreateTable/PutItem/GetItem/Query/Scan/PartiQL,
+crash the control leader, write through a survivor, restart, partition, heal, add a
+node, speed, pause) and fails on any console or page error. Not in CI.
+
+Browsers: Chromium 153 verified (2026-10-30). Firefox: not yet run. Playwright's
+Firefox needs `playwright install firefox` (host `playwright.download.prss.microsoft.com`,
+blocked in the agent sandbox); a stock Firefox cannot be driven by Playwright (it needs
+Playwright's patched build), so use Playwright's build or drive stock Firefox through
+geckodriver. Static audit: the wasm uses only bulk-memory, multivalue, reference-types,
+nontrapping-fptoint, sign-ext and mutable-globals (rustc's wasm32 defaults), all in
+Firefox since 79; the shell passes `f64` (not `u64`/BigInt) across the boundary; the
+page uses `accent-color` (Firefox 92), `oklch()` (113) and `text-decoration-thickness`
+(70); `instantiateStreaming` needs `application/wasm`, which GitHub Pages serves.
