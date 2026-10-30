@@ -42,56 +42,12 @@ use tokio::time::{sleep, timeout};
 mod support;
 use support::call;
 
-/// Bring up an `n`-node per-process cluster (each its own edge state) —
-/// duplicated fixture, per this codebase's own "sibling test modules keep
-/// their own fixtures independent" convention (see `index_backfill.rs`'s
-/// identical doc comment).
+/// Bring up an `n`-node cluster via `support::bring_up_deadline` (bind-and-hold,
+/// no retry loop; issue #1421).
 async fn bring_up(n: usize, dir: &Path) -> Vec<Node> {
-    for attempt in 0..16 {
-        let addrs = support::free_addrs(n * 6);
-        let nodes_cfg: Vec<animusd::RoleAddrs> = (0..n)
-            .map(|i| animusd::RoleAddrs {
-                id: animusd::config::node_id(i),
-                role: animusd::config::NodeRole::Both,
-                internal: addrs[6 * i],
-                client: addrs[6 * i + 1],
-                dynamo: addrs[6 * i + 2],
-                admin: addrs[6 * i + 3],
-                intra: addrs[6 * i + 4],
-                console: addrs[6 * i + 5],
-                advertise_host: None,
-                tls: None,
-                encryption_key_path: None,
-                labels: Default::default(),
-                overload: None,
-            })
-            .collect();
-        let config = animusd::ClusterConfig {
-            version: animusd::config::CLUSTER_CONFIG_VERSION,
-            nodes: nodes_cfg,
-            dynamo_auth: None,
-            cluster_settings: None,
-        };
-        let mut nodes = Vec::new();
-        let mut failed = false;
-        for i in 0..n {
-            match animusd::run_node(&config, i, dir.join(format!("node-{attempt}-{i}"))).await {
-                Ok(node) => nodes.push(node),
-                Err(_) => {
-                    failed = true;
-                    break;
-                }
-            }
-        }
-        if !failed {
-            return nodes;
-        }
-        for node in &nodes {
-            node.shutdown_graceful().await;
-        }
-        sleep(Duration::from_millis(50)).await;
-    }
-    panic!("could not bring up cluster after retries (ports kept getting stolen)");
+    support::bring_up_deadline(n, dir, support::JOIN_DEADLINE)
+        .await
+        .0
 }
 
 /// One HTTP/1.0 admin request; returns `(status, parsed JSON)` — duplicated

@@ -8248,12 +8248,19 @@ default to a test-sized interval), restart/durability across every
 deployment shape, and the `WatchMetadata`/system-table/OTel/metrics support
 surfaces.
 `support/mod.rs` holds the shared bring-up helpers — `bring_up_deadline`/
-`bring_up_deadline_tls`/`start_single_node` bind-and-hold every node's
+`bring_up_deadline_with` (a `&mut ClusterConfig` hook: `dynamo_auth`,
+`cluster_settings`)/`bring_up_deadline_with_start` (also a per-node start hook,
+paired with `animusd::run_bound_node_with_*`, for non-default start knobs such
+as a pinned `orphan_sweep_after` or throttle defaults)/`bring_up_deadline_labeled`
+(per-node labels, which are consumed at bind time so a config hook cannot set
+them)/`bring_up_deadline_tls`/`start_single_node` bind-and-hold every node's
 listeners before starting any of them (issue #627, no port-TOCTOU, no
 retry loop; see this file's own "Every in-crate bring-up retries the
 port-TOCTOU race" entry above and `docs/lessons/testing/2026-09-20-
 allocate-test-ports-by-binding-and-holding-never-probe-and-release.md`),
-while `free_addrs`'s own probe-then-release allocator survives only for
+while converting a hand-rolled `bring_up` copy must keep any readiness gate
+the copy carried (`docs/lessons/testing/2026-10-30-converting-a-bring-up-copy-
+keep-its-readiness-gate.md`; #1421), and `free_addrs`'s own probe-then-release allocator survives only for
 the callers that need a not-yet-bound address ahead of a **joiner or
 growth** path binding it itself (`grow_deadline`, the four `join_*_
 deadline` helpers, `bring_up_split`) — plus split-cluster bring-up,

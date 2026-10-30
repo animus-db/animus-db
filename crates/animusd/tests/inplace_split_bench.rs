@@ -25,82 +25,39 @@
 
 use std::time::Duration;
 
-use animusd::{
-    ClientRequest, ClientResponse, ClusterConfig, Node, RoleAddrs, SegmentStoreConfig,
-    StorageBackend, StreamSealKnobs, read_frame, write_frame,
-};
+use animusd::{ClientRequest, ClientResponse, ClusterConfig, Node, read_frame, write_frame};
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
 
 mod support;
 use support::{admin, kickoff_tablet, sole_tablet_of};
 
-/// Bring up an `n`-node cluster, one process-shaped node per index —
-/// byte-for-byte the same bring-up shape (including quiescence disabled,
-/// `Duration::ZERO`) the deleted `split_build.rs::bring_up`'s copy-mode
-/// cluster used, minus the now-deleted `SplitMode` selection (every split
-/// is in-place unconditionally since Layer B1).
+/// Bring up an `n`-node in-place-split cluster via `support::bring_up_deadline_with_start`
+/// (bind-and-hold, no retry loop; issue #1421).
 async fn bring_up_inplace(n: usize, dir: &std::path::Path) -> (Vec<Node>, ClusterConfig) {
-    for attempt in 0..16 {
-        let addrs = support::free_addrs(n * 6);
-        let nodes_cfg: Vec<RoleAddrs> = (0..n)
-            .map(|i| RoleAddrs {
-                id: animusd::config::node_id(i),
-                role: animusd::config::NodeRole::Both,
-                internal: addrs[6 * i],
-                client: addrs[6 * i + 1],
-                dynamo: addrs[6 * i + 2],
-                admin: addrs[6 * i + 3],
-                intra: addrs[6 * i + 4],
-                console: addrs[6 * i + 5],
-                advertise_host: None,
-                tls: None,
-                encryption_key_path: None,
-                labels: Default::default(),
-                overload: None,
-            })
-            .collect();
-        let config = ClusterConfig {
-            version: animusd::config::CLUSTER_CONFIG_VERSION,
-            nodes: nodes_cfg,
-            dynamo_auth: None,
-            cluster_settings: None,
-        };
-        let mut nodes = Vec::new();
-        let mut failed = false;
-        for i in 0..n {
-            match animusd::run_node_with_streams_quiesce_and_backup_store(
+    support::bring_up_deadline_with_start(
+        n,
+        dir,
+        support::JOIN_DEADLINE,
+        |_| {},
+        |bound, config, i| async move {
+            animusd::run_bound_node_with_streams_quiesce_and_backup_store(
+                bound,
                 &config,
                 i,
-                dir.join(format!("node-{attempt}-{i}")),
-                StorageBackend::default(),
+                animusd::StorageBackend::default(),
+                // Pinned as the old per-file bring-up did (not the default).
                 Duration::from_secs(600),
-                StreamSealKnobs::default(),
-                SegmentStoreConfig::default(),
+                animusd::StreamSealKnobs::default(),
+                animusd::SegmentStoreConfig::default(),
                 animusd::DEFAULT_STREAM_RETENTION,
                 Duration::ZERO,
                 animusd::BackupStoreConfig::default(),
             )
             .await
-            {
-                Ok(node) => nodes.push(node),
-                Err(_) => {
-                    failed = true;
-                    break;
-                }
-            }
-        }
-        if !failed {
-            return (nodes, config);
-        }
-        for node in &nodes {
-            node.shutdown_graceful().await;
-        }
-        sleep(Duration::from_millis(50)).await;
-    }
-    panic!(
-        "could not bring up an in-place-split cluster after retries (ports kept getting stolen)"
-    );
+        },
+    )
+    .await
 }
 
 /// [`split_build.rs::put_in`]'s twin, but reporting how many frames it took

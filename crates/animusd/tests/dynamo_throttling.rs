@@ -48,8 +48,6 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use tokio::time::sleep;
-
 mod support;
 use support::{create_table, dynamo};
 
@@ -58,67 +56,37 @@ use support::{create_table, dynamo};
 // admin_endpoint.rs).
 // ---------------------------------------------------------------------------
 
-/// Brings up a cluster with every node started with a real cluster-wide
-/// throttle default (ADR 0065 §5(a), W-08 step 4) — the config-surface path
-/// itself (`animusd::run_node_with_cluster_settings`'s own
-/// `throttle_read_units`/`throttle_write_units` params), this file's own
-/// remaining test's subject. Also stamps `ClusterConfig::cluster_settings`
-/// with the same values for documentation, though
-/// `run_node_with_cluster_settings` itself takes them as explicit arguments
-/// rather than re-reading the config.
+/// Bring up an `n`-node cluster via `support::bring_up_deadline_with_start`
+/// (bind-and-hold, no retry loop; issue #1421) with the cluster-wide throttle
+/// defaults seeded.
 async fn bring_up_with_throttle_defaults(
     n: usize,
     dir: &std::path::Path,
     throttle_read_units: Option<u64>,
     throttle_write_units: Option<u64>,
 ) -> (Vec<animusd::Node>, animusd::ClusterConfig) {
-    for attempt in 0..16 {
-        let addrs = support::free_addrs(n * 6);
-        let nodes_cfg: Vec<animusd::RoleAddrs> = (0..n)
-            .map(|i| animusd::RoleAddrs {
-                id: animusd::config::node_id(i),
-                role: animusd::config::NodeRole::Both,
-                internal: addrs[6 * i],
-                client: addrs[6 * i + 1],
-                dynamo: addrs[6 * i + 2],
-                admin: addrs[6 * i + 3],
-                intra: addrs[6 * i + 4],
-                console: addrs[6 * i + 5],
-                advertise_host: None,
-                tls: None,
-                encryption_key_path: None,
-                labels: Default::default(),
-                overload: None,
-            })
-            .collect();
-        let config = animusd::ClusterConfig {
-            version: animusd::config::CLUSTER_CONFIG_VERSION,
-            nodes: nodes_cfg,
-            dynamo_auth: None,
-            cluster_settings: Some(animusd::config::ClusterSettings {
+    support::bring_up_deadline_with_start(
+        n,
+        dir,
+        support::JOIN_DEADLINE,
+        |config| {
+            config.cluster_settings = Some(animusd::config::ClusterSettings {
                 throttle_read_units,
                 throttle_write_units,
-                // ADR 0067 (W-08b): this file's own test deliberately
-                // creates tables with a huge `ProvisionedThroughput` (to
-                // drive the *throttle* bucket's arithmetic, not to test the
-                // auto-split trigger) — `run_node`'s own default per-tablet
-                // capacity ceilings (3000 RCU / 1000 WCU) would otherwise
-                // derive a huge minimum tablet count for that table and
-                // repeatedly split it mid-test; `Some(0)`/`Some(0)`
-                // disables that trigger entirely (see
-                // `TabletCapacityCeilings`'s own doc).
+                // ADR 0067 (W-08b): these tests create tables with a huge
+                // `ProvisionedThroughput` to drive the *throttle* bucket's
+                // arithmetic, not the auto-split trigger; `Some(0)`/`Some(0)`
+                // disables that trigger (see `TabletCapacityCeilings`).
                 tablet_max_read_units: Some(0),
                 tablet_max_write_units: Some(0),
                 ..Default::default()
-            }),
-        };
-        let mut nodes = Vec::new();
-        let mut failed = false;
-        for i in 0..n {
-            match animusd::run_node_with_cluster_settings(
+            });
+        },
+        |bound, config, i| async move {
+            animusd::run_bound_node_with_cluster_settings(
+                bound,
                 &config,
                 i,
-                dir.join(format!("node-{attempt}-{i}")),
                 animusd::StorageBackend::default(),
                 animus_control::node::DEFAULT_ORPHAN_SWEEP_AFTER,
                 animusd::StreamSealKnobs::default(),
@@ -138,23 +106,9 @@ async fn bring_up_with_throttle_defaults(
                 false,
             )
             .await
-            {
-                Ok(node) => nodes.push(node),
-                Err(_) => {
-                    failed = true;
-                    break;
-                }
-            }
-        }
-        if !failed {
-            return (nodes, config);
-        }
-        for node in &nodes {
-            node.shutdown_graceful().await;
-        }
-        sleep(Duration::from_millis(50)).await;
-    }
-    panic!("could not bring up cluster after retries (ports kept getting stolen)");
+        },
+    )
+    .await
 }
 
 /// `CreateTable` with `BillingMode: "PROVISIONED"` and an explicit
