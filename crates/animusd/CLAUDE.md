@@ -146,7 +146,7 @@ wiring; the rules:
   `rt-multi-thread`/`time`. `cargo build -p animusd` is unchanged by the split.
 - **`embedded`**: the in-crate `SimCluster` fixture (`sim_cluster.rs`,
   `sim_cluster_lsm.rs`) compiled outside `cfg(test)` and exposed as the public
-  `embedded::EmbeddedCluster` (module doc in `src/embedded.rs`): `new`/`submit`/
+  `embedded::EmbeddedCluster` (module doc in `src/embedded.rs`): `new`/`submit`/`submit_http` (console/admin API, ADR 0082 2026-10-31)/
   `poll`/`advance`/`run_request`/`crash`/`restart`/`partition`/`heal_all`/`grow`/
   `status`. `grow` returns `Err` while a node is down or partitioned (the fixture waits for every node to see the new member and would otherwise panic; lesson `docs/lessons/testing/2026-10-30-a-browser-build-turns-every-fixture-panic-into-a-dead-page.md`). The `animus-web` crate wraps it for the browser (ADR 0082). It pulls in `animus-sim` and `animus-control/sim-versions`. It builds
   for `wasm32-unknown-unknown`:

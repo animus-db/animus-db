@@ -8,4 +8,4 @@
 
 # Agent-isolation worktrees (not part of the repo)
 .claude/worktrees/
-/website/demo/pkg/
+/website/demo/

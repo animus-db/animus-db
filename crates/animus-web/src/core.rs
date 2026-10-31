@@ -37,8 +37,10 @@ pub struct Completed {
     pub id: RequestId,
     /// HTTP-style status.
     pub status: u16,
-    /// The JSON response body.
+    /// The response body (JSON for every route the cluster itself serves).
     pub body: String,
+    /// The `Content-Type` the real edge would send.
+    pub content_type: String,
 }
 
 /// A request awaiting its result.
@@ -93,11 +95,34 @@ impl Core {
         body: &str,
     ) -> Result<RequestId, EmbeddedError> {
         let id = self.cluster.submit(node, target, body)?;
+        Ok(self.track(id))
+    }
+
+    /// Send an HTTP-style request for the data console (`/console/api/*`) or
+    /// the operator dashboard's admin API (`/admin/*`) to `node` and return its
+    /// id. `path` is the request target including any query string. Resolved
+    /// by [`tick`](Self::tick) like [`submit`](Self::submit), with the same
+    /// 30-virtual-second timeout.
+    ///
+    /// # Errors
+    /// `node` does not exist.
+    pub fn submit_http(
+        &mut self,
+        node: u64,
+        method: &str,
+        path: &str,
+        body: &str,
+    ) -> Result<RequestId, EmbeddedError> {
+        let id = self.cluster.submit_http(node, method, path, body)?;
+        Ok(self.track(id))
+    }
+
+    fn track(&mut self, id: RequestId) -> RequestId {
         let deadline_us = self
             .now_us
             .saturating_add(u64::try_from(REQUEST_TIMEOUT.as_micros()).unwrap_or(u64::MAX));
         self.in_flight.insert(id, InFlight { deadline_us });
-        Ok(id)
+        id
     }
 
     /// Advance virtual time by `real_ms * speed` (see [`MAX_TICK_REAL_MS`] and
@@ -117,9 +142,14 @@ impl Core {
         let mut done = Vec::new();
         let ids: Vec<RequestId> = self.in_flight.keys().copied().collect();
         for id in ids {
-            if let Some((status, body)) = self.cluster.poll(id) {
+            if let Some(r) = self.cluster.poll_http(id) {
                 self.in_flight.remove(&id);
-                done.push(Completed { id, status, body });
+                done.push(Completed {
+                    id,
+                    status: r.status,
+                    body: r.body,
+                    content_type: r.content_type.to_owned(),
+                });
             } else if self
                 .in_flight
                 .get(&id)
@@ -130,6 +160,7 @@ impl Core {
                 done.push(Completed {
                     id,
                     status: 504,
+                    content_type: "application/json".to_owned(),
                     body: serde_json::json!({
                         "__type": "com.amazon.coral.availability#RequestTimeoutException",
                         "message": format!(
@@ -418,6 +449,17 @@ mod tests {
                         ));
                         submitted += 1;
                     }
+                    7 => {
+                        const PATHS: [&str; 5] = [
+                            "/console/api/tables",
+                            "/admin/status",
+                            "/admin/raftkv",
+                            "/admin/storage/lsm?tablet=1",
+                            "/admin/peers",
+                        ];
+                        drop(core.submit_http(next(nodes), "GET", PATHS[next(5) as usize], ""));
+                        submitted += 1;
+                    }
                     _ => {}
                 }
                 for _ in 0..next(20) {
@@ -431,6 +473,27 @@ mod tests {
             assert!(done <= submitted, "seed={seed}");
             assert_eq!(core.in_flight(), 0, "seed={seed}");
         }
+    }
+
+    #[test]
+    fn console_and_dashboard_requests_resolve_through_the_pump() {
+        let mut core = Core::new(8, 3).expect("cluster");
+        assert_eq!(run(&mut core, 0, CREATE, CREATE_BODY).status, 200);
+        let id = core
+            .submit_http(1, "GET", "/console/api/tables", "")
+            .expect("submit");
+        let tables = resolve_id(&mut core, id);
+        assert_eq!(tables.status, 200, "{}", tables.body);
+        assert!(tables.body.contains("tbl"), "{}", tables.body);
+        assert_eq!(tables.content_type, "application/json");
+        let id = core
+            .submit_http(2, "GET", "/admin/status", "")
+            .expect("submit");
+        let status = resolve_id(&mut core, id);
+        assert_eq!(status.status, 200, "{}", status.body);
+        assert!(status.body.contains("tbl"), "{}", status.body);
+        assert!(core.submit_http(7, "GET", "/admin/status", "").is_err());
+        assert_eq!(core.in_flight(), 0);
     }
 
     #[test]

@@ -7,7 +7,7 @@
 //       [--url http://127.0.0.1:8000/demo.html] [--shots DIR] [--exe /path/to/browser]
 //
 // Drives the page like a visitor: start, CreateTable, PutItem, GetItem, Query,
-// Scan, PartiQL, crash the control leader, write through a survivor, restart,
+// Scan, PartiQL, the data console and operator dashboard in their frames, crash the control leader, write through a survivor, restart,
 // partition, heal, add a node, speed slider, pause. Fails on any console error,
 // page error or unexpected response. Needs Playwright's own browser build (a
 // stock Firefox cannot be driven by Playwright).
@@ -66,6 +66,34 @@ for (const [ex, want] of [["create", "orders"], ["put", ""], ["get", "o-1001"], 
   check(ex, r.code === 200 && r.body.includes(want), "HTTP " + r.code);
 }
 await shot(page, `${name}-desktop-light.png`);
+
+// The real data console and operator dashboard, in iframes, against the same cluster.
+{
+  await page.click("#tab-console");
+  const con = page.frameLocator("#frame-console");
+  await con.locator("td.name a", { hasText: "orders" }).waitFor({ timeout: 60000 });
+  check("data console lists the table made in the playground", true);
+  await con.locator("td.name a", { hasText: "orders" }).click();
+  await con.locator("body").getByText("customer_id").first().waitFor({ timeout: 60000 });
+  check("data console opens the table (in-frame navigation)", true);
+  await con.locator("a.tab-link", { hasText: "Items" }).click();
+  await con.locator("body").getByText("o-1001").first().waitFor({ timeout: 60000 });
+  check("data console shows the item written over the DynamoDB wire", true);
+  await shot(page, `${name}-console.png`);
+
+  await page.click("#tab-dashboard");
+  const dash = page.frameLocator("#frame-dashboard");
+  await dash.locator("body").getByText(/3 node\(s\) reachable/).waitFor({ timeout: 60000 });
+  check("dashboard overview sees the cluster", true);
+  await dash.getByText("orders").locator("visible=true").first().waitFor({ timeout: 60000 });
+  check("dashboard lists the playground table", true);
+  await dash.locator(".sidebar button.navlink", { hasText: "Tablets" }).click();
+  await dash.getByText("orders").locator("visible=true").first().waitFor({ timeout: 60000 });
+  check("dashboard tablets tab", true);
+  await dash.locator(".sidebar button.navlink", { hasText: "Backups" }).click();
+  await shot(page, `${name}-dashboard.png`);
+  await page.click("#tab-requests");
+}
 
 const leaderText = await page.textContent("#ctl-leader");
 const leader = Number(/\d+/.exec(leaderText)[0]);

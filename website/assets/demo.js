@@ -83,6 +83,36 @@
   var eventsBuf = [];
   var prevStatus = null;
   var rafId = 0;
+  var uiPending = 0;       // requests made by the console/dashboard frames, in flight
+
+  // ---- the bridge the console and dashboard frames call -------------------
+  // The two web UIs run in same-origin iframes (demo-frame.js). Their fetch()
+  // calls to /console/api/* and /admin/* land here and are answered by the
+  // in-tab cluster, so every interface sees the same cluster.
+  function entryNode() {
+    var nodes = status ? status.nodes : [];
+    for (var i = 0; i < nodes.length; i++) { if (nodes[i].up) { return nodes[i].id; } }
+    return 0;
+  }
+  window.animusDemo = {
+    ready: function () { return !!cluster; },
+    entryNode: entryNode,
+    nodeCount: function () { return status ? status.nodes.length : 0; },
+    // `host` is the host of the URL the UI fetched: the dashboard dials peers by the
+    // node ids the cluster reports ("n2"); its own origin means "the entry node".
+    nodeForHost: function (host) {
+      var m = /^n(\d+)(?::\d+)?$/.exec(host || "");
+      return m && Number(m[1]) < (status ? status.nodes.length : 0) ? Number(m[1]) : entryNode();
+    },
+    http: function (node, method, path, body) {
+      if (!cluster) { return Promise.reject(new Error("the cluster is not running")); }
+      uiPending++;
+      var done = function () { uiPending--; };
+      var p = cluster.http(node, method, path, body || "");
+      p.then(done, done);
+      return p;
+    }
+  };
 
   // ---- formatting ---------------------------------------------------------
   function fmtClock(ms) {
@@ -268,6 +298,9 @@
     try {
       if (!paused) {
         cluster.tick(dt, SPEEDS[speedIdx]);
+      } else if (uiPending > 0) {
+        // A UI request is waiting on a paused clock: let it run at real-time speed.
+        cluster.tick(dt, 1);
       }
       if (now - lastStatusAt > 200) {
         lastStatusAt = now;
@@ -372,7 +405,8 @@
       btn.textContent = cluster ? "Rebuild cluster" : "Start cluster";
       return;
     }
-    status = null; prevStatus = null; lastStatusJson = ""; eventsBuf = []; nodeCount = 0;
+    status = null; prevStatus = null; lastStatusJson = ""; eventsBuf = []; nodeCount = 0; uiPending = 0;
+    resetFrames();
     paused = false;
     $("pause").textContent = "Pause";
     $("pause").setAttribute("aria-pressed", "false");
@@ -390,7 +424,42 @@
     document.documentElement.setAttribute("data-demo-ready", "1");
   }
 
+  // ---- interface tabs (requests / data console / operator dashboard) ------
+  var PANES = ["requests", "console", "dashboard"];
+  function showPane(name) {
+    PANES.forEach(function (p) {
+      var on = p === name;
+      $("pane-" + p).hidden = !on;
+      var t = $("tab-" + p);
+      t.setAttribute("aria-selected", String(on));
+      t.tabIndex = on ? 0 : -1;
+    });
+    if (name !== "requests") {
+      var f = $("frame-" + name);
+      // Load the real UI once, on first visit; it keeps its own state after that.
+      if (!f.getAttribute("src")) { f.setAttribute("src", "demo-frame.html?app=" + name); }
+    }
+  }
+  // A rebuilt cluster invalidates whatever the frames loaded from the old one.
+  function resetFrames() {
+    ["console", "dashboard"].forEach(function (a) { $("frame-" + a).removeAttribute("src"); });
+    var active = PANES.filter(function (p) { return $("tab-" + p).getAttribute("aria-selected") === "true"; })[0];
+    if (active && active !== "requests") { showPane(active); }
+  }
+
   document.addEventListener("DOMContentLoaded", function () {
+    PANES.forEach(function (p, i) {
+      var t = $("tab-" + p);
+      t.addEventListener("click", function () { showPane(p); });
+      t.addEventListener("keydown", function (e) {
+        var j = e.key === "ArrowRight" ? i + 1 : e.key === "ArrowLeft" ? i - 1 : -1;
+        if (j < 0) { return; }
+        j = (j + PANES.length) % PANES.length;
+        showPane(PANES[j]);
+        $("tab-" + PANES[j]).focus();
+        e.preventDefault();
+      });
+    });
     var sel = $("example");
     EXAMPLES.forEach(function (ex) {
       var o = el("option", null, ex.label);

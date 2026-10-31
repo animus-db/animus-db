@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Build the in-browser demo's WebAssembly into website/demo/pkg/ (gitignored;
-# ADR 0082). Used by .github/workflows/pages.yml and for local previews:
+# Build the in-browser demo into website/demo/ (gitignored; ADR 0082): the
+# WebAssembly into demo/pkg/ and the two real animusd web UIs (the data console and
+# the operator dashboard) into demo/apps/. Used by .github/workflows/pages.yml and for local previews:
 #
 #   scripts/build-web-demo.sh && python3 -m http.server 8000 --directory website
 #
@@ -12,6 +13,20 @@
 # message. Set CARGO_TARGET_DIR to keep the wasm build out of ./target.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+
+# The data console and the operator dashboard run in the demo page unmodified. The
+# single source of truth is crates/animusd/src: copy the files, concatenating the
+# stylesheet the same way console.rs / dashboard.rs do (fonts, then tokens, then the
+# UI's own). website/assets/demo-frame.js loads them.
+src=crates/animusd/src
+rm -rf website/demo/apps
+mkdir -p website/demo/apps/console website/demo/apps/dashboard
+cp "${src}/console.html" website/demo/apps/console/index.html
+cp "${src}/console.js" website/demo/apps/console/console.js
+cat "${src}/fonts.css" "${src}/tokens.css" "${src}/console.css" > website/demo/apps/console/console.css
+cp "${src}/dashboard.html" website/demo/apps/dashboard/index.html
+cp "${src}"/dashboard_*.js website/demo/apps/dashboard/
+cat "${src}/fonts.css" "${src}/tokens.css" "${src}/dashboard.css" > website/demo/apps/dashboard/dashboard.css
 
 want=$(awk '/^name = "wasm-bindgen"$/ {getline; gsub(/[^0-9.]/, "", $0); print; exit}' Cargo.lock)
 have=$(wasm-bindgen --version 2>/dev/null | awk '{print $2}' || true)

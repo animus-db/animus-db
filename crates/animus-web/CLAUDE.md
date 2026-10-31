@@ -14,6 +14,7 @@ virtual clock. It powers `website/demo.html`.
 - `src/shell.rs`: the `#[wasm_bindgen]` class `AnimusCluster`:
   `new AnimusCluster(seed, nodes)`, `request(node, target, bodyJson) -> Promise<{status, body}>`,
   `tick(realMs, speed)`, `crash/restart/partition/healAll/grow`, `status() -> JSON string`.
+  `http(node, method, path, body) -> Promise<{status, contentType, body}>` serves the data console / operator dashboard API (ADR 0082, 2026-10-31 amendment).
   It holds only JS glue (promises, `JsError`) and a panic hook to `console.error`.
 
 ## Rules
@@ -67,3 +68,14 @@ nontrapping-fptoint, sign-ext and mutable-globals (rustc's wasm32 defaults), all
 Firefox since 79; the shell passes `f64` (not `u64`/BigInt) across the boundary; the
 page uses `accent-color` (Firefox 92), `oklch()` (113) and `text-decoration-thickness`
 (70); `instantiateStreaming` needs `application/wasm`, which GitHub Pages serves.
+
+## The two web UIs in the demo
+
+`website/demo-frame.html` + `assets/demo-frame.js` load animusd's real data console and
+dashboard (copied by `scripts/build-web-demo.sh` from `crates/animusd/src` into the gitignored
+`website/demo/apps/`) into same-origin iframes; a shim there sends their `fetch` calls to
+`window.animusDemo.http` (defined in `assets/demo.js`), which calls `AnimusCluster.http`. When a
+UI source file adds a new asset, a `location.href =` navigation, or an API path outside
+`/console/api/` and `/admin/` (not `/admin/ui/`), check the shim and `demo-browser-smoke.mjs`.
+Backups, export/import, index `UpdateTable`, metrics export and peer-console links do not work in
+the sim; see the ADR's amendment.
