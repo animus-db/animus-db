@@ -148,6 +148,7 @@ dependencies = [
  "async-trait",
  "chacha20poly1305",
  "futures",
+ "getrandom 0.2.17",
  "rand 0.8.8",
  "rcgen",
  "rustls",
@@ -318,6 +319,17 @@ dependencies = [
  "futures",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "animus-web"
+version = "0.1.0-alpha.0"
+dependencies = [
+ "animusd",
+ "js-sys",
+ "serde",
+ "serde_json",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -997,8 +1009,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ff2abc00be7fca6ebc474524697ae276ad847ad0a6b3faa4bcb027e9a4614ad0"
 dependencies = [
  "cfg-if",
+ "js-sys",
  "libc",
  "wasi",
+ "wasm-bindgen",
 ]
 
 [[package]]

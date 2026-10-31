@@ -786,7 +786,48 @@ struct SimState {
     partitions: BTreeSet<(NodeId, NodeId)>,
     crashed: BTreeSet<NodeId>,
 
-    trace: Vec<TraceEvent>,
+    trace: TraceBuf,
+}
+
+/// The simulator's [`TraceEvent`] history with an optional retention cap.
+///
+/// The default is **unbounded**, byte-for-byte the old `Vec<TraceEvent>`
+/// behaviour every determinism test relies on. A long-lived embedder (a
+/// browser tab driving a cluster for hours) sets a cap with
+/// [`Simulator::set_trace_cap`] so the buffer cannot grow without bound. The
+/// cap affects only what is *retained*; no event is ever skipped or reordered
+/// and nothing here touches the RNG, so a run's execution is identical with
+/// or without it.
+#[derive(Default)]
+struct TraceBuf {
+    events: std::collections::VecDeque<TraceEvent>,
+    /// `None`: keep everything (the default). `Some(0)`: record nothing.
+    /// `Some(n)`: keep the most recent `n` events.
+    cap: Option<usize>,
+}
+
+impl TraceBuf {
+    fn push(&mut self, event: TraceEvent) {
+        match self.cap {
+            Some(0) => {}
+            Some(cap) => {
+                if self.events.len() >= cap {
+                    self.events.pop_front();
+                }
+                self.events.push_back(event);
+            }
+            None => self.events.push_back(event),
+        }
+    }
+
+    fn set_cap(&mut self, cap: Option<usize>) {
+        self.cap = cap;
+        if let Some(cap) = cap {
+            while self.events.len() > cap {
+                self.events.pop_front();
+            }
+        }
+    }
 }
 
 impl SimState {
@@ -1494,7 +1535,7 @@ impl Simulator {
             pending_removes: BTreeMap::new(),
             partitions: BTreeSet::new(),
             crashed: BTreeSet::new(),
-            trace: Vec::new(),
+            trace: TraceBuf::default(),
         };
         Self {
             shared: Arc::new(Shared {
@@ -2265,7 +2306,17 @@ impl Simulator {
     /// The recorded history of this run.
     #[must_use]
     pub fn trace(&self) -> Vec<TraceEvent> {
-        self.shared.lock().trace.clone()
+        self.shared.lock().trace.events.iter().cloned().collect()
+    }
+
+    /// Bound the retained [`trace`](Self::trace) history: `None` (the
+    /// default) keeps every event, `Some(0)` turns recording off, `Some(n)`
+    /// keeps only the most recent `n` events (older ones are dropped, now and
+    /// as new events arrive). Purely a memory bound for a long-lived embedder:
+    /// it never changes what the simulation does, only what is remembered, so
+    /// the default leaves every existing byte-identical-trace test untouched.
+    pub fn set_trace_cap(&self, cap: Option<usize>) {
+        self.shared.lock().trace.set_cap(cap);
     }
 
     /// The recorded history rendered as stable text lines.
@@ -2274,6 +2325,7 @@ impl Simulator {
         self.shared
             .lock()
             .trace
+            .events
             .iter()
             .map(ToString::to_string)
             .collect()

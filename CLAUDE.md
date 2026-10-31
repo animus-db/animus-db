@@ -184,6 +184,7 @@ the relevant one before working in a crate:
 | `animus-placement` | [crates/animus-placement/CLAUDE.md](crates/animus-placement/CLAUDE.md) |
 | `animus-node` | [crates/animus-node/CLAUDE.md](crates/animus-node/CLAUDE.md) |
 | `animusd` | [crates/animusd/CLAUDE.md](crates/animusd/CLAUDE.md) |
+| `animus-web` | [crates/animus-web/CLAUDE.md](crates/animus-web/CLAUDE.md) |
 | `animus-cli` | [crates/animus-cli/CLAUDE.md](crates/animus-cli/CLAUDE.md) |
 | `animus-bench` | [crates/animus-bench/CLAUDE.md](crates/animus-bench/CLAUDE.md) |
 | `animus-operator` | [crates/animus-operator/CLAUDE.md](crates/animus-operator/CLAUDE.md) |
@@ -202,6 +203,8 @@ cargo nextest run -p animusd --lib --profile gates # animusd's SimCluster `--lib
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo fmt --all --check
 cargo deny check                                   # licenses + advisories (cargo install cargo-deny)
+scripts/check-animusd-test-list.sh                 # fails if an animusd tests/*.rs is not a [[test]] in its Cargo.toml (autotests = false)
+scripts/build-web-demo.sh                          # the browser demo's wasm into website/demo/pkg (ADR 0082; needs the wasm32 target + pinned wasm-bindgen-cli)
 scripts/check-format-fixtures.sh                   # ADR 0073 Phase 0: fails if a checked-in format fixture was edited/deleted
 (cd fuzz && cargo test --release --test smoke)    # R-01 (c): deterministic stable smoke of every fuzz target (real libFuzzer: fuzz/README.md)
 cargo bench -p animus-storage                      # ProdEnv smoke of the write/IO path

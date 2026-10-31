@@ -142,7 +142,14 @@ impl VersionState {
             .clone()
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "embedded"))]
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "fixture helper: used by the SimCluster test tier; an embedded build does not call it"
+        )
+    )]
     pub(crate) fn set_profile(&self, p: VersionProfile) {
         *self.profile.lock().expect("version profile poisoned") = p;
     }

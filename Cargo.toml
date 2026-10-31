@@ -133,6 +133,12 @@ socket2 = { version = "0.6", features = ["all"] }
 # `zeroize` scrubs the loaded key from memory on drop.
 chacha20poly1305 = "0.10"
 zeroize = "1"
+# Browser build (ADR 0082): `animus-web` only. MIT OR Apache-2.0. The JS glue
+# the website demo loads is generated from this exact `wasm-bindgen` version by
+# a pinned `wasm-bindgen-cli` (`.github/workflows/pages.yml` reads the version
+# out of `Cargo.lock`, so the two cannot drift).
+wasm-bindgen = "0.2"
+js-sys = "0.3"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
@@ -159,3 +165,15 @@ debug = "line-tables-only"
 
 [profile.release]
 debug = 1
+
+# The browser build (`animus-web`, ADR 0082): the .wasm is downloaded by every
+# visitor, so it is built for size, not for the native release's speed.
+# `cargo build -p animus-web --profile wasm-release --target wasm32-unknown-unknown`.
+[profile.wasm-release]
+inherits = "release"
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+debug = false
+strip = "debuginfo"
+panic = "abort"

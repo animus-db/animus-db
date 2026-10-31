@@ -12606,3 +12606,7 @@ closed-C-15 appendix in the shape of the closed-C-14 one; two new
 `docs/lessons/` entries (a residual-inventory-count-drift lesson under
 `orchestration/`, a "recheck a sim gap claim against the raw-KV path"
 lesson under `testing/`).
+
+## 2026-10-30 amendment — the generic brain now also builds for the browser (cross-reference to ADR 0082)
+
+`SimCluster` and the `E: Env`-generic client path this ADR carved out are now reachable outside `cfg(test)`: `animusd` gained an `embedded` cargo feature that compiles the fixture and exposes it as `animusd::embedded::EmbeddedCluster`, with the real process (`ProdEnv`, sockets, TLS, OpenTelemetry, the binary) behind a default-on `server` feature, so the same brain compiles for `wasm32-unknown-unknown`. No visibility was widened (the embedded module is a descendant of the crate root, as the fixture already was) and the orphan-rule carve-out this ADR describes is unchanged. Decision, rationale and the rejected real-time `WebEnv` are in [ADR 0082](0082-browser-build-embedded-cluster.md).

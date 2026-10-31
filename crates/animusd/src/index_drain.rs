@@ -220,7 +220,7 @@ use animus_dynamo::{
     AttributeValue, ChangeRecord, FootprintEntry, IndexFootprint, Item, index as dynamo_index,
     index_table_name, is_index_table_name, storage_key,
 };
-use animus_env::{Clock, Env, Metric};
+use animus_env::{Env, Metric};
 use animus_node::host::RelayClient;
 use animus_tablet::TOKEN_BYTES;
 use animus_tablet::TabletId;
@@ -333,11 +333,7 @@ const BACKFILL_SEED_TIMEOUT: Duration = Duration::from_secs(10);
 /// durable records/catalog state (nothing is trimmed until every expected
 /// term says it's safe to, and a failed seal simply re-evaluates its
 /// triggers next tick).
-#[allow(
-    clippy::disallowed_methods,
-    reason = "a concrete ClientCtx (E = ProdEnv) process-boundary background loop; SimCluster never spawns this loop (it drives its five arms on demand via drain_gsi/drive_stream_seal/drive_backfill_seed/etc. instead), so its own sleep cadence never needs to advance virtual time; issue #993"
-)]
-pub(crate) async fn change_consumer_loop(ctx: ClientCtx) {
+pub(crate) async fn change_consumer_loop<E: Env, R: RelayClient>(ctx: ClientCtx<E, R>) {
     // Driver-local memo of the seal arm's age-trigger basis for a tablet
     // that has never sealed a shard of its own (no catalog row to read a
     // last-seal time from yet) — see `seal_tick`'s own doc for the full
@@ -359,7 +355,7 @@ pub(crate) async fn change_consumer_loop(ctx: ClientCtx) {
     // ownership/bounding discipline as `first_hot_seen` above.
     let mut marker_bytes_seen: BTreeMap<TabletId, u64> = BTreeMap::new();
     loop {
-        tokio::time::sleep(INDEX_DRAIN_INTERVAL).await;
+        ctx.env.sleep(INDEX_DRAIN_INTERVAL).await;
         let meta = ctx.effective_metadata();
         // ADR 0066 §1 (S-02 step 3): piggyback this loop's own per-tick
         // `Metadata` refresh to keep the SigV4 gate's lock-free "any
@@ -1843,12 +1839,12 @@ async fn seed_change_log_record<E: Env>(
 /// trickling backlog where the very first record arrived long before the
 /// most recent seal — an accepted precision loss in exchange for never
 /// scanning to compute it.
-async fn seal_tick(
-    ctx: &ClientCtx,
+async fn seal_tick<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
     meta: &Metadata,
     table: &str,
     tablet: TabletId,
-    group: &CpGroup,
+    group: &CpGroup<E>,
     first_hot_seen: &mut BTreeMap<TabletId, u64>,
 ) -> Result<(), String> {
     // ADR 0043 §A3's "When": the change log's OWN bytes, never the base
@@ -1976,12 +1972,12 @@ async fn seal_tick(
 /// can have PITR enabled with no stream, or a stream with no PITR, or both
 /// independently — ADR 0059 §9's "never gate each other" rule means each
 /// consumer's own age-trigger basis must be tracked separately).
-async fn pitr_tick(
-    ctx: &ClientCtx,
+async fn pitr_tick<E: Env, R: RelayClient>(
+    ctx: &ClientCtx<E, R>,
     meta: &Metadata,
     table: &str,
     tablet: TabletId,
-    group: &CpGroup,
+    group: &CpGroup<E>,
     first_pitr_hot_seen: &mut BTreeMap<TabletId, u64>,
 ) -> Result<(), String> {
     let approx_bytes = group.approx_bytes_kind(KIND_CHANGE).await;

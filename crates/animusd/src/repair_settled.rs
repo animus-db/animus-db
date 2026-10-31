@@ -27,6 +27,7 @@ use crate::{ClientCtx, MetaCommand, RelayClient};
 use animus_env::Env;
 
 /// Tick cadence of the loop.
+#[cfg(feature = "server")]
 pub(crate) const REPAIR_SETTLED_INTERVAL: Duration = Duration::from_millis(200);
 /// Reports proposed per tick (bounds the one-time burst after the gate opens).
 pub(crate) const REPAIR_SETTLED_PER_TICK: usize = 16;
@@ -34,6 +35,7 @@ pub(crate) const REPAIR_SETTLED_PER_TICK: usize = 16;
 const REPAIR_SETTLED_RETRY: Duration = Duration::from_secs(2);
 
 /// Run forever on every node; self-gates per tablet on leadership.
+#[cfg(feature = "server")]
 pub(crate) async fn repair_settled_loop(ctx: ClientCtx) {
     let mut proposed: BTreeMap<TabletId, (Epoch, Nanos)> = BTreeMap::new();
     loop {

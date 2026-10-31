@@ -136,6 +136,70 @@ before bind, same as before, since `NodeId::mint` needs no `Env` to run at
 all), so it still needs a real, already-resolvable address up front, never
 a literal `:0`.
 
+## Cargo features: `server` and `embedded` (browser build)
+
+The crate has two builds of one library. `Cargo.toml` documents the feature
+wiring; the rules:
+
+- **`server`** (default): everything above. Sockets, TLS, `ProdEnv`, the
+  `animusd` binary, OpenTelemetry, signals, `tokio` `net`/`fs`/`signal`/
+  `rt-multi-thread`/`time`. `cargo build -p animusd` is unchanged by the split.
+- **`embedded`**: the in-crate `SimCluster` fixture (`sim_cluster.rs`,
+  `sim_cluster_lsm.rs`) compiled outside `cfg(test)` and exposed as the public
+  `embedded::EmbeddedCluster` (module doc in `src/embedded.rs`): `new`/`submit`/
+  `poll`/`advance`/`run_request`/`crash`/`restart`/`partition`/`heal_all`/`grow`/
+  `status`. `grow` returns `Err` while a node is down or partitioned (the fixture waits for every node to see the new member and would otherwise panic; lesson `docs/lessons/testing/2026-10-30-a-browser-build-turns-every-fixture-panic-into-a-dead-page.md`). The `animus-web` crate wraps it for the browser (ADR 0082). It pulls in `animus-sim` and `animus-control/sim-versions`. It builds
+  for `wasm32-unknown-unknown`:
+  `cargo check -p animusd --lib --no-default-features --features embedded --target wasm32-unknown-unknown`.
+  `animus-env` gets `getrandom/js` on wasm32 (its `Cargo.toml`).
+- At least one must be on (`compile_error!` in `lib.rs`); the in-crate **tests
+  need `server`** (they use `ProdEnv`-typed pieces and cannot build with
+  `--no-default-features`). Run the embedded tests with
+  `cargo test -p animusd --lib --features embedded embedded`; `--features
+  embedded` is not part of the default `gates` nextest run.
+
+How the split is done (lesson: `docs/lessons/code-patterns/2026-10-30-gate-a-process-boundary-by-feature-not-by-rewriting-the-generic-core.md`):
+
+- Server-only code carries `#[cfg(feature = "server")]` on **whole items or
+  `impl` blocks**: `Node`/`BoundNode`/`BoundControlNode`/`BoundDataNode`, the
+  `run_node*`/`start_cluster*`/`bind_cluster*` family, `serve_requests`/
+  `handle_connection`, the TCP `serve`/`handle_conn` of `dynamo`/`admin`/
+  `console`, `control_handle` (`AnimusdRelayClient`), `otel`, `import`,
+  `control_recover`, `node_labels`, `backup_capture`, `backup_restore`, the
+  concrete `execute_routed*`/`run_operation` and the concrete export/import/
+  restore/tagging kickoffs in `dynamo.rs`, the `Fs`/`EncryptedFs`/`Cluster`
+  variants of `SegmentStoreHandle`/`BackupStoreHandle` (their `S3(dyn
+  SegmentStore)` variant stays, `SimCluster` uses it), and the tablet-host/
+  txn-resolver/metrics loops. The generic `impl<E: Env, R: RelayClient>
+  ClientCtx<E, R>`, `dispatch_item_op`/`dispatch_table_op`/`execute_item_op_as`,
+  `GenericAdminHost`, `GenericConsoleBackend` and the `E: Env`-generic modules
+  are **not** gated; they are the brain both builds share.
+- `DefaultEnv` / `DefaultRelay` (type aliases in `lib.rs`) are what the bare
+  `ClientCtx`/`CpGroup`/`ClusterEdgeState`/`CpRoute` mean: `ProdEnv` /
+  `AnimusdRelayClient` with `server`, `SimEnv` / `SimRelayClient<SimEnv>` without.
+  Without `server`, `TlsMaterial` is an uninhabited stand-in, `otel` is a two-
+  function no-op, and `default_export_store_factory` always answers "not
+  available" (there is no S3 transport).
+- The embedded-only build `allow`s `dead_code`/`unused_imports`/`unused_variables`
+  crate-wide (`lib.rs`, with a reason): it reaches a subset of the client path,
+  and the server build's lint run covers dead code.
+- Test-only helpers `SimCluster` needs (`CpGroup::{role_term, features,
+  peer_applied_index, propose_freeze, commit_index, is_halted}`,
+  `ClusterEdgeState::{replace_control, downgrade_control}`,
+  `VersionState::set_profile`) are `cfg(any(test, feature = "embedded"))`.
+  Their doc comments still say "`#[cfg(test)]`-only"; read that as "test or
+  embedded".
+- `change_consumer_loop` (GSI drain, stream/PITR seal arms, change-log trim) is
+  generic over `E`/`R` and sleeps with `ctx.env.sleep`. `SimCluster` never spawns
+  it (its tests drive each arm on demand); `EmbeddedCluster` spawns it on every
+  node at construction, after `restart` and after `grow`, so GSI queries work.
+- `tests/*.rs` are an explicit `[[test]]` list with `required-features =
+  ["server"]` (`autotests = false`): **a new `tests/foo.rs` must be added to
+  `Cargo.toml`** or it is not built.
+- `animus-sim`'s `Simulator::set_trace_cap` (default: unbounded) bounds the
+  `TraceEvent` history; `EmbeddedCluster::new` turns it off so a long-lived
+  tab does not grow an event log.
+
 ## Module map (`src/`)
 
 - **`lib.rs`** (~11,800 lines) — the node assembly: `Node`/`BoundNode`/

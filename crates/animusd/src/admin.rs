@@ -77,6 +77,7 @@ use animus_control::syskv;
 use animus_dynamo::wire::{base64url_decode, base64url_encode};
 use animus_dynamo::{AttributeValue, Item};
 use animus_env::Env;
+#[cfg(feature = "server")]
 use animus_env::MaybeTlsStream;
 use animus_env::NodeId;
 use animus_env::PRIMARY_STREAM;
@@ -89,6 +90,7 @@ use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncWrite};
+#[cfg(feature = "server")]
 use tokio::net::TcpListener;
 use tracing::Instrument;
 
@@ -300,6 +302,7 @@ const TXN_VIEW_MAX_LIMIT: usize = 5000;
 /// `crate::ACCEPT_ERROR_BACKOFF`'s own doc) — it now genuinely mirrors
 /// `animus_env::prod::spawn_accept`'s contract, which this doc comment
 /// used to claim without the code actually doing it.
+#[cfg(feature = "server")]
 pub(crate) async fn serve(
     listener: TcpListener,
     ctx: ClientCtx,
@@ -359,6 +362,7 @@ pub(crate) async fn serve(
     }
 }
 
+#[cfg(feature = "server")]
 async fn handle_conn<S: AsyncRead + AsyncWrite + Unpin>(
     mut stream: S,
     ctx: ClientCtx,
@@ -518,6 +522,7 @@ fn admin_gate_exempt(path: &str) -> bool {
     matches!(path, "/admin/health" | "/admin/live" | "/metrics")
 }
 
+#[cfg(feature = "server")]
 async fn dispatch(ctx: &ClientCtx, request: &http::HttpRequest) -> (u16, String) {
     animus_node::admin::dispatch(
         ctx,
@@ -552,6 +557,7 @@ async fn dispatch(ctx: &ClientCtx, request: &http::HttpRequest) -> (u16, String)
 /// `docs/engineering-lessons.md`'s matching 2026-09-08 entry for why the
 /// two must stay genuinely separate impls rather than one generic one.
 #[async_trait]
+#[cfg(feature = "server")]
 impl AdminHost for ClientCtx {
     async fn config_view(&self) -> Value {
         config_view(self)
@@ -2196,6 +2202,7 @@ async fn segment_store_view<E: Env, R: RelayClient>(ctx: &ClientCtx<E, R>) -> Va
 /// reads the demux's own bookkeeping.
 const DEBUG_INBOXES_TOP_N: usize = 20;
 
+#[cfg(feature = "server")]
 fn debug_inboxes_view(ctx: &ClientCtx) -> Value {
     let stats = ctx.env.inbox_stats(DEBUG_INBOXES_TOP_N);
     let meta = ctx.effective_metadata();
@@ -3231,6 +3238,7 @@ async fn action_data_dynamo<E: Env, R: RelayClient>(
 /// other generic-dispatch widening in this crate's own `SimCluster`
 /// series, which only ever paralleled the primary DynamoDB wire edge's own
 /// caller).
+#[cfg(feature = "server")]
 async fn action_data_dynamo_concrete(ctx: &ClientCtx, body: &[u8]) -> (u16, Value) {
     let req: DynamoDataReq = match parse_body(body) {
         Ok(r) => r,

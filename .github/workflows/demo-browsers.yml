@@ -1,0 +1,91 @@
+# End-to-end check of the in-browser demo (ADR 0082) in real Chromium and
+# Firefox: builds the wasm exactly as pages.yml does, serves website/, and runs
+# scripts/demo-browser-smoke.mjs (start, CRUD/Query/Scan/PartiQL, crash the
+# control leader, write through a survivor, restart, partition, heal, add a
+# node, speed, pause), failing on any console or page error.
+#
+# Path-filtered: it only runs when something the demo is built from changes.
+name: demo-browsers
+
+on:
+  pull_request:
+    paths:
+      - 'website/**'
+      - 'crates/animus-web/**'
+      - 'crates/animusd/**'
+      - 'crates/animus-sim/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'scripts/build-web-demo.sh'
+      - 'scripts/demo-browser-smoke.mjs'
+      - '.github/workflows/demo-browsers.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: demo-browsers-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  demo-browsers:
+    name: demo-browsers
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (1.96) with the wasm target
+        uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          targets: wasm32-unknown-unknown
+
+      # rust-toolchain.toml pins channel `1.96`, which rustup treats as a different
+      # toolchain from the action's `1.96.0`, so the target above lands on the wrong
+      # one. Add it to the toolchain cargo will actually use.
+      - name: Add the wasm32 target to the pinned toolchain
+        run: rustup target add wasm32-unknown-unknown
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      # Same pin rule as pages.yml: the CLI must match Cargo.lock's wasm-bindgen.
+      - name: Install wasm-bindgen-cli (version from Cargo.lock)
+        run: |
+          v=$(awk '/^name = "wasm-bindgen"$/ {getline; gsub(/[^0-9.]/, "", $0); print; exit}' Cargo.lock)
+          echo "wasm-bindgen ${v}"
+          cargo install wasm-bindgen-cli --version "${v}" --locked
+
+      - name: Build the browser demo (website/demo/pkg)
+        run: scripts/build-web-demo.sh
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install Playwright with Chromium and Firefox
+        run: |
+          mkdir -p "$RUNNER_TEMP/pw" && cd "$RUNNER_TEMP/pw"
+          npm init -y >/dev/null
+          npm install --no-audit --no-fund playwright@1.63.0
+          npx playwright install --with-deps chromium firefox
+
+      - name: Run the demo in Chromium and Firefox
+        run: |
+          python3 -m http.server 8000 --directory website >/dev/null 2>&1 &
+          for _ in $(seq 1 30); do curl -sf http://127.0.0.1:8000/demo.html >/dev/null && break; sleep 1; done
+          export NODE_PATH="$RUNNER_TEMP/pw/node_modules"
+          mkdir -p "$RUNNER_TEMP/shots"
+          for b in chromium firefox; do
+            echo "::group::${b}"
+            node scripts/demo-browser-smoke.mjs "$b" --shots "$RUNNER_TEMP/shots/$b"
+            echo "::endgroup::"
+          done
+
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: demo-browser-screenshots
+          path: ${{ runner.temp }}/shots
+          if-no-files-found: ignore

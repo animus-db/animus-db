@@ -99,3 +99,12 @@ rcgen = { workspace = true }
 # the plain (feature-less) `[dependencies]` entry above when building this
 # crate's own test targets with `--features prod`/`--all-features`.
 animus-s3 = { workspace = true, features = ["fake", "prod"] }
+
+# `chacha20poly1305` (encryption at rest, above) reaches `getrandom` through
+# `aead`'s `OsRng`. On `wasm32-unknown-unknown` (the browser build of `animusd`'s
+# `embedded` feature) `getrandom` 0.2 has no default backend and refuses to
+# compile; its `js` feature routes it through `crypto.getRandomValues`. This
+# adds nothing to a native build. (The encryption-at-rest paths themselves are
+# `server`-only; this only lets the dependency graph compile.)
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }

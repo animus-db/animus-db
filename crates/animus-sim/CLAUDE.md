@@ -91,6 +91,7 @@ Crash semantics, exactly:
   `animus-control::shared_wal`'s `flush` and its `sharedwal_fault_corpus`
   cell (f)), and `corrupt_durable(node, file, offset)` (flip one durable byte —
   at-rest corruption of synced data, e.g. to hit an SSTable's per-block CRC).
+- **Trace retention**: the `trace()` history is unbounded by default (every byte-identical-trace test relies on that). `set_trace_cap(Some(n))` keeps only the last `n` events and `Some(0)` records nothing; it changes what is remembered, never the execution (`determinism::trace_cap_bounds_retention_without_changing_execution`). Long-lived embedders (`animusd`'s `EmbeddedCluster`) set `Some(0)`.
 - Observability: `trace()` / `trace_lines()`, `now()`, `seed()`, `stats()`
   (`SimStats { task_polls, timer_fires }`, ADR 0061 rung I C-09 PR 3's
   follow-on — the corpus-deep `dynamo_wire` timeout fix, 2026-09-09): a

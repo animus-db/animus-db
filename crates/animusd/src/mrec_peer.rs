@@ -36,6 +36,7 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+#[cfg(feature = "server")]
 use animus_env::TlsMaterial;
 use animus_node::host::RelayClient;
 use animus_node::{ClientRequest, ClientResponse, MrecApplyRequest, MrecApplyResponse};
@@ -44,6 +45,7 @@ use futures::future::BoxFuture;
 use crate::config::{
     ClusterConfig, ClusterSettings, DEFAULT_MREC_MAX_CLOCK_SKEW_MS, PeerCluster, TlsSection,
 };
+#[cfg(feature = "server")]
 use crate::control_handle::AnimusdRelayClient;
 
 /// Why a cross-cluster call failed (as opposed to the peer answering).
@@ -305,6 +307,7 @@ pub(crate) const INSECURE_PEER_REFUSAL: &str = "cross-cluster MREC traffic requi
 /// own mutual-TLS material (plus the peer's own `tls_ca` when configured),
 /// through the same gated framing every intra relay uses.
 #[derive(Clone)]
+#[cfg(feature = "server")]
 pub(crate) struct ProdPeerClient {
     cfg: Arc<MrecConfig>,
     relay: AnimusdRelayClient,
@@ -312,6 +315,7 @@ pub(crate) struct ProdPeerClient {
     peer_tls: Arc<BTreeMap<usize, TlsMaterial>>,
 }
 
+#[cfg(feature = "server")]
 impl ProdPeerClient {
     /// Build the client. `node_tls` is this node's own TLS material (the one
     /// the intra relay uses) and `node_tls_section` the config it was loaded
@@ -354,6 +358,7 @@ impl ProdPeerClient {
     }
 }
 
+#[cfg(feature = "server")]
 impl PeerClient for ProdPeerClient {
     fn call(
         &self,
@@ -419,6 +424,7 @@ pub(crate) fn decode_response(bytes: &[u8]) -> Result<MrecApplyResponse, PeerErr
 /// # Errors
 /// The client could not be built, or the call failed (the text names which).
 #[doc(hidden)]
+#[cfg(feature = "server")]
 pub async fn probe_peer_for_test(
     config: &ClusterConfig,
     node_index: usize,
@@ -460,6 +466,7 @@ pub async fn probe_peer_for_test(
 /// # Errors
 /// The TLS material could not be loaded.
 #[doc(hidden)]
+#[cfg(feature = "server")]
 pub async fn probe_peer_request_for_test(
     config: &ClusterConfig,
     node_index: usize,

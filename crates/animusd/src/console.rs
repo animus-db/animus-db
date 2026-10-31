@@ -22,8 +22,10 @@
 
 use std::sync::Arc;
 
+#[cfg(feature = "server")]
 use animus_env::MaybeTlsStream;
 use tokio::io::{AsyncRead, AsyncWrite};
+#[cfg(feature = "server")]
 use tokio::net::TcpListener;
 
 // Re-exported so every existing `console::X` call site in `lib.rs` (the
@@ -68,6 +70,7 @@ const JS: &str = include_str!("console.js");
 /// the peer's address and the connection dropped; the loop keeps serving.
 /// **A failed `accept()` itself also never stops this loop** (issue #592,
 /// `crate::ACCEPT_ERROR_BACKOFF`'s own doc).
+#[cfg(feature = "server")]
 pub(crate) async fn serve(
     listener: TcpListener,
     tables: TableSnapshotFn,
@@ -130,6 +133,7 @@ pub(crate) async fn serve(
     }
 }
 
+#[cfg(feature = "server")]
 async fn handle_conn<S: AsyncRead + AsyncWrite + Unpin>(
     mut stream: S,
     tables: TableSnapshotFn,

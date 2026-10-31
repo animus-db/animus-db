@@ -7,6 +7,8 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 description = "AnimusDB node server daemon."
+# Explicit `[[test]]` list with `required-features = ["server"]` (see below).
+autotests = false
 
 [lints.rust]
 unsafe_code = "forbid"
@@ -50,16 +52,46 @@ path = "src/lib.rs"
 [[bin]]
 name = "animusd"
 path = "src/main.rs"
+required-features = ["server"]
 
 [[bench]]
 name = "cluster_bench"
 harness = false
+required-features = ["server"]
 
 # R-01 sub-track (b): real-process chaos harness (docs/chaos.md). Opt-in so
 # the per-push gates never schedule a multi-minute multi-process run; it is
 # still compiled by `clippy --all-features`.
 # Run: `cargo test -p animusd --features chaos --test chaos -- --test-threads=1`.
 [features]
+# `server` (default): the real node process — sockets, TLS, `ProdEnv`, the
+# `animusd` binary, OpenTelemetry, signal handling. `embedded`: the in-crate
+# `SimCluster` fixture exposed as the public `embedded::EmbeddedCluster`
+# (deterministic, single-threaded, no sockets), buildable for
+# `wasm32-unknown-unknown`. Everything the browser build must not link
+# (tokio `net`/`fs`/`signal`/`rt-multi-thread`/`time`, rustls, socket2,
+# opentelemetry, `ProdEnv`) hangs off `server`. At least one of the two
+# must be on (`compile_error!` in `lib.rs`). See `CLAUDE.md`.
+default = ["server"]
+server = [
+    "animus-env/prod",
+    "animus-s3/prod",
+    "tokio/net",
+    "tokio/fs",
+    "tokio/signal",
+    "tokio/rt-multi-thread",
+    "tokio/time",
+    "dep:tokio-rustls",
+    "dep:socket2",
+    "dep:rand",
+    "dep:flate2",
+    "dep:tracing-subscriber",
+    "dep:tracing-opentelemetry",
+    "dep:opentelemetry",
+    "dep:opentelemetry_sdk",
+    "dep:opentelemetry-otlp",
+]
+embedded = ["dep:animus-sim", "animus-control/sim-versions"]
 chaos = []
 # R-01 sub-track (a): multi-hour/day soak harness (docs/soak.md). Opt-in for
 # the same reason as `chaos`.
@@ -75,29 +107,461 @@ upgrade-from = []
 [[test]]
 name = "chaos"
 path = "tests/chaos.rs"
-required-features = ["chaos"]
+required-features = ["server", "chaos"]
 
 [[test]]
 name = "upgrade_previous_release"
 path = "tests/upgrade_previous_release.rs"
-required-features = ["upgrade-from"]
+required-features = ["server", "upgrade-from"]
 
 [[test]]
 name = "soak"
 path = "tests/soak.rs"
-required-features = ["soak"]
+required-features = ["server", "soak"]
+
+
+# Every integration test below drives a real `ProdEnv` node over sockets, so
+# each needs the `server` feature. Cargo cannot attach `required-features` to
+# an auto-discovered target, hence `autotests = false` and this explicit list:
+# **a new `tests/<name>.rs` must be added here** (with
+# `required-features = ["server"]`) or it is silently not built. The
+# `server`-gated list is what lets
+# `cargo check -p animusd --no-default-features --features embedded --all-targets`
+# stay meaningful for the `embedded` build.
+[[test]]
+name = "admin_endpoint"
+path = "tests/admin_endpoint.rs"
+required-features = ["server"]
+[[test]]
+name = "advertise_host"
+path = "tests/advertise_host.rs"
+required-features = ["server"]
+[[test]]
+name = "auto_split_min_tablets"
+path = "tests/auto_split_min_tablets.rs"
+required-features = ["server"]
+[[test]]
+name = "auto_split_ops_rate"
+path = "tests/auto_split_ops_rate.rs"
+required-features = ["server"]
+[[test]]
+name = "backfill_seeder"
+path = "tests/backfill_seeder.rs"
+required-features = ["server"]
+[[test]]
+name = "batch_write"
+path = "tests/batch_write.rs"
+required-features = ["server"]
+[[test]]
+name = "bring_up_allocation"
+path = "tests/bring_up_allocation.rs"
+required-features = ["server"]
+[[test]]
+name = "client_handshake"
+path = "tests/client_handshake.rs"
+required-features = ["server"]
+[[test]]
+name = "cluster"
+path = "tests/cluster.rs"
+required-features = ["server"]
+[[test]]
+name = "cluster_ephemeral_default_dir"
+path = "tests/cluster_ephemeral_default_dir.rs"
+required-features = ["server"]
+[[test]]
+name = "cluster_growth"
+path = "tests/cluster_growth.rs"
+required-features = ["server"]
+[[test]]
+name = "cluster_gt_rf_split_bench"
+path = "tests/cluster_gt_rf_split_bench.rs"
+required-features = ["server"]
+[[test]]
+name = "cluster_version_prod"
+path = "tests/cluster_version_prod.rs"
+required-features = ["server"]
+[[test]]
+name = "config_node_identity"
+path = "tests/config_node_identity.rs"
+required-features = ["server"]
+[[test]]
+name = "consensus_task_panic_health"
+path = "tests/consensus_task_panic_health.rs"
+required-features = ["server"]
+[[test]]
+name = "console_endpoint"
+path = "tests/console_endpoint.rs"
+required-features = ["server"]
+[[test]]
+name = "console_table_config"
+path = "tests/console_table_config.rs"
+required-features = ["server"]
+[[test]]
+name = "control_membership_admin"
+path = "tests/control_membership_admin.rs"
+required-features = ["server"]
+[[test]]
+name = "control_metadata_restart"
+path = "tests/control_metadata_restart.rs"
+required-features = ["server"]
+[[test]]
+name = "control_mirror_restart"
+path = "tests/control_mirror_restart.rs"
+required-features = ["server"]
+[[test]]
+name = "control_only"
+path = "tests/control_only.rs"
+required-features = ["server"]
+[[test]]
+name = "cp_cross_process"
+path = "tests/cp_cross_process.rs"
+required-features = ["server"]
+[[test]]
+name = "cp_plane"
+path = "tests/cp_plane.rs"
+required-features = ["server"]
+[[test]]
+name = "cp_quiescence"
+path = "tests/cp_quiescence.rs"
+required-features = ["server"]
+[[test]]
+name = "cp_rebalance"
+path = "tests/cp_rebalance.rs"
+required-features = ["server"]
+[[test]]
+name = "cp_rebalance_gc"
+path = "tests/cp_rebalance_gc.rs"
+required-features = ["server"]
+[[test]]
+name = "cp_reconfigure"
+path = "tests/cp_reconfigure.rs"
+required-features = ["server"]
+[[test]]
+name = "cp_txn"
+path = "tests/cp_txn.rs"
+required-features = ["server"]
+[[test]]
+name = "create_table_ready"
+path = "tests/create_table_ready.rs"
+required-features = ["server"]
+[[test]]
+name = "dashboard_endpoint"
+path = "tests/dashboard_endpoint.rs"
+required-features = ["server"]
+[[test]]
+name = "data_only"
+path = "tests/data_only.rs"
+required-features = ["server"]
+[[test]]
+name = "decommission"
+path = "tests/decommission.rs"
+required-features = ["server"]
+[[test]]
+name = "drop_table_gc"
+path = "tests/drop_table_gc.rs"
+required-features = ["server"]
+[[test]]
+name = "drop_table_index_cascade"
+path = "tests/drop_table_index_cascade.rs"
+required-features = ["server"]
+[[test]]
+name = "durable_restart"
+path = "tests/durable_restart.rs"
+required-features = ["server"]
+[[test]]
+name = "dynamo_auth_policy"
+path = "tests/dynamo_auth_policy.rs"
+required-features = ["server"]
+[[test]]
+name = "dynamo_backup"
+path = "tests/dynamo_backup.rs"
+required-features = ["server"]
+[[test]]
+name = "dynamo_execute_transaction"
+path = "tests/dynamo_execute_transaction.rs"
+required-features = ["server"]
+[[test]]
+name = "dynamo_export"
+path = "tests/dynamo_export.rs"
+required-features = ["server"]
+[[test]]
+name = "dynamo_import"
+path = "tests/dynamo_import.rs"
+required-features = ["server"]
+[[test]]
+name = "dynamo_index_scan"
+path = "tests/dynamo_index_scan.rs"
+required-features = ["server"]
+[[test]]
+name = "dynamo_index_writes"
+path = "tests/dynamo_index_writes.rs"
+required-features = ["server"]
+[[test]]
+name = "dynamo_indexes"
+path = "tests/dynamo_indexes.rs"
+required-features = ["server"]
+[[test]]
+name = "dynamo_item_size_cap"
+path = "tests/dynamo_item_size_cap.rs"
+required-features = ["server"]
+[[test]]
+name = "dynamo_partiql"
+path = "tests/dynamo_partiql.rs"
+required-features = ["server"]
+[[test]]
+name = "dynamo_pitr"
+path = "tests/dynamo_pitr.rs"
+required-features = ["server"]
+[[test]]
+name = "dynamo_pitr_restore"
+path = "tests/dynamo_pitr_restore.rs"
+required-features = ["server"]
+[[test]]
+name = "dynamo_relayed_throttle"
+path = "tests/dynamo_relayed_throttle.rs"
+required-features = ["server"]
+[[test]]
+name = "dynamo_restore"
+path = "tests/dynamo_restore.rs"
+required-features = ["server"]
+[[test]]
+name = "dynamo_schema"
+path = "tests/dynamo_schema.rs"
+required-features = ["server"]
+[[test]]
+name = "dynamo_sigv4"
+path = "tests/dynamo_sigv4.rs"
+required-features = ["server"]
+[[test]]
+name = "dynamo_streams"
+path = "tests/dynamo_streams.rs"
+required-features = ["server"]
+[[test]]
+name = "dynamo_tags"
+path = "tests/dynamo_tags.rs"
+required-features = ["server"]
+[[test]]
+name = "dynamo_throttling"
+path = "tests/dynamo_throttling.rs"
+required-features = ["server"]
+[[test]]
+name = "dynamo_ttl"
+path = "tests/dynamo_ttl.rs"
+required-features = ["server"]
+[[test]]
+name = "dynamo_txn"
+path = "tests/dynamo_txn.rs"
+required-features = ["server"]
+[[test]]
+name = "dynamo_txn_cancellation"
+path = "tests/dynamo_txn_cancellation.rs"
+required-features = ["server"]
+[[test]]
+name = "dynamo_txn_idempotency"
+path = "tests/dynamo_txn_idempotency.rs"
+required-features = ["server"]
+[[test]]
+name = "dynamo_wire"
+path = "tests/dynamo_wire.rs"
+required-features = ["server"]
+[[test]]
+name = "encryption_at_rest_default_cluster_store_e2e"
+path = "tests/encryption_at_rest_default_cluster_store_e2e.rs"
+required-features = ["server"]
+[[test]]
+name = "encryption_at_rest_e2e"
+path = "tests/encryption_at_rest_e2e.rs"
+required-features = ["server"]
+[[test]]
+name = "encryption_at_rest_segment_store_e2e"
+path = "tests/encryption_at_rest_segment_store_e2e.rs"
+required-features = ["server"]
+[[test]]
+name = "f11_split_alignment"
+path = "tests/f11_split_alignment.rs"
+required-features = ["server"]
+[[test]]
+name = "format_fixtures"
+path = "tests/format_fixtures.rs"
+required-features = ["server"]
+[[test]]
+name = "frame_cap"
+path = "tests/frame_cap.rs"
+required-features = ["server"]
+[[test]]
+name = "heartbeat_batch_liveness"
+path = "tests/heartbeat_batch_liveness.rs"
+required-features = ["server"]
+[[test]]
+name = "heartbeat_live_destinations"
+path = "tests/heartbeat_live_destinations.rs"
+required-features = ["server"]
+[[test]]
+name = "index_backfill"
+path = "tests/index_backfill.rs"
+required-features = ["server"]
+[[test]]
+name = "inplace_split_bench"
+path = "tests/inplace_split_bench.rs"
+required-features = ["server"]
+[[test]]
+name = "inplace_split_e2e"
+path = "tests/inplace_split_e2e.rs"
+required-features = ["server"]
+[[test]]
+name = "intra_port_split"
+path = "tests/intra_port_split.rs"
+required-features = ["server"]
+[[test]]
+name = "join_data_seed_settings_reach"
+path = "tests/join_data_seed_settings_reach.rs"
+required-features = ["server"]
+[[test]]
+name = "join_port_toctou"
+path = "tests/join_port_toctou.rs"
+required-features = ["server"]
+[[test]]
+name = "kind_scan"
+path = "tests/kind_scan.rs"
+required-features = ["server"]
+[[test]]
+name = "kind_write_batch"
+path = "tests/kind_write_batch.rs"
+required-features = ["server"]
+[[test]]
+name = "learner_reconfigure"
+path = "tests/learner_reconfigure.rs"
+required-features = ["server"]
+[[test]]
+name = "metrics_endpoint"
+path = "tests/metrics_endpoint.rs"
+required-features = ["server"]
+[[test]]
+name = "mrec_peer_transport"
+path = "tests/mrec_peer_transport.rs"
+required-features = ["server"]
+[[test]]
+name = "mrec_wan_emulated"
+path = "tests/mrec_wan_emulated.rs"
+required-features = ["server"]
+[[test]]
+name = "otel_tracing"
+path = "tests/otel_tracing.rs"
+required-features = ["server"]
+[[test]]
+name = "overload"
+path = "tests/overload.rs"
+required-features = ["server"]
+[[test]]
+name = "panic_safe_teardown"
+path = "tests/panic_safe_teardown.rs"
+required-features = ["server"]
+[[test]]
+name = "per_process"
+path = "tests/per_process.rs"
+required-features = ["server"]
+[[test]]
+name = "port_reservation"
+path = "tests/port_reservation.rs"
+required-features = ["server"]
+[[test]]
+name = "provision_propose_pacing"
+path = "tests/provision_propose_pacing.rs"
+required-features = ["server"]
+[[test]]
+name = "schema_broadcast_fd_bound"
+path = "tests/schema_broadcast_fd_bound.rs"
+required-features = ["server"]
+[[test]]
+name = "schema_ddl_relay"
+path = "tests/schema_ddl_relay.rs"
+required-features = ["server"]
+[[test]]
+name = "seed_join_allocated"
+path = "tests/seed_join_allocated.rs"
+required-features = ["server"]
+[[test]]
+name = "seed_join_hostname"
+path = "tests/seed_join_hostname.rs"
+required-features = ["server"]
+[[test]]
+name = "self_heal"
+path = "tests/self_heal.rs"
+required-features = ["server"]
+[[test]]
+name = "shared_wal_e2e"
+path = "tests/shared_wal_e2e.rs"
+required-features = ["server"]
+[[test]]
+name = "shared_wal_liveness"
+path = "tests/shared_wal_liveness.rs"
+required-features = ["server"]
+[[test]]
+name = "shutdown_aborts_connection_handlers"
+path = "tests/shutdown_aborts_connection_handlers.rs"
+required-features = ["server"]
+[[test]]
+name = "split_cluster"
+path = "tests/split_cluster.rs"
+required-features = ["server"]
+[[test]]
+name = "split_placing_completion"
+path = "tests/split_placing_completion.rs"
+required-features = ["server"]
+[[test]]
+name = "split_placing_two_replica_diff_e2e"
+path = "tests/split_placing_two_replica_diff_e2e.rs"
+required-features = ["server"]
+[[test]]
+name = "stream_janitor"
+path = "tests/stream_janitor.rs"
+required-features = ["server"]
+[[test]]
+name = "streams_e2e"
+path = "tests/streams_e2e.rs"
+required-features = ["server"]
+[[test]]
+name = "system_table"
+path = "tests/system_table.rs"
+required-features = ["server"]
+[[test]]
+name = "tablet_rf_self_heals"
+path = "tests/tablet_rf_self_heals.rs"
+required-features = ["server"]
+[[test]]
+name = "task_panic_guard"
+path = "tests/task_panic_guard.rs"
+required-features = ["server"]
+[[test]]
+name = "tls_e2e"
+path = "tests/tls_e2e.rs"
+required-features = ["server"]
+[[test]]
+name = "txn_recovery_participant_spans"
+path = "tests/txn_recovery_participant_spans.rs"
+required-features = ["server"]
+[[test]]
+name = "watch_metadata"
+path = "tests/watch_metadata.rs"
+required-features = ["server"]
+[[test]]
+name = "website_ports"
+path = "tests/website_ports.rs"
+required-features = ["server"]
 
 [dependencies]
 async-trait.workspace = true
 # `animusd` is the real node process — it's the one place that actually
 # constructs a `ProdEnv` (ADR 0061 rung C0 gates it behind this feature).
-animus-env = { workspace = true, features = ["prod"] }
+# Since the `server`/`embedded` split `prod` is enabled by the `server`
+# feature, not unconditionally, so the `embedded` build has no `ProdEnv`.
+animus-env = { path = "../animus-env", default-features = false }
 # S-04 PR 2: `s3:` URIs on `--segment-store`/`--backup-store` construct a
 # real `animus_s3::prod::HyperRustlsTransport` (this crate is the one real
 # process boundary, same reasoning as `animus-env`'s own `prod` feature
 # above) wrapped in `animus_env::S3SegmentStore`. `animusd` never touches
 # `animus_s3::client`/`sigv4` directly beyond that construction site.
-animus-s3 = { workspace = true, features = ["prod"] }
+animus-s3.workspace = true
 # The `E: Env`-generic node core (ADR 0061 Phase C carve-out) this crate
 # re-exports its wire types/`topology`/`decide` from at the crate root.
 animus-node.workspace = true
@@ -116,9 +580,16 @@ animus-dynamo.workspace = true
 # it is specifically apply-evaluator machinery a wire-protocol consumer of
 # `animus-dynamo` has no reason to see re-exported.
 animus-item.workspace = true
+# `embedded` only: the in-crate `SimCluster` fixture (and so `EmbeddedCluster`)
+# drives a `Simulator`. Also a dev-dependency below for the test builds.
+animus-sim = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
-tokio.workspace = true
+# Declared directly (not `workspace = true`) so the `embedded`/wasm build gets
+# only the features that compile on `wasm32-unknown-unknown`; the `server`
+# feature adds `net`/`fs`/`signal`/`rt-multi-thread`/`time`. A member cannot
+# subtract features from the workspace entry, hence the direct declaration.
+tokio = { version = "1", default-features = false, features = ["sync", "macros", "io-util", "rt"] }
 # `futures::future::join_all` — the multi-participant 2PC coordinator's
 # concurrent-prepare fan-out (ADR 0018 §2/PR4, `ClientCtx::cp_txn`).
 futures.workspace = true
@@ -126,23 +597,23 @@ futures.workspace = true
 # commented place: `generate_join_nonce` at the CLI pre-bind boundary of a
 # cluster-allocated-id join (ADR 0036) — a leaf that never runs under
 # `SimEnv`. See that function's doc before adding another caller.
-rand.workspace = true
+rand = { workspace = true, optional = true }
 tracing.workspace = true
-tracing-subscriber.workspace = true
-tracing-opentelemetry.workspace = true
-opentelemetry.workspace = true
-opentelemetry_sdk.workspace = true
-opentelemetry-otlp.workspace = true
+tracing-subscriber = { workspace = true, optional = true }
+tracing-opentelemetry = { workspace = true, optional = true }
+opentelemetry = { workspace = true, optional = true }
+opentelemetry_sdk = { workspace = true, optional = true }
+opentelemetry-otlp = { workspace = true, optional = true }
 # TLS on the client/intra/admin/console listeners and every dialer (ADR
 # 0064, S-01 commit 2) — the accept-side `TlsAcceptor`/`MaybeTlsStream`
 # plumbing this crate's own listeners need on top of what `animus-env`
 # (commit 1) already provides for the internal wire. Same pinned `ring`
 # feature set as `animus-env`'s own `tokio-rustls` dependency (one crypto
 # backend workspace-wide, ADR 0064 Decision 5).
-tokio-rustls = { workspace = true }
+tokio-rustls = { workspace = true, optional = true }
 # gzip encoding for the S3 export data files (ADR 0068, S-05) — this
 # crate's own export job driver is the sole caller.
-flate2.workspace = true
+flate2 = { workspace = true, optional = true }
 # `manifest-files.json`'s `md5Checksum`/`etag` fields (ADR 0068 §1) — a
 # CRC32 stand-in, not a real MD5 (see `crc32_hex`'s own doc); already a
 # workspace dependency (`animus-storage`'s SSTable block checksums), so
@@ -156,7 +627,7 @@ crc32fast.workspace = true
 # `prod.rs` uses it for `SO_KEEPALIVE` tuning), so this adds no new crate to
 # the graph — just a second, safe (`unsafe_code = "forbid"` stays intact)
 # consumer of it in this crate.
-socket2 = { workspace = true, features = ["all"] }
+socket2 = { workspace = true, features = ["all"], optional = true }
 
 [dev-dependencies]
 tempfile = "3"

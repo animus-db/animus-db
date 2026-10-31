@@ -1,0 +1,38 @@
+[package]
+name = "animus-web"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "AnimusDB in a browser tab: wasm-bindgen shell over animusd's EmbeddedCluster."
+# Not published: the website build consumes it (ADR 0082).
+publish = false
+
+[lib]
+# `cdylib` is the .wasm the website loads; `rlib` lets native unit tests (and
+# clippy over the workspace) link the plain-Rust core.
+crate-type = ["cdylib", "rlib"]
+
+# The workspace forbids `unsafe_code`; `wasm-bindgen`'s macros expand to
+# `unsafe` glue, which `forbid` cannot be re-allowed under. So this crate (only)
+# is `deny`, with one justified crate-level allow on the `shell` module (see
+# `src/lib.rs`). Everything else, including the whole `core` module, stays
+# unsafe-free. The clippy determinism lints are the workspace's.
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+disallowed_types = "warn"
+disallowed_methods = "warn"
+
+[dependencies]
+# `default-features = false, features = ["embedded"]`: no sockets, TLS,
+# `ProdEnv`, OpenTelemetry or tokio net/fs/time (the `server` feature), so the
+# crate builds for `wasm32-unknown-unknown`. CI asserts the absence.
+animusd = { path = "../animusd", default-features = false, features = ["embedded"] }
+serde.workspace = true
+serde_json.workspace = true
+wasm-bindgen.workspace = true
+js-sys.workspace = true
