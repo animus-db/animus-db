@@ -54,8 +54,8 @@ shrank the raw file but grew the gzipped one. Size on 2026-10-30: 5.7 MB raw,
 --directory website`), then `NODE_PATH=$(npm root -g) node
 scripts/demo-browser-smoke.mjs chromium|firefox|webkit [--shots DIR] [--exe PATH]`.
 It runs the whole visitor flow (start, CreateTable/PutItem/GetItem/Query/Scan/PartiQL,
-crash the control leader, write through a survivor, restart, partition, heal, add a
-node, speed, pause) and fails on any console or page error. CI runs it in Chromium and
+the two embedded UIs, crash the control leader from the fault strip, the dashboard following it,
+write through a survivor, restart, partition, heal, add a node, speed, pause; in dark and at 390 px) and fails on any console or page error. CI runs it in Chromium and
 Firefox (Playwright's builds) in `.github/workflows/demo-browsers.yml`, path-filtered to
 the demo's inputs.
 
@@ -79,3 +79,20 @@ UI source file adds a new asset, a `location.href =` navigation, or an API path 
 `/console/api/` and `/admin/` (not `/admin/ui/`), check the shim and `demo-browser-smoke.mjs`.
 Backups, export/import, index `UpdateTable`, metrics export and peer-console links do not work in
 the sim; see the ADR's amendment.
+
+## The app shell (ADR 0082, second 2026-10-31 amendment)
+
+`website/demo.html` is one full-height app shell, not a page: shell bar (logo to the site, four `role=tab`
+views, theme switch), a one-line intro with a `<details>` "What's real here", the active view, and a fault
+strip (virtual clock, speed, Pause, a Crash/Restart chip per node). Views: Requests (raw wire), Data console
+(frame), Cluster (the demo's own node cards, partition/grow/rebuild, tablets, events) and Operator dashboard
+(frame). The page itself must never scroll: `body.app` is `100dvh`, only a pane scrolls. Rules when editing:
+- The two frames run animusd's real UIs in **embedded mode**: `demo-frame.js`'s shim sets `data-embedded` on their
+  `<html>` (they hide their own chrome and ignore their own theme key, see `crates/animusd/CLAUDE.md`). Theme comes
+  from the shell (`animusdb-theme` via `site.js`); `demo.js` mirrors `data-theme` and `data-embedded-hidden` onto frames.
+- A hidden dashboard must not poll, or a paused clock advances (UI requests tick it at 1x). Any new timer that
+  calls into a frame must check which view is active (`nudgeFrames`).
+- A control that exists in both the strip and the Cluster view has distinct `aria-label`s (`... (fault strip)`);
+  the smoke test addresses the strip's by that label.
+- Clock, speed and Pause exist once, in the strip (`#clock`, `#speed`, `#pause`).
+

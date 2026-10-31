@@ -149,18 +149,43 @@
 
   // ---- node cards ---------------------------------------------------------
   var cards = [];
+  var chipList = [];
+  // The fault strip's compact chip: up/down, control leader, one Crash/Restart toggle.
+  function makeChip(i) {
+    var li = el("li", "chip");
+    var dot = el("span", "dot");
+    dot.setAttribute("aria-hidden", "true");
+    var label = el("span", null, "n" + i);
+    var mark = el("span", "lead-mark");
+    var btn = el("button", "btn small", "Crash");
+    btn.type = "button";
+    btn.addEventListener("click", function () {
+      var up = !li.classList.contains("down");
+      act(function () { if (up) { cluster.crash(i); } else { cluster.restart(i); } },
+        "node " + i + (up ? " crashed" : " restarted"));
+    });
+    li.appendChild(dot);
+    li.appendChild(label);
+    li.appendChild(mark);
+    li.appendChild(btn);
+    $("chips").appendChild(li);
+    return { root: li, mark: mark, btn: btn, label: label };
+  }
   function buildCards(n) {
     var grid = $("node-grid");
     grid.textContent = "";
     cards = [];
     for (var i = 0; i < n; i++) { cards.push(makeCard(i, grid)); }
+    chipList = [];
+    $("chips").textContent = "";
+    for (var c = 0; c < n; c++) { chipList.push(makeChip(c)); }
     fillNodeSelects(n);
     nodeCount = n;
   }
   function makeCard(i, grid) {
     var root = el("div", "node");
     root.setAttribute("role", "listitem");
-    var h = el("h4");
+    var h = el("h3");
     h.appendChild(el("span", null, "Node " + i));
     var st = el("span", "state up", "up");
     h.appendChild(st);
@@ -205,9 +230,25 @@
       fn();
       logEvent(message);
       refreshStatus(true);
+      nudgeFrames();
     } catch (e) {
       logEvent("error: " + (e && e.message ? e.message : String(e)));
     }
+  }
+
+  // After a fault, ask the operator dashboard (if loaded) to refresh now and again
+  // once the cluster has had a moment of virtual time to react. `loadAll` is the
+  // dashboard's own global refresh (dashboard.html); it also polls every 2s embedded.
+  function nudgeFrames() {
+    [250, 1500].forEach(function (ms) {
+      setTimeout(function () {
+        try {
+          if (activePane() !== "dashboard") { return; } // a hidden view refreshes when shown
+          var w = $("frame-dashboard").contentWindow;
+          if (w && typeof w.loadAll === "function") { w.loadAll(); }
+        } catch (e) { /* frame not loaded or navigating */ }
+      }, ms);
+    });
   }
 
   // ---- status -> DOM ------------------------------------------------------
@@ -266,6 +307,12 @@
       }
       c.crash.disabled = !n.up;
       c.restart.disabled = n.up;
+      var k = chipList[i];
+      k.root.className = "chip" + (n.up ? "" : " down") + (n.control_leader ? " leader" : "");
+      k.mark.textContent = n.control_leader ? "leader" : "";
+      k.root.title = "Node " + i + (n.up ? " is up" : " is down") + (n.control_leader ? ", control leader" : "");
+      k.btn.textContent = n.up ? "Crash" : "Restart";
+      k.btn.setAttribute("aria-label", (n.up ? "Crash" : "Restart") + " node " + i + " (fault strip)");
     });
     var parts = s.partitions.map(function (p) { return "node " + p[0] + " and node " + p[1]; });
     $("partition-list").textContent = parts.length ? "Partitioned: " + parts.join("; ") + "." : "No partitions.";
@@ -410,7 +457,7 @@
     paused = false;
     $("pause").textContent = "Pause";
     $("pause").setAttribute("aria-pressed", "false");
-    $("live").hidden = false;
+    showLive();
     $("resp").textContent = "";
     $("resp-head").textContent = "";
     $("resp-head").appendChild(el("span", "muted", "No request sent yet."));
@@ -421,11 +468,13 @@
     btn.disabled = false;
     btn.textContent = "Rebuild cluster";
     $("start-note").textContent = "Rebuilding discards the current cluster and its data.";
+    $("rebuild-note").hidden = false;
     document.documentElement.setAttribute("data-demo-ready", "1");
   }
 
-  // ---- interface tabs (requests / data console / operator dashboard) ------
-  var PANES = ["requests", "console", "dashboard"];
+  // ---- views (requests / data console / cluster / operator dashboard) ----
+  var PANES = ["requests", "console", "cluster", "dashboard"];
+  var live = false;
   function showPane(name) {
     PANES.forEach(function (p) {
       var on = p === name;
@@ -434,22 +483,72 @@
       t.setAttribute("aria-selected", String(on));
       t.tabIndex = on ? 0 : -1;
     });
-    if (name !== "requests") {
+    if (name === "console" || name === "dashboard") {
       var f = $("frame-" + name);
       // Load the real UI once, on first visit; it keeps its own state after that.
       if (!f.getAttribute("src")) { f.setAttribute("src", "demo-frame.html?app=" + name); }
+    }
+    markHidden(name);
+    if (name === "dashboard") { nudgeFrames(); }
+    try { history.replaceState(null, "", "#" + name); } catch (e) { /* sandboxed */ }
+  }
+  // Tell each loaded UI whether its view is showing (`data-embedded-hidden` on its
+  // <html>; the dashboard stops polling while hidden).
+  function markHidden(active) {
+    ["console", "dashboard"].forEach(function (a) {
+      try {
+        var d = $("frame-" + a).contentDocument;
+        if (!d || !d.documentElement) { return; }
+        if (a === active) { d.documentElement.removeAttribute("data-embedded-hidden"); }
+        else { d.documentElement.setAttribute("data-embedded-hidden", "1"); }
+      } catch (e) { /* frame not loaded */ }
+    });
+  }
+  function activePane() {
+    return PANES.filter(function (p) { return $("tab-" + p).getAttribute("aria-selected") === "true"; })[0] || "requests";
+  }
+  // First start: swap the start screen for the views and show the fault strip. The
+  // setup form moves into the Cluster view, where it becomes "Rebuild".
+  function showLive() {
+    if (!live) {
+      live = true;
+      $("pane-start").hidden = true;
+      $("strip").hidden = false;
+      PANES.forEach(function (p) { $("tab-" + p).disabled = false; });
+      var box = $("setup-box");
+      $("rebuild-box").appendChild(box);
+      var note = el("p", "muted demo-small", "Rebuilding discards the current cluster and its data.");
+      note.id = "rebuild-note";
+      note.hidden = true;
+      $("rebuild-box").appendChild(note);
+      var want = (location.hash || "").slice(1);
+      showPane(PANES.indexOf(want) >= 0 ? want : "requests");
     }
   }
   // A rebuilt cluster invalidates whatever the frames loaded from the old one.
   function resetFrames() {
     ["console", "dashboard"].forEach(function (a) { $("frame-" + a).removeAttribute("src"); });
-    var active = PANES.filter(function (p) { return $("tab-" + p).getAttribute("aria-selected") === "true"; })[0];
-    if (active && active !== "requests") { showPane(active); }
+    if (live) { showPane(activePane()); }
   }
+  // The shell owns the theme (site.js sets data-theme on <html>); keep the open
+  // frames' <html> in step, live. The frames are same-origin.
+  function mirrorTheme() {
+    var t = document.documentElement.getAttribute("data-theme");
+    ["console", "dashboard"].forEach(function (a) {
+      try {
+        var d = $("frame-" + a).contentDocument;
+        if (!d || !d.documentElement) { return; }
+        if (t) { d.documentElement.setAttribute("data-theme", t); } else { d.documentElement.removeAttribute("data-theme"); }
+      } catch (e) { /* frame not loaded */ }
+    });
+  }
+  window.animusDemo.theme = mirrorTheme;
+  new MutationObserver(mirrorTheme).observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
 
   document.addEventListener("DOMContentLoaded", function () {
     PANES.forEach(function (p, i) {
       var t = $("tab-" + p);
+      $("frame-" + p) && $("frame-" + p).addEventListener("load", function () { mirrorTheme(); markHidden(activePane()); });
       t.addEventListener("click", function () { showPane(p); });
       t.addEventListener("keydown", function (e) {
         var j = e.key === "ArrowRight" ? i + 1 : e.key === "ArrowLeft" ? i - 1 : -1;
@@ -459,6 +558,9 @@
         $("tab-" + PANES[j]).focus();
         e.preventDefault();
       });
+    });
+    document.addEventListener("keydown", function (e) {
+      if (e.key === "Escape" && $("real").open) { $("real").open = false; $("real").querySelector("summary").focus(); }
     });
     var sel = $("example");
     EXAMPLES.forEach(function (ex) {
