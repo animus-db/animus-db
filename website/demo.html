@@ -21,13 +21,12 @@
 <link rel="stylesheet" href="assets/demo.css">
 <script src="assets/site.js" defer></script>
 </head>
-<body>
-<a class="skip-link" href="#main">Skip to content</a>
+<body class="app">
+<a class="skip-link" href="#views">Skip to content</a>
 
-<header class="site">
-  <div class="wrap bar">
-    <a class="brand" href="index.html">
-      <svg width="32" height="32" viewBox="-43 -43 86 86" aria-hidden="true">
+<header class="shell-bar">
+  <a class="brand" href="index.html" aria-label="AnimusDB home">
+    <svg width="32" height="32" viewBox="-43 -43 86 86" aria-hidden="true">
         <circle cx="-26.14" cy="-15.09" r="2.4" fill="oklch(0.780 0.012 250.0)"></circle>
         <circle cx="-26.14" cy="0" r="3.04" fill="oklch(0.754 0.033 250.6)"></circle>
         <circle cx="-26.14" cy="15.09" r="2.4" fill="oklch(0.780 0.012 250.0)"></circle>
@@ -48,18 +47,20 @@
         <circle cx="26.14" cy="0" r="3.04" fill="oklch(0.754 0.033 250.6)"></circle>
         <circle cx="26.14" cy="15.09" r="2.4" fill="oklch(0.780 0.012 250.0)"></circle>
       </svg>
-      AnimusDB
-    </a>
-    <div class="head-right">
-      <nav class="main" aria-label="Main">
-        <a href="how-it-works.html">How it works</a>
-        <a href="docs.html">Docs</a>
-        <a href="compatibility.html">Compatibility</a>
-        <a class="here" aria-current="page" href="demo.html">Try it</a>
-        <a href="https://github.com/animus-db/animus-db">GitHub</a>
-        <a class="nav-cta" href="install.html">Install</a>
-      </nav>
-      <div class="theme-switch" role="group" aria-label="Theme">
+    AnimusDB
+  </a>
+  <div class="view-tabs" role="tablist" aria-label="View">
+    <button type="button" role="tab" id="tab-requests" aria-selected="true" aria-controls="pane-requests" data-pane="requests" disabled>Requests</button>
+    <button type="button" role="tab" id="tab-console" aria-selected="false" aria-controls="pane-console" tabindex="-1" data-pane="console" disabled>Data console</button>
+    <button type="button" role="tab" id="tab-cluster" aria-selected="false" aria-controls="pane-cluster" tabindex="-1" data-pane="cluster" disabled>Cluster</button>
+    <button type="button" role="tab" id="tab-dashboard" aria-selected="false" aria-controls="pane-dashboard" tabindex="-1" data-pane="dashboard" disabled>Operator dashboard</button>
+  </div>
+  <nav class="shell-links" aria-label="Site">
+    <a href="how-it-works.html">How it works</a>
+    <a href="docs.html">Docs</a>
+    <a href="install.html">Install</a>
+  </nav>
+  <div class="theme-switch" role="group" aria-label="Theme">
         <button type="button" data-theme-choice="light" aria-pressed="false" aria-label="Light theme">
           <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
             <circle cx="8" cy="8" r="3.2"/><path d="M8 .8v2M8 13.2v2M.8 8h2M13.2 8h2M2.9 2.9l1.4 1.4M11.7 11.7l1.4 1.4M13.1 2.9l-1.4 1.4M4.3 11.7l-1.4 1.4"/>
@@ -76,160 +77,69 @@
           </svg>
         </button>
       </div>
-    </div>
-  </div>
 </header>
 
-<main id="main">
-
-<div class="page-head">
-  <div class="wrap">
-    <h1>A cluster in this tab</h1>
-    <p>
-      This page runs the real AnimusDB request path (the DynamoDB-compatible edge, the Raft
-      control plane and a Raft group per tablet) compiled to WebAssembly, on the same
-      deterministic simulator the project's tests use. Create a table, write and read items,
-      then crash a node or cut the network and watch the cluster recover. The same cluster
-      also serves the real data console and operator dashboard, in tabs below.
-    </p>
-  </div>
-</div>
-
-<div class="wrap demo">
-
-  <section class="demo-about" aria-labelledby="about-h">
-    <h2 id="about-h" class="demo-h">What this is, and is not</h2>
-    <div class="cols-2">
-      <div>
-        <h3>What is real</h3>
-        <ul>
-          <li>The DynamoDB JSON request path, from request parsing to the item and table operations, is the same code the server runs.</li>
-          <li>Each node runs a multi-voter control-plane Raft group, and every tablet replica runs its own Raft group. Elections, replication and leader changes all happen.</li>
-          <li>Crashing a node keeps its state for the restart; a partition drops the messages between two nodes.</li>
-        </ul>
-      </div>
-      <div>
-        <h3>What is simulated</h3>
-        <ul>
-          <li><strong>Time is virtual.</strong> The cluster's clock only moves while this tab is visible and not paused, at the speed you pick. A background tab pauses it instead of letting elections flap.</li>
-          <li><strong>Everything is in memory.</strong> There are no sockets, threads or disk. Reloading the page discards the cluster.</li>
-          <li><strong>Seeded.</strong> The same seed builds the same cluster, and the cluster is a pure function of the calls made on it. Your clicks and frame timing are real, so a hand-driven session will not replay byte for byte.</li>
-        </ul>
+<div class="intro">
+  <p class="intro-line">A real AnimusDB cluster, running in this tab on virtual time. Send DynamoDB requests, browse the data, crash a node or cut the network, and watch Raft recover.</p>
+  <details class="real" id="real">
+    <summary>What&rsquo;s real here</summary>
+    <div class="real-panel">
+      <div class="cols-3">
+        <div>
+          <h2>What is real</h2>
+          <ul>
+            <li>The DynamoDB JSON request path, from request parsing to the item and table operations, is the same code the server runs.</li>
+            <li>Each node runs a multi-voter control-plane Raft group, and every tablet replica runs its own Raft group. Elections, replication and leader changes all happen.</li>
+            <li>The data console and the operator dashboard are the real <code>animusd</code> web UIs, unmodified apart from an embedded mode that hides their own header; their HTTP calls are answered by the in-tab cluster.</li>
+            <li>Crashing a node keeps its state for the restart; a partition drops the messages between two nodes.</li>
+          </ul>
+        </div>
+        <div>
+          <h2>What is simulated</h2>
+          <ul>
+            <li><strong>Time is virtual.</strong> The cluster&rsquo;s clock only moves while this tab is visible and not paused, at the speed you pick. A background tab pauses it instead of letting elections flap.</li>
+            <li><strong>Everything is in memory.</strong> There are no sockets, threads or disk. Reloading the page discards the cluster.</li>
+            <li><strong>Seeded.</strong> The same seed builds the same cluster, and the cluster is a pure function of the calls made on it. Your clicks and frame timing are real, so a hand-driven session will not replay byte for byte.</li>
+          </ul>
+        </div>
+        <div>
+          <h2>Not available here</h2>
+          <p>On-demand backup, PITR restore, table export and import, tagging, and adding or removing a global secondary index or a stream with <code>UpdateTable</code>. Those requests answer with an &ldquo;unsupported&rdquo; error, in the Requests view and in the web UIs alike (so the data console&rsquo;s index changes and the dashboard&rsquo;s Backups view report errors). The dashboard&rsquo;s metrics exporter and peer-console links need things a tab does not have.</p>
+          <p>This is a demonstration, not a benchmark: the numbers it shows are virtual milliseconds, not performance.</p>
+        </div>
       </div>
     </div>
-    <p class="muted demo-small">
-      Not available here: on-demand backup, PITR restore, table export and import, tagging, and
-      adding or removing a global secondary index or a stream with <code>UpdateTable</code>.
-      Those requests answer with an "unsupported" error, in the DynamoDB requests and in the
-      web UIs alike (so the data console's index changes and the dashboard's Backups view
-      report errors). This is a demonstration, not a
-      benchmark: the numbers it shows are virtual milliseconds, not performance.
-    </p>
+  </details>
+</div>
+
+<main id="views">
+
+  <section id="pane-start" class="pane scroll start" aria-labelledby="start-h">
+    <div class="pane-in">
+      <h1 id="start-h">A cluster in this tab</h1>
+      <p class="lead">Pick a size and a seed, then start. The first start downloads the WebAssembly build of the real request path.</p>
+      <div id="setup-box">
+        <form id="setup" class="setup-row" autocomplete="off">
+          <label>Nodes
+            <select id="nodes-in">
+              <option value="3" selected>3</option>
+              <option value="5">5</option>
+              <option value="7">7</option>
+            </select>
+          </label>
+          <label>Seed
+            <input id="seed-in" type="number" min="0" step="1" value="42" inputmode="numeric">
+          </label>
+          <button id="start" class="btn primary" type="submit">Start cluster</button>
+        </form>
+        <p class="muted demo-small" id="start-note">Downloads about 1.7&nbsp;MB (compressed) of WebAssembly on first start.</p>
+        <p id="load-error" class="warnbox demo-error" role="alert" hidden></p>
+      </div>
+    </div>
   </section>
 
-  <section class="demo-setup" aria-labelledby="setup-h">
-    <h2 id="setup-h" class="demo-h">Cluster</h2>
-    <form id="setup" class="setup-row" autocomplete="off">
-      <label>Nodes
-        <select id="nodes-in">
-          <option value="3" selected>3</option>
-          <option value="5">5</option>
-          <option value="7">7</option>
-        </select>
-      </label>
-      <label>Seed
-        <input id="seed-in" type="number" min="0" step="1" value="42" inputmode="numeric">
-      </label>
-      <button id="start" class="btn primary" type="submit">Start cluster</button>
-      <span class="muted demo-small" id="start-note">Downloads about 1.7&nbsp;MB (compressed) of WebAssembly on first start.</span>
-    </form>
-    <p id="load-error" class="warnbox demo-error" role="alert" hidden></p>
-  </section>
-
-  <div id="live" hidden>
-
-    <section aria-labelledby="view-h">
-      <h2 id="view-h" class="demo-h">Cluster view</h2>
-      <div class="statbar" aria-live="off">
-        <div><span class="k">Virtual clock</span><span class="v mono live" id="clock">0.000 s</span></div>
-        <div><span class="k">Control leader</span><span class="v mono" id="ctl-leader">none</span></div>
-        <div><span class="k">Tables</span><span class="v mono" id="table-count">0</span></div>
-        <div><span class="k">Tablets</span><span class="v mono" id="tablet-count">0</span></div>
-        <div><span class="k">In flight</span><span class="v mono" id="pending">0</span></div>
-      </div>
-
-      <div class="speed-row">
-        <label for="speed">Speed <span class="mono" id="speed-out">1x</span></label>
-        <input id="speed" type="range" min="0" max="6" step="1" value="2" aria-valuetext="1x">
-        <button id="pause" class="btn" type="button" aria-pressed="false">Pause</button>
-        <span class="muted demo-small">Virtual seconds per real second. Slow it down to watch an election; speed it up to wait out a timeout.</span>
-      </div>
-
-      <div id="node-grid" class="node-grid" role="list"></div>
-
-      <div class="fault-row">
-        <fieldset>
-          <legend>Network</legend>
-          <label class="sr-only" for="part-a">Node A</label>
-          <select id="part-a"></select>
-          <span aria-hidden="true">&harr;</span>
-          <label class="sr-only" for="part-b">Node B</label>
-          <select id="part-b"></select>
-          <button id="partition" class="btn" type="button">Partition</button>
-          <button id="heal" class="btn" type="button">Heal all</button>
-        </fieldset>
-        <fieldset>
-          <legend>Membership</legend>
-          <button id="grow" class="btn" type="button">Add a node</button>
-        </fieldset>
-      </div>
-      <p id="partition-list" class="muted demo-small" aria-live="polite"></p>
-
-      <h3 class="demo-h3">Tablets</h3>
-      <div class="table-scroll">
-        <table class="tablets">
-          <thead><tr><th scope="col">Tablet</th><th scope="col">Table</th><th scope="col">Replicas</th><th scope="col">Leader</th><th scope="col">State</th></tr></thead>
-          <tbody id="tablet-rows"><tr><td colspan="5" class="muted">No tables yet. Run CreateTable below.</td></tr></tbody>
-        </table>
-      </div>
-
-      <h3 class="demo-h3">Events</h3>
-      <ol id="events" class="events mono" aria-live="polite"></ol>
-    </section>
-
-    <section aria-labelledby="ui-h">
-      <h2 id="ui-h" class="demo-h">Talk to the cluster</h2>
-      <p class="body-text">
-        Three ways in, all against the same cluster: raw DynamoDB requests, the data console
-        (the tables-and-items web UI <code>animusd</code> serves on its console port), and the
-        operator dashboard (the cluster-state UI on its admin port). The two web UIs here are the
-        real files from the repository, running unmodified in this tab; their HTTP calls are
-        answered by the in-browser cluster.
-      </p>
-      <div class="view-tabs" role="tablist" aria-label="Interface">
-        <button type="button" role="tab" id="tab-requests" aria-selected="true" aria-controls="pane-requests" data-pane="requests">DynamoDB requests</button>
-        <button type="button" role="tab" id="tab-console" aria-selected="false" aria-controls="pane-console" tabindex="-1" data-pane="console">Data console</button>
-        <button type="button" role="tab" id="tab-dashboard" aria-selected="false" aria-controls="pane-dashboard" tabindex="-1" data-pane="dashboard">Operator dashboard</button>
-      </div>
-
-      <div id="pane-console" role="tabpanel" aria-labelledby="tab-console" hidden>
-        <p class="muted demo-small">
-          Browse tables and items, create or change a table, turn on a stream or TTL. A table you
-          created in the request tab shows up here, and the reverse.
-        </p>
-        <iframe id="frame-console" class="app-frame" title="AnimusDB data console" data-app="console"></iframe>
-      </div>
-      <div id="pane-dashboard" role="tabpanel" aria-labelledby="tab-dashboard" hidden>
-        <p class="muted demo-small">
-          Overview, placement, tablets, transactions, streams, data browser and storage debug
-          views. Crash a node above and refresh. Backups need an object store and the metrics
-          exporter needs a collector; neither exists in a tab, so those views show an empty or
-          error state.
-        </p>
-        <iframe id="frame-dashboard" class="app-frame" title="AnimusDB operator dashboard" data-app="dashboard"></iframe>
-      </div>
-
-      <div id="pane-requests" role="tabpanel" aria-labelledby="tab-requests">
+  <section id="pane-requests" class="pane scroll" role="tabpanel" aria-labelledby="tab-requests" hidden>
+    <div class="pane-in">
       <p class="body-text">
         Pick an example, edit the JSON if you like, and send it to any node. The request is a
         DynamoDB JSON body; the target is the <code>X-Amz-Target</code> operation it would carry
@@ -264,73 +174,77 @@
         leader. Without it a read is eventually consistent, as in DynamoDB, and may be served by a
         replica that has not applied the latest write yet.
       </p>
+    </div>
+  </section>
+
+  <section id="pane-console" class="pane frame-pane" role="tabpanel" aria-labelledby="tab-console" hidden>
+    <iframe id="frame-console" class="app-frame" title="AnimusDB data console" data-app="console"></iframe>
+  </section>
+
+  <section id="pane-cluster" class="pane scroll" role="tabpanel" aria-labelledby="tab-cluster" hidden>
+    <div class="pane-in">
+      <div class="statbar" aria-live="off">
+        <div><span class="k">Control leader</span><span class="v mono" id="ctl-leader">none</span></div>
+        <div><span class="k">Tables</span><span class="v mono" id="table-count">0</span></div>
+        <div><span class="k">Tablets</span><span class="v mono" id="tablet-count">0</span></div>
+        <div><span class="k">In flight</span><span class="v mono" id="pending">0</span></div>
       </div>
-    </section>
 
-  </div>
+      <div id="node-grid" class="node-grid" role="list"></div>
 
-  <p class="ctalink-row">
-    <a class="ctalink" href="install.html">Run a real cluster</a>
-    <a class="ctalink" href="articles/determinism.html">Why determinism matters</a>
-    <a class="ctalink" href="how-it-works.html">How it works</a>
-    <a class="ctalink" href="compatibility.html">What is implemented</a>
-  </p>
-</div>
+      <div class="fault-row">
+        <fieldset>
+          <legend>Network</legend>
+          <label class="sr-only" for="part-a">Node A</label>
+          <select id="part-a"></select>
+          <span aria-hidden="true">&harr;</span>
+          <label class="sr-only" for="part-b">Node B</label>
+          <select id="part-b"></select>
+          <button id="partition" class="btn" type="button">Partition</button>
+          <button id="heal" class="btn" type="button">Heal all</button>
+        </fieldset>
+        <fieldset>
+          <legend>Membership</legend>
+          <button id="grow" class="btn" type="button">Add a node</button>
+        </fieldset>
+        <fieldset id="rebuild-box">
+          <legend>Cluster</legend>
+        </fieldset>
+      </div>
+      <p id="partition-list" class="muted demo-small" aria-live="polite"></p>
 
-<script src="assets/demo.js" defer></script>
+      <h2 class="demo-h3">Tablets</h2>
+      <div class="table-scroll">
+        <table class="tablets">
+          <thead><tr><th scope="col">Tablet</th><th scope="col">Table</th><th scope="col">Replicas</th><th scope="col">Leader</th><th scope="col">State</th></tr></thead>
+          <tbody id="tablet-rows"><tr><td colspan="5" class="muted">No tables yet. Run CreateTable in Requests.</td></tr></tbody>
+        </table>
+      </div>
+
+      <h2 class="demo-h3">Events</h2>
+      <ol id="events" class="events mono" aria-live="polite"></ol>
+    </div>
+  </section>
+
+  <section id="pane-dashboard" class="pane frame-pane" role="tabpanel" aria-labelledby="tab-dashboard" hidden>
+    <iframe id="frame-dashboard" class="app-frame" title="AnimusDB operator dashboard" data-app="dashboard"></iframe>
+  </section>
+
 </main>
 
-</main>
-
-<footer class="site">
-  <div class="wrap">
-    <div class="foot-grid">
-      <div>
-        <h5>Product</h5>
-        <ul>
-          <li><a href="index.html">Overview</a></li>
-          <li><a href="how-it-works.html">How it works</a></li>
-          <li><a href="install.html">Install</a></li>
-          <li><a href="demo.html">Try it in your browser</a></li>
-          <li><a href="docs.html">Documentation</a></li>
-        </ul>
-      </div>
-      <div>
-        <h5>Reference</h5>
-        <ul>
-          <li><a href="architecture.html">Architecture</a></li>
-          <li><a href="compatibility.html">Compatibility</a></li>
-          <li><a href="performance.html">Performance</a></li>
-          <li><a href="licence.html">Licensing</a></li>
-        </ul>
-      </div>
-      <div>
-        <h5>Writing</h5>
-        <ul>
-          <li><a href="articles/why-lock-in-compounds.html">Why lock-in compounds</a></li>
-          <li><a href="articles/what-self-hosting-costs.html">What self-hosting actually costs</a></li>
-          <li><a href="articles/determinism.html">Determinism, and why you should care</a></li>
-        </ul>
-      </div>
-      <div>
-        <h5>Project</h5>
-        <ul>
-          <li><a href="https://github.com/animus-db/animus-db">GitHub</a></li>
-          <li><a href="https://github.com/animus-db/animus-db/issues">Issues</a></li>
-          <li><a href="https://github.com/animus-db/animus-db/blob/main/CONTRIBUTING.md">Contributing</a></li>
-          <li><a href="https://github.com/animus-db/animus-db/blob/main/docs/adr/README.md">Design records</a></li>
-          <li><a href="https://github.com/animus-db/animus-db/blob/main/LICENSE">Licence text</a></li>
-          <li><a href="https://github.com/animus-db/animus-db/blob/main/CODE_OF_CONDUCT.md">Code of conduct</a></li>
-        </ul>
-      </div>
-    </div>
-    <div class="foot-bottom">
-      <span>Pre-alpha. Not ready for production data.</span>
-      <span class="spacer"></span>
-      <span class="mono">AGPL-3.0 · animusdb.io</span>
-    </div>
+<footer class="fault-strip" id="strip" aria-label="Cluster controls" hidden>
+  <div class="strip-time">
+    <span class="k">Virtual clock</span>
+    <span class="mono live" id="clock">0.000 s</span>
   </div>
+  <div class="strip-speed">
+    <label for="speed">Speed <span class="mono" id="speed-out">1x</span></label>
+    <input id="speed" type="range" min="0" max="6" step="1" value="2" aria-valuetext="1x">
+    <button id="pause" class="btn small" type="button" aria-pressed="false">Pause</button>
+  </div>
+  <ul class="chips" id="chips" aria-label="Nodes"></ul>
 </footer>
 
+<script src="assets/demo.js" defer></script>
 </body>
 </html>

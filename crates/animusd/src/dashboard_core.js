@@ -68,6 +68,11 @@ async function loadSelf() {
 // its own when the OS preference changes). Light is the default when
 // nothing is stored yet (ADR 0056 flips the old dark-by-default).
 const THEME_KEY = "animusd-admin-theme";
+// Embedded mode (see dashboard.css): the page is a view inside a host app shell (the
+// browser demo, ADR 0082). The host sets `data-embedded` on <html> before any script
+// runs and owns the theme, so the persisted preference is neither read nor written,
+// the switch is not wired, and the auto-refresh defaults to 2s (dashboard.html).
+const EMBEDDED = document.documentElement.hasAttribute("data-embedded");
 function applyThemeChoice(choice) {
   const root = document.documentElement;
   if (choice === "light" || choice === "dark") root.dataset.theme = choice;
@@ -77,10 +82,12 @@ function applyThemeChoice(choice) {
   });
 }
 function initTheme() {
+  if (EMBEDDED) return;
   const saved = localStorage.getItem(THEME_KEY);
   applyThemeChoice(saved === "dark" || saved === "system" ? saved : "light");
 }
 function wireThemeSwitch(containerId) {
+  if (EMBEDDED) return;
   const el = $(containerId);
   if (!el) return;
   el.querySelectorAll("button[data-theme-choice]").forEach((b) => {

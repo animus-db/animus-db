@@ -152,6 +152,17 @@ wiring; the rules:
   for `wasm32-unknown-unknown`:
   `cargo check -p animusd --lib --no-default-features --features embedded --target wasm32-unknown-unknown`.
   `animus-env` gets `getrandom/js` on wasm32 (its `Cargo.toml`).
+- **Embedded mode of the two web UIs** (ADR 0082, second 2026-10-31 amendment): when a host
+  sets `data-embedded` on the UI document's `<html>` before its scripts run (the browser demo's
+  `website/assets/demo-frame.js` does), `console.css`/`dashboard.css` hide the whole top bar
+  (brand, logo, theme switch, the console's scope note, the dashboard's "no auth" banner, health
+  pill, refresh controls; the elements stay in the DOM), `console.html`'s inline script and
+  `dashboard_core.js` (`EMBEDDED`) skip reading/writing their theme key and wiring the switch (the
+  host sets `data-theme` and keeps it current), and the dashboard defaults its auto-refresh to 2 s
+  and skips polls while the host sets `data-embedded-hidden`. A host may call the global `loadAll()`
+  to refresh the dashboard. Every rule is keyed on the attribute, so served normally nothing
+  changes; keep it that way, and put any new "own chrome" element under the `html[data-embedded]`
+  rules.
 - At least one must be on (`compile_error!` in `lib.rs`); the in-crate **tests
   need `server`** (they use `ProdEnv`-typed pieces and cannot build with
   `--no-default-features`). Run the embedded tests with

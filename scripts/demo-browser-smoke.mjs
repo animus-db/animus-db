@@ -7,8 +7,10 @@
 //       [--url http://127.0.0.1:8000/demo.html] [--shots DIR] [--exe /path/to/browser]
 //
 // Drives the page like a visitor: start, CreateTable, PutItem, GetItem, Query,
-// Scan, PartiQL, the data console and operator dashboard in their frames, crash the control leader, write through a survivor, restart,
-// partition, heal, add a node, speed slider, pause. Fails on any console error,
+// Scan, PartiQL, the data console and operator dashboard in their frames (embedded
+// mode: no logo, header, theme switch or warnings of their own; theme follows the
+// shell), crash the control leader from the fault strip, watch the dashboard follow,
+// write through a survivor, restart, partition, heal, add a node, speed slider, pause. Fails on any console error,
 // page error or unexpected response. Needs Playwright's own browser build (a
 // stock Firefox cannot be driven by Playwright).
 import { createRequire } from "node:module";
@@ -42,13 +44,31 @@ async function session(viewport, scheme) {
   await page.goto(url);
   return page;
 }
-const shot = async (page, file) => { if (shots) { await page.screenshot({ path: `${shots}/${file}`, fullPage: true }); } };
+const shot = async (page, file) => { if (shots) { await page.screenshot({ path: `${shots}/${file}` }); } };
+// The shell fills the viewport and never scrolls the page itself.
+const pageFits = (page) => page.evaluate(() =>
+  document.scrollingElement.scrollHeight <= window.innerHeight + 1 && document.scrollingElement.scrollWidth <= window.innerWidth);
+// An embedded UI shows none of its own chrome.
+async function embeddedClean(label, frameLoc, selfHidden) {
+  const f = page.frameLocator(frameLoc);
+  const embedded = await page.locator(frameLoc).evaluate((fr) => fr.contentDocument.documentElement.hasAttribute("data-embedded"));
+  const visible = async (sel) => (await f.locator(sel).locator("visible=true").count());
+  const bad = [];
+  for (const sel of [".topbar", "svg.logo", ".theme-switch", ".banner", ".scope-note", "#refresh", "#auto"]) {
+    if (await visible(sel)) { bad.push(sel); }
+  }
+  check(label + " embedded: no own header, logo, theme switch or warning", embedded && bad.length === 0, bad.join(" "));
+  const h = await page.locator(frameLoc).evaluate((fr) => fr.getBoundingClientRect().height / window.innerHeight);
+  check(label + " frame fills the viewport height", h > 0.6, h.toFixed(2));
+}
 
 const page = await session({ width: 1280, height: 900 }, "light");
 await page.click("#start");
 await page.waitForSelector("html[data-demo-ready='1']", { timeout: 120000 });
 await page.waitForFunction(() => document.getElementById("ctl-leader").textContent.startsWith("node"), null, { timeout: 60000 });
 check("start cluster, control leader elected", true, await page.textContent("#ctl-leader"));
+check("one logo, strip visible, page does not scroll",
+  (await page.locator("a.brand svg:visible").count()) === 1 && (await page.locator("#strip").isVisible()) && (await pageFits(page)));
 
 async function send(example, node) {
   await page.selectOption("#example", example);
@@ -79,36 +99,54 @@ await shot(page, `${name}-desktop-light.png`);
   await con.locator("a.tab-link", { hasText: "Items" }).click();
   await con.locator("body").getByText("o-1001").first().waitFor({ timeout: 60000 });
   check("data console shows the item written over the DynamoDB wire", true);
+  await embeddedClean("data console", "#frame-console");
+  await page.click("[data-theme-choice='dark']");
+  await page.waitForFunction(() => document.getElementById("frame-console").contentDocument.documentElement.getAttribute("data-theme") === "dark");
+  check("shell theme change reaches the open console frame", true);
+  await page.click("[data-theme-choice='light']");
   await shot(page, `${name}-console.png`);
 
   await page.click("#tab-dashboard");
   const dash = page.frameLocator("#frame-dashboard");
-  await dash.locator("body").getByText(/3 node\(s\) reachable/).waitFor({ timeout: 60000 });
+  await dash.locator("body").getByText(/All 3 node\(s\) reachable/).waitFor({ timeout: 60000 });
   check("dashboard overview sees the cluster", true);
+  await embeddedClean("dashboard", "#frame-dashboard");
+  check("dashboard keeps its own navigation", (await dash.locator(".sidebar button.navlink").count()) >= 5);
+  check("pages do not scroll with a UI open", await pageFits(page));
   await dash.getByText("orders").locator("visible=true").first().waitFor({ timeout: 60000 });
   check("dashboard lists the playground table", true);
   await dash.locator(".sidebar button.navlink", { hasText: "Tablets" }).click();
   await dash.getByText("orders").locator("visible=true").first().waitFor({ timeout: 60000 });
   check("dashboard tablets tab", true);
-  await dash.locator(".sidebar button.navlink", { hasText: "Backups" }).click();
+  await dash.locator(".sidebar button.navlink", { hasText: "Overview" }).click();
   await shot(page, `${name}-dashboard.png`);
+  await page.click("#tab-cluster");
+  await shot(page, `${name}-cluster.png`);
+  check("cluster view: pages do not scroll", await pageFits(page));
   await page.click("#tab-requests");
 }
 
 const leaderText = await page.textContent("#ctl-leader");
 const leader = Number(/\d+/.exec(leaderText)[0]);
-await page.click(`button[aria-label='Crash node ${leader}']`);
+await page.click(`button[aria-label='Crash node ${leader} (fault strip)']`);
 await page.waitForFunction((l) => {
   const t = document.getElementById("ctl-leader").textContent;
   return /node \d+/.test(t) && t !== "node " + l;
 }, leader, { timeout: 60000 });
 const survivor = (leader + 1) % 3;
 const r2 = await send("put2", survivor);
-check("crash control leader, write through survivor", r2.code === 200, "HTTP " + r2.code);
-await page.click(`button[aria-label='Restart node ${leader}']`);
-await page.waitForFunction((l) => document.querySelectorAll(".node")[l].classList.contains("down") === false, leader, { timeout: 30000 });
-check("restart", true);
+check("crash control leader from the strip, write through survivor", r2.code === 200, "HTTP " + r2.code);
+// The dashboard (already loaded) follows the fault without a manual refresh.
+await page.click("#tab-dashboard");
+await page.frameLocator("#frame-dashboard").locator("body").getByText(/node\(s\) down/).waitFor({ timeout: 60000 });
+check("dashboard follows the crash by itself", true);
+await page.click(`button[aria-label='Restart node ${leader} (fault strip)']`);
+await page.waitForFunction((l) => document.querySelectorAll("#chips .chip")[l].classList.contains("down") === false, leader, { timeout: 30000 });
+check("restart from the strip", true);
+await page.frameLocator("#frame-dashboard").locator("body").getByText(/All 3 node\(s\) reachable/).waitFor({ timeout: 60000 });
+check("dashboard follows the restart", true);
 
+await page.click("#tab-cluster");
 await page.selectOption("#part-a", "0");
 await page.selectOption("#part-b", "1");
 await page.click("#partition");
@@ -116,7 +154,7 @@ check("partition", (await page.textContent("#partition-list")).includes("node 0 
 await page.click("#heal");
 check("heal", (await page.textContent("#partition-list")).includes("No partitions"));
 await page.click("#grow");
-await page.waitForFunction(() => document.querySelectorAll(".node").length === 4, null, { timeout: 120000 });
+await page.waitForFunction(() => document.querySelectorAll(".node").length === 4 && document.querySelectorAll("#chips .chip").length === 4, null, { timeout: 120000 });
 check("add node", true);
 await page.fill("#speed", "5");
 await page.dispatchEvent("#speed", "input");
@@ -135,12 +173,17 @@ const dark = await session({ width: 1280, height: 900 }, "dark");
 await dark.click("#start");
 await dark.waitForSelector("html[data-demo-ready='1']", { timeout: 120000 });
 await shot(dark, `${name}-desktop-dark.png`);
+check("dark: page does not scroll", await pageFits(dark));
 await dark.context().close();
 const mob = await session({ width: 390, height: 844 }, "light");
 await mob.click("#start");
 await mob.waitForSelector("html[data-demo-ready='1']", { timeout: 120000 });
 const overflow = await mob.evaluate(() => document.documentElement.scrollWidth > window.innerWidth);
 check("no horizontal page scroll at 390px", !overflow);
+check("390px: page does not scroll, tabs reachable", (await pageFits(mob)) && (await mob.locator("#tab-dashboard").isVisible()));
+await mob.click("#tab-cluster");
+check("390px cluster view: no horizontal page scroll", !(await mob.evaluate(() => document.documentElement.scrollWidth > window.innerWidth)));
+await mob.click("#tab-requests");
 await shot(mob, `${name}-mobile.png`);
 await mob.context().close();
 await browser.close();

@@ -66,6 +66,11 @@
 // logic is a handful of lines. Runs before console.js's router so the
 // correct palette is set before the app paints its first screen.
 const THEME_KEY = "animusd-console-theme";
+// Embedded mode (see console.css): the page is a view inside a host app shell
+// (the browser demo, ADR 0082). The host sets `data-embedded` on <html> before this
+// script runs and owns the theme (it sets `data-theme` and keeps it current), so
+// the persisted preference is neither read nor written and the switch is not wired.
+const EMBEDDED = document.documentElement.hasAttribute("data-embedded");
 function applyThemeChoice(choice) {
   const root = document.documentElement;
   if (choice === "light" || choice === "dark") root.dataset.theme = choice;
@@ -75,10 +80,11 @@ function applyThemeChoice(choice) {
   });
 }
 (function initTheme() {
+  if (EMBEDDED) return;
   const saved = localStorage.getItem(THEME_KEY);
   applyThemeChoice(saved === "dark" || saved === "system" ? saved : "light");
 })();
-document.getElementById("theme-switch").querySelectorAll("button[data-theme-choice]").forEach((b) => {
+if (!EMBEDDED) document.getElementById("theme-switch").querySelectorAll("button[data-theme-choice]").forEach((b) => {
   b.addEventListener("click", () => {
     localStorage.setItem(THEME_KEY, b.dataset.themeChoice);
     applyThemeChoice(b.dataset.themeChoice);

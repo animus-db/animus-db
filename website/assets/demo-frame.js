@@ -8,6 +8,9 @@
    self-contained (inline CSS and JS), points the address bar at the UI's own
    path (history.replaceState, so its location.pathname routing works), and
    prepends a shim that:
+     - marks the document `data-embedded` (the UIs hide their own brand, theme switch
+       and warnings, see "Embedded mode" in crates/animusd/CLAUDE.md) and copies the
+       shell's theme onto it; the shell keeps it current (demo.js mirrors later changes);
      - answers fetch() of /console/api/* and /admin/* from the in-tab cluster;
      - turns navigations to /console/ui/* and /admin/ui/* (links, and the
        `location.href =` assignments the console makes) into a reload of this
@@ -26,6 +29,12 @@
   // Runs inside the rewritten document, before any UI script. Stringified below,
   // so it must not close over anything: its inputs arrive as arguments.
   function shim(app, framePath) {
+    var root = document.documentElement;
+    root.setAttribute("data-embedded", "1");
+    try {
+      var theme = window.parent.document.documentElement.getAttribute("data-theme");
+      if (theme) { root.setAttribute("data-theme", theme); }
+    } catch (e) { /* cross-origin parent: keep the system theme */ }
     var api = function () { return window.parent && window.parent.animusDemo; };
     var realFetch = window.fetch.bind(window);
     var isApi = function (p) {
