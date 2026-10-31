@@ -72,3 +72,9 @@
   .node-grid { grid-template-columns: minmax(0, 1fr); }
   .setup-row input[type="number"] { width: 100px; }
 }
+
+.view-tabs { display: flex; flex-wrap: wrap; gap: 0; border-bottom: 1px solid var(--border-strong); margin: 0 0 18px; }
+.view-tabs button { font: 600 15px var(--font-ui); color: var(--text2); background: transparent; border: 0; border-bottom: 3px solid transparent; padding: 9px 16px; margin-bottom: -1px; cursor: pointer; }
+.view-tabs button:hover { color: var(--text); }
+.view-tabs button[aria-selected="true"] { color: var(--text); border-bottom-color: var(--accent); }
+.app-frame { display: block; width: 100%; height: min(82vh, 860px); min-height: 520px; border: 1px solid var(--border-strong); background: var(--bg); }

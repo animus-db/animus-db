@@ -90,6 +90,29 @@ impl AnimusCluster {
         promise
     }
 
+    /// Send an HTTP-style request for the data console (`/console/api/*`) or the
+    /// operator dashboard's admin API (`/admin/*`) to `node`; `path` is the
+    /// request target with its query string. The promise resolves to
+    /// `{ status, contentType, body }` like `request`, and rejects for a node
+    /// that does not exist. The UI assets are static files the page serves.
+    #[wasm_bindgen]
+    pub fn http(&mut self, node: u32, method: &str, path: &str, body: &str) -> Promise {
+        let mut fns: Option<(Function, Function)> = None;
+        let promise = Promise::new(&mut |resolve, reject| fns = Some((resolve, reject)));
+        let Some((resolve, reject)) = fns else {
+            return promise;
+        };
+        match self.core.submit_http(u64::from(node), method, path, body) {
+            Ok(id) => {
+                self.resolvers.insert(id, resolve);
+            }
+            Err(e) => {
+                let _ = reject.call1(&JsValue::NULL, &JsValue::from_str(&e.to_string()));
+            }
+        }
+        promise
+    }
+
     /// Advance virtual time by `real_ms * speed` (call once per
     /// `requestAnimationFrame` with the elapsed milliseconds; `real_ms` counts
     /// at most 100 and `speed` at most 100) and settle the promises of requests
@@ -115,6 +138,11 @@ impl AnimusCluster {
             &JsValue::from_f64(f64::from(c.status)),
         );
         let _ = Reflect::set(&result, &"body".into(), &JsValue::from_str(&c.body));
+        let _ = Reflect::set(
+            &result,
+            &"contentType".into(),
+            &JsValue::from_str(&c.content_type),
+        );
         let _ = resolve.call1(&JsValue::NULL, &result);
     }
 

@@ -89,7 +89,8 @@
       This page runs the real AnimusDB request path (the DynamoDB-compatible edge, the Raft
       control plane and a Raft group per tablet) compiled to WebAssembly, on the same
       deterministic simulator the project's tests use. Create a table, write and read items,
-      then crash a node or cut the network and watch the cluster recover.
+      then crash a node or cut the network and watch the cluster recover. The same cluster
+      also serves the real data console and operator dashboard, in tabs below.
     </p>
   </div>
 </div>
@@ -119,7 +120,9 @@
     <p class="muted demo-small">
       Not available here: on-demand backup, PITR restore, table export and import, tagging, and
       adding or removing a global secondary index or a stream with <code>UpdateTable</code>.
-      Those requests answer with an "unsupported" error. This is a demonstration, not a
+      Those requests answer with an "unsupported" error, in the DynamoDB requests and in the
+      web UIs alike (so the data console's index changes and the dashboard's Backups view
+      report errors). This is a demonstration, not a
       benchmark: the numbers it shows are virtual milliseconds, not performance.
     </p>
   </section>
@@ -194,8 +197,39 @@
       <ol id="events" class="events mono" aria-live="polite"></ol>
     </section>
 
-    <section aria-labelledby="console-h">
-      <h2 id="console-h" class="demo-h">DynamoDB console</h2>
+    <section aria-labelledby="ui-h">
+      <h2 id="ui-h" class="demo-h">Talk to the cluster</h2>
+      <p class="body-text">
+        Three ways in, all against the same cluster: raw DynamoDB requests, the data console
+        (the tables-and-items web UI <code>animusd</code> serves on its console port), and the
+        operator dashboard (the cluster-state UI on its admin port). The two web UIs here are the
+        real files from the repository, running unmodified in this tab; their HTTP calls are
+        answered by the in-browser cluster.
+      </p>
+      <div class="view-tabs" role="tablist" aria-label="Interface">
+        <button type="button" role="tab" id="tab-requests" aria-selected="true" aria-controls="pane-requests" data-pane="requests">DynamoDB requests</button>
+        <button type="button" role="tab" id="tab-console" aria-selected="false" aria-controls="pane-console" tabindex="-1" data-pane="console">Data console</button>
+        <button type="button" role="tab" id="tab-dashboard" aria-selected="false" aria-controls="pane-dashboard" tabindex="-1" data-pane="dashboard">Operator dashboard</button>
+      </div>
+
+      <div id="pane-console" role="tabpanel" aria-labelledby="tab-console" hidden>
+        <p class="muted demo-small">
+          Browse tables and items, create or change a table, turn on a stream or TTL. A table you
+          created in the request tab shows up here, and the reverse.
+        </p>
+        <iframe id="frame-console" class="app-frame" title="AnimusDB data console" data-app="console"></iframe>
+      </div>
+      <div id="pane-dashboard" role="tabpanel" aria-labelledby="tab-dashboard" hidden>
+        <p class="muted demo-small">
+          Overview, placement, tablets, transactions, streams, data browser and storage debug
+          views. Crash a node above and refresh. Backups need an object store and the metrics
+          exporter needs a collector; neither exists in a tab, so those views show an empty or
+          error state.
+        </p>
+        <iframe id="frame-dashboard" class="app-frame" title="AnimusDB operator dashboard" data-app="dashboard"></iframe>
+      </div>
+
+      <div id="pane-requests" role="tabpanel" aria-labelledby="tab-requests">
       <p class="body-text">
         Pick an example, edit the JSON if you like, and send it to any node. The request is a
         DynamoDB JSON body; the target is the <code>X-Amz-Target</code> operation it would carry
@@ -230,6 +264,7 @@
         leader. Without it a read is eventually consistent, as in DynamoDB, and may be served by a
         replica that has not applied the latest write yet.
       </p>
+      </div>
     </section>
 
   </div>

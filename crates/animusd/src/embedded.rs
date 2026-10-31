@@ -45,6 +45,12 @@
 //! sees a write once the loop has drained it (a few hundred virtual
 //! milliseconds).
 //!
+//! The two web UIs are served too (ADR 0082's 2026-10-31 amendment):
+//! [`EmbeddedCluster::submit_http`] runs a `/console/api/*` (data console, ADR
+//! 0052) or `/admin/*` (operator dashboard, ADR 0021) request through the same
+//! `route`/`dispatch` the real listeners call, without blocking `advance`. The
+//! UI assets themselves are the embedder's to serve.
+//!
 //! # Determinism and memory
 //!
 //! No `HashMap`, no wall clock, no `tokio::spawn` here: tasks are spawned on
@@ -86,11 +92,28 @@ impl std::fmt::Display for EmbeddedError {
 
 impl std::error::Error for EmbeddedError {}
 
-/// One wire response: HTTP-style status and the JSON body.
-type Response = (u16, String);
+/// One wire response: HTTP-style status, content type and the body.
+type Response = (u16, &'static str, String);
+
+/// The `Content-Type` of a DynamoDB-wire response.
+const DYNAMO_CONTENT_TYPE: &str = "application/x-amz-json-1.0";
+
+/// The `Content-Type` of a locally built JSON error.
+const JSON_CONTENT_TYPE: &str = "application/json";
 
 /// The slot a spawned request future fills when it resolves.
 type Slot = Arc<Mutex<Option<Response>>>;
+
+/// One HTTP-style response to a [`EmbeddedCluster::submit_http`] request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HttpResponse {
+    /// HTTP status.
+    pub status: u16,
+    /// The `Content-Type` the real edge would send.
+    pub content_type: &'static str,
+    /// The response body (JSON for every API route).
+    pub body: String,
+}
 
 /// An in-flight request: the node it was sent to and its result slot.
 struct Pending {
@@ -208,10 +231,84 @@ impl EmbeddedCluster {
             let (target, body) = (target.to_owned(), body.as_bytes().to_vec());
             let out = slot.clone();
             handle.env(node).spawn_task(async move {
-                let result = if target.starts_with(animus_dynamo::streams_wire::TARGET_PREFIX) {
-                    handle.dynamo_streams(node, &target, &body).await
+                let (status, body) =
+                    if target.starts_with(animus_dynamo::streams_wire::TARGET_PREFIX) {
+                        handle.dynamo_streams(node, &target, &body).await
+                    } else {
+                        handle.dynamo(node, &target, &body).await
+                    };
+                *out.lock().expect("result slot poisoned") =
+                    Some((status, DYNAMO_CONTENT_TYPE, body));
+            });
+        }
+        self.pending.insert(id, Pending { node, slot });
+        Ok(id)
+    }
+
+    /// Send an HTTP-style request for the **data console** (`/console/api/*`,
+    /// ADR 0052) or the **operator dashboard's admin API** (`/admin/*`, ADR
+    /// 0020/0021) to `node`, **without advancing time**. `path` is the request
+    /// target, query string included (`/admin/raftkv?tablet=3`). The request
+    /// runs through the very `animus_node::console::route` /
+    /// `animus_node::admin::dispatch` the real listeners call, over the same
+    /// `ClientCtx` the DynamoDB path uses, so both UIs see this cluster's live
+    /// state. [`advance`](Self::advance) and [`poll`](Self::poll_http) it like
+    /// [`submit`](Self::submit).
+    ///
+    /// The static UI assets (`/console/ui/*`, `/admin/ui/*`) are *not* served
+    /// here: the embedder ships the HTML/CSS/JS (the real files under
+    /// `crates/animusd/src`). Such a path, and any other unknown path, answers
+    /// `404`. A request to a crashed node completes at once with `503`.
+    ///
+    /// Actions the fixture cannot perform (S3 backups, an index `UpdateTable`,
+    /// OpenTelemetry) answer with the same error the sim fixture returns; they
+    /// never panic.
+    ///
+    /// # Errors
+    /// `node` does not exist.
+    pub fn submit_http(
+        &mut self,
+        node: u64,
+        method: &str,
+        path: &str,
+        body: &str,
+    ) -> Result<RequestId, EmbeddedError> {
+        self.check_node(node)?;
+        let id = self.next_request;
+        self.next_request += 1;
+        let slot: Slot = Arc::new(Mutex::new(None));
+        let (path_only, query) = path.split_once('?').unwrap_or((path, ""));
+        let is_console = path_only.starts_with("/console/api/");
+        let is_admin = path_only.starts_with("/admin/") && !path_only.starts_with("/admin/ui/");
+        if self.down.contains(&node) {
+            *slot.lock().expect("result slot poisoned") = Some(unavailable(node, "is down"));
+        } else if !is_console && !is_admin {
+            *slot.lock().expect("result slot poisoned") = Some((
+                404,
+                JSON_CONTENT_TYPE,
+                serde_json::json!({
+                    "error": format!("no such API route: {path_only}"),
+                })
+                .to_string(),
+            ));
+        } else {
+            let handle = self.cluster.handle();
+            let (method, path_only, query, body) = (
+                method.to_owned(),
+                path_only.to_owned(),
+                query.to_owned(),
+                body.as_bytes().to_vec(),
+            );
+            let out = slot.clone();
+            handle.env(node).spawn_task(async move {
+                let result = if is_console {
+                    handle
+                        .console(node, &method, &path_only, &query, &body)
+                        .await
                 } else {
-                    handle.dynamo(node, &target, &body).await
+                    let (status, body) =
+                        handle.admin(node, &method, &path_only, &query, &body).await;
+                    (status, JSON_CONTENT_TYPE, body)
                 };
                 *out.lock().expect("result slot poisoned") = Some(result);
             });
@@ -220,10 +317,25 @@ impl EmbeddedCluster {
         Ok(id)
     }
 
+    /// [`poll`](Self::poll) for a [`submit_http`](Self::submit_http) request,
+    /// keeping the content type.
+    pub fn poll_http(&mut self, id: RequestId) -> Option<HttpResponse> {
+        self.take(id)
+            .map(|(status, content_type, body)| HttpResponse {
+                status,
+                content_type,
+                body,
+            })
+    }
+
     /// The result of request `id` if it has finished, consuming it; `None`
     /// while it is still in flight (and for an id that was already returned or
     /// never issued).
     pub fn poll(&mut self, id: RequestId) -> Option<(u16, String)> {
+        self.take(id).map(|(status, _, body)| (status, body))
+    }
+
+    fn take(&mut self, id: RequestId) -> Option<Response> {
         let done = self
             .pending
             .get(&id)?
@@ -436,6 +548,7 @@ impl EmbeddedCluster {
 fn unavailable(node: u64, why: &str) -> Response {
     (
         503,
+        DYNAMO_CONTENT_TYPE,
         serde_json::json!({
             "__type": "com.amazon.coral.availability#ServiceUnavailableException",
             "message": format!("node {node} {why}"),
@@ -882,5 +995,108 @@ mod tests {
         let mut c = EmbeddedCluster::new(env_seed(0xE4B0_0009), 3, 3).unwrap();
         c.advance(Duration::from_secs(60));
         assert!(c.cluster.simulator().trace().is_empty());
+    }
+
+    fn http(
+        c: &mut EmbeddedCluster,
+        node: u64,
+        method: &str,
+        path: &str,
+        body: &str,
+    ) -> HttpResponse {
+        let id = c
+            .submit_http(node, method, path, body)
+            .expect("node exists");
+        for _ in 0..3000 {
+            if let Some(r) = c.poll_http(id) {
+                return r;
+            }
+            c.advance(Duration::from_millis(10));
+        }
+        panic!("http request {method} {path} did not finish");
+    }
+
+    #[test]
+    fn console_and_admin_see_a_table_created_over_the_dynamo_wire() {
+        let seed = env_seed(11);
+        let mut c = EmbeddedCluster::new(seed, 3, 3).expect("cluster");
+        let create = r#"{"TableName":"orders","BillingMode":"PAY_PER_REQUEST",
+            "AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
+            "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}]}"#;
+        assert_eq!(run(&mut c, 0, CREATE, create).0, 200, "seed {seed}");
+        let put = r#"{"TableName":"orders","Item":{"id":{"S":"a"},"n":{"N":"1"}}}"#;
+        assert_eq!(run(&mut c, 0, PUT, put).0, 200, "seed {seed}");
+        // The data console lists it from any node, as JSON.
+        for node in 0..3 {
+            let r = http(&mut c, node, "GET", "/console/api/tables", "");
+            assert_eq!(r.status, 200, "seed {seed} node {node}: {}", r.body);
+            assert!(
+                r.body.contains("orders"),
+                "seed {seed} node {node}: {}",
+                r.body
+            );
+            assert_eq!(r.content_type, "application/json");
+        }
+        // ... and scans its items through the console's own endpoint.
+        let r = http(
+            &mut c,
+            1,
+            "POST",
+            "/console/api/tables/orders/items/scan",
+            "{}",
+        );
+        assert_eq!(r.status, 200, "seed {seed}: {}", r.body);
+        assert!(r.body.contains("\"a\""), "seed {seed}: {}", r.body);
+        // The dashboard's admin API answers with cluster state, query included.
+        let r = http(&mut c, 2, "GET", "/admin/status", "");
+        assert_eq!(r.status, 200, "seed {seed}: {}", r.body);
+        assert!(r.body.contains("orders"), "seed {seed}: {}", r.body);
+        let r = http(&mut c, 0, "GET", "/admin/raftkv?x=1", "");
+        assert_eq!(r.status, 200, "seed {seed}: {}", r.body);
+    }
+
+    #[test]
+    fn http_to_unknown_paths_and_down_nodes_is_refused_not_panicking() {
+        let mut c = EmbeddedCluster::new(env_seed(12), 3, 3).expect("cluster");
+        assert_eq!(http(&mut c, 0, "GET", "/nope", "").status, 404);
+        // Static assets are the embedder's, not the cluster's.
+        assert_eq!(http(&mut c, 0, "GET", "/admin/ui/overview", "").status, 404);
+        assert!(c.submit_http(9, "GET", "/admin/status", "").is_err());
+        c.crash(1).expect("crash");
+        assert_eq!(http(&mut c, 1, "GET", "/admin/status", "").status, 503);
+        // Actions the fixture cannot perform answer an error body, never a panic.
+        for (m, p, b) in [
+            ("GET", "/admin/backups", ""),
+            ("GET", "/admin/backup-store", ""),
+            (
+                "POST",
+                "/admin/data/dynamo",
+                r#"{"op":"CreateBackup","payload":{"TableName":"x","BackupName":"b"}}"#,
+            ),
+            ("POST", "/admin/data/dynamo", "not json"),
+            ("POST", "/console/api/tables", "{}"),
+            ("GET", "/console/api/tables/missing", ""),
+        ] {
+            let r = http(&mut c, 0, m, p, b);
+            assert!(r.status < 600, "{m} {p}");
+        }
+    }
+
+    #[test]
+    fn http_results_are_a_function_of_the_seed() {
+        let drive = |seed| {
+            let mut c = EmbeddedCluster::new(seed, 3, 3).expect("cluster");
+            let a = http(&mut c, 0, "GET", "/admin/config", "");
+            let b = http(&mut c, 1, "GET", "/console/api/tables", "");
+            (
+                a.status,
+                a.body,
+                b.status,
+                b.body,
+                c.status().virtual_time_ms,
+            )
+        };
+        let seed = env_seed(13);
+        assert_eq!(drive(seed), drive(seed), "seed {seed}");
     }
 }
