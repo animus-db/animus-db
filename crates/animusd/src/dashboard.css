@@ -83,6 +83,19 @@ header.topbar .brand .logo { flex: none; }
 header.topbar .brand .wordmark { display: flex; align-items: baseline; gap: 9px; }
 header.topbar .brand .name { font-size: 20px; font-family: var(--font-display); font-stretch: var(--display-stretch); font-weight: var(--display-weight); text-transform: uppercase; letter-spacing: 0; }
 header.topbar .brand .env { font: 400 11px var(--font-mono); color: var(--text2); }
+/* Embedded mode: a host shell (the browser demo, ADR 0082) sets `data-embedded` on
+   <html>. The host provides the brand, theme switch and its own framing, so the whole
+   top bar (brand, "no auth" banner, health pill, refresh controls, theme switch) goes;
+   the sidebar stays as the dashboard's real navigation. Nothing changes without it. */
+html[data-embedded] header.topbar { display: none; }
+/* On a narrow host the sidebar becomes a scrolling row above the view. */
+@media (max-width: 640px) {
+  html[data-embedded] .shell { flex-direction: column; }
+  html[data-embedded] .sidebar { width: auto; flex-direction: row; overflow-x: auto; border-right: 0; border-bottom: 1px solid var(--rule); padding: 4px 0; gap: 0; }
+  html[data-embedded] .sidebar button.navlink { white-space: nowrap; margin: 0 8px; }
+  html[data-embedded] .sidebar .spacer, html[data-embedded] .sidebar .sidebar-foot { display: none; }
+  html[data-embedded] main { padding: 16px 14px 40px; }
+}
 header.topbar .banner {
   font: 600 11px var(--font-ui); color: var(--warn); background: var(--warn-bg);
   border-radius: var(--radius); padding: 4px 11px;

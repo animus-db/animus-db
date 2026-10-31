@@ -594,10 +594,19 @@ $("nd-scan-load").addEventListener("click", browseNodeKeys);
 $("nd-key-load").addEventListener("click", inspectNodeKey);
 
 let timer = null;
+// Embedded: poll faster so a host's fault injection shows up quickly; a host may also
+// call the global `loadAll()` to refresh at once.
+if (EMBEDDED) $("auto").value = "2000";
 function arm() {
   if (timer) clearInterval(timer);
   const ms = Number($("auto").value);
-  if (ms > 0) timer = setInterval(loadAll, ms);
+  // Embedded: a host marks a view it is not showing with `data-embedded-hidden` on
+  // <html>; skip the poll then (the host's virtual clock may be paused, and a hidden
+  // view should not generate requests).
+  if (ms > 0) timer = setInterval(() => {
+    if (EMBEDDED && document.documentElement.hasAttribute("data-embedded-hidden")) return;
+    loadAll();
+  }, ms);
 }
 $("auto").addEventListener("change", arm);
 
