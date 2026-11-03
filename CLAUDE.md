@@ -684,12 +684,19 @@ truth; this map is just for navigation.
   `.claude/hooks/session-start.sh` for driving older stacks; drive it
   non-interactively (`gh stack view --json`, `gh stack merge <pr> --yes`) —
   the bare forms open a TUI and block.
-- **A green PR goes into the merge queue without waiting for review**
-  (maintainer decision, 2026-10-10). Once every check on the PR's current
-  head is green and it is mergeable, enable auto-merge so the merge queue
-  takes it. Do not hold it for a human approval. "Green" is the full gate
-  set, with no bypass, per Session operating mode item 4. A red, pending or
-  conflicted PR never enters the queue.
+- **A PR goes into the merge queue without waiting for review**
+  (maintainer decision, 2026-10-10, revised 2026-11-03). Enable auto-merge as
+  soon as the PR is opened; `gates` aggregates every PR check, so the queue
+  only takes a fully green PR. `gates` covers `lint`, `wasm`, `test-archive`,
+  `test-shard`, `test-doc`, `s3-real-endpoint`, `upgrade-previous-release`,
+  `corpus-changed` and `dco` (PR only), and the path-filtered `chaos`, `fuzz`,
+  `image` and `demo-browsers` (PR only, called from `ci.yml`; a skip because
+  the diff cannot reach them is a pass). `prod-liveness` is the second
+  required check. Do not hold it for a human approval. "Green" is the full
+  gate set, with no bypass, per Session operating mode item 4. A red or
+  conflicted PR never merges. A new PR-level check must be added to `gates`'
+  `needs` and its result check, or it is not protecting `main`
+  (`docs/lessons/orchestration/2026-11-03-a-required-aggregate-must-cover-every-pr-check.md`).
 - Don't delete head branches after a PR merges — GitHub auto-deletes them
   (repo setting). Recreating a branch name later for follow-up work is fine.
 - Every distributed behavior lands with a fault-injecting simulation test that

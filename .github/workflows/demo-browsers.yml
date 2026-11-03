@@ -8,24 +8,19 @@
 name: demo-browsers
 
 on:
-  pull_request:
-    paths:
-      - 'website/**'
-      - 'crates/animus-web/**'
-      - 'crates/animusd/**'
-      - 'crates/animus-sim/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'scripts/build-web-demo.sh'
-      - 'scripts/demo-browser-smoke.mjs'
-      - '.github/workflows/demo-browsers.yml'
+  # Pull requests do not trigger this workflow directly: `ci.yml` calls it
+  # (job `demo-browsers`, gated by its `changes` job on the path list that
+  # used to sit here: website/, crates/animus-web, crates/animusd,
+  # crates/animus-sim, Cargo.toml/lock, the two demo scripts and this file),
+  # so the required `gates` aggregate can wait on it.
+  workflow_call:
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: demo-browsers-${{ github.ref }}
+  group: demo-browsers-${{ github.ref }}  # fixed prefix: safe when called from ci.yml
   cancel-in-progress: true
 
 jobs:

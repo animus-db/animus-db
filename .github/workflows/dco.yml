@@ -1,13 +1,19 @@
 name: DCO
 
+# Called from ci.yml (job `dco`, pull_request only) so the required `gates`
+# aggregate can wait on it. In a called workflow `github.event` is the
+# caller's, so `github.event.pull_request.*` below still resolves. It is
+# skipped in `merge_group` (a queue entry has no PR commit range, and the PR's
+# own commits were checked when it was opened).
 on:
-  pull_request:
-    types: [opened, synchronize, reopened]
+  workflow_call:
 
 # One check per PR; a rapid re-push supersedes the run still in flight, which
-# is only re-reading the same commit range.
+# is only re-reading the same commit range. NOT `${{ github.workflow }}`: in a
+# called workflow that is the caller's name ("CI"), which would collide with
+# ci.yml's own concurrency group.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: dco-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:

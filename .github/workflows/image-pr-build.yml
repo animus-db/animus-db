@@ -1,0 +1,79 @@
+name: image-pr-build
+
+# The pull-request half of image.yml: proves the animusd and animus-operator
+# images still build and start (amd64 only, nothing is pushed, no registry
+# credentials, read-only token). Reusable only: ci.yml calls it as job `image`
+# when its `changes` job sees a diff that can reach the images, so the
+# required `gates` aggregate can wait on it. Keep the build/smoke steps in
+# step with image.yml's `build` job (the push-side twin).
+on:
+  workflow_call:
+
+# Fixed prefix, NOT `${{ github.workflow }}`: in a called workflow that is the
+# caller's name ("CI"), which would collide with ci.yml's own group.
+concurrency:
+  group: image-pr-build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build (${{ matrix.image }}, ${{ matrix.suffix }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: animus-db/animusd
+            target: runtime
+            platform: linux/amd64
+            suffix: amd64
+          - image: animus-db/animus-operator
+            target: runtime-operator
+            platform: linux/amd64
+            suffix: amd64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Compute image labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ matrix.image }}
+
+      # Same gha cache scope as image.yml's `build`, so a PR reuses main's layers.
+      - name: Build (load locally)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: ${{ matrix.target }}
+          platforms: ${{ matrix.platform }}
+          load: true
+          tags: animus-smoke:${{ matrix.target }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.target }}-${{ matrix.suffix }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.target }}-${{ matrix.suffix }}
+
+      # See image.yml's identical step for why this output check proves the
+      # binary loaded (builder/runtime glibc skew).
+      - name: Smoke-start the image
+        run: |
+          set -euo pipefail
+          case "${{ matrix.target }}" in
+            runtime)
+              out="$(docker run --rm animus-smoke:runtime --help 2>&1 || true)"
+              grep -q '^usage:' <<<"$out" \
+                || { echo "animusd did not print its usage line:"; printf '%s\n' "$out" | head -5; exit 1; }
+              ;;
+            runtime-operator)
+              out="$(docker run --rm animus-smoke:runtime-operator crd 2>&1 || true)"
+              grep -q 'kind: CustomResourceDefinition' <<<"$out" \
+                || { echo "animus-operator did not print its CRD:"; printf '%s\n' "$out" | head -5; exit 1; }
+              ;;
+          esac

@@ -26,13 +26,10 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - ".github/workflows/fuzz.yml"
-  pull_request:
-    paths:
-      - "crates/**"
-      - "fuzz/**"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - ".github/workflows/fuzz.yml"
+  # Pull requests do not trigger this workflow directly: `ci.yml` calls it
+  # (job `fuzz`, gated by its `changes` job on the same path list as `push`
+  # above), so the required `gates` aggregate can wait on it.
+  workflow_call:
   schedule:
     # 04:17 UTC nightly, after corpus-deep (03:17), off the hour.
     - cron: "17 4 * * *"
@@ -43,8 +40,10 @@ on:
         required: false
         default: "1200"
 
+# NOT `${{ github.workflow }}`: in a called workflow that is the CALLER's name
+# ("CI"), which would collide with ci.yml's own concurrency group.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: fuzz-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
