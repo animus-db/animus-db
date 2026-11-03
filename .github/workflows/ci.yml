@@ -11,6 +11,13 @@ name: CI
 # PR merged onto the latest `main`), so the queue's required checks (`gates`,
 # `prod-liveness`) report on exactly what will land. Without it a required
 # check never starts for a queued PR and the entry times out.
+#
+# `gates` is an aggregate over EVERY pull-request check (the job comment on
+# `gates` lists which are required, PR-only or path-filtered), so auto-merge
+# can be enabled the moment a PR opens: the queue only takes a fully green one.
+# The chaos, fuzz, image, demo-browsers and DCO checks live in their own
+# workflow files and are CALLED from here (`workflow_call`), because a
+# path-filtered workflow cannot be required directly.
 on:
   push:
     branches: [main]
@@ -48,8 +55,9 @@ jobs:
   # building/testing the rest of the workspace, and were starving here one
   # distinct victim per run (issues #280/#286).
   #
-  # `gates` is a thin aggregate over four parallel jobs (`lint`,
-  # `test-archive` -> `test-shard`, `test-doc`), the same shape as
+  # `gates` is a thin aggregate over every PR check (see its own comment; the
+  # compile/test core is `lint`, `wasm`, `test-archive` -> `test-shard`,
+  # `test-doc`), the same shape as
   # `prod-liveness` below, for the same reason: branch protection names one
   # required check, "gates", and that name has to keep resolving to a single
   # job. Before this split `gates` was one serial job (fmt, clippy, build,
@@ -57,24 +65,178 @@ jobs:
   # cargo-nextest and every compile job shares an sccache compile cache.
   gates:
     name: gates
-    needs: [lint, wasm, test-shard, test-doc]
+    needs:
+      - changes
+      - lint
+      - wasm
+      - test-archive
+      - test-shard
+      - test-doc
+      - corpus-changed
+      - s3-real-endpoint
+      - upgrade-previous-release
+      - chaos
+      - fuzz
+      - image
+      - demo-browsers
+      - dco
     if: always()
     runs-on: ubuntu-latest
     steps:
+      # `gates` is the ONE required check besides `prod-liveness` (the `main`
+      # ruleset names only those two), so it must fail when ANY pull-request
+      # check fails: that is what makes it safe to enable auto-merge the moment
+      # a PR opens. A `needs` result is `success`, `failure`, `cancelled` or
+      # `skipped`; "skipped" is a pass ONLY where the skip is intentional
+      # (this event or diff does not call the job) and is a failure anywhere
+      # else, because a job is also "skipped" when something it needs failed.
+      #
+      #   always required, every event: changes, lint, wasm, test-archive,
+      #     test-shard, test-doc, s3-real-endpoint, upgrade-previous-release.
+      #   pull_request only (skipped on push and merge_group, which pass):
+      #     corpus-changed (corpus-select is PR-only; the nightly-depth corpora
+      #     never ran in the queue), dco (a queue entry has no PR commit range).
+      #   pull_request and path-filtered (skipped when `changes` says the diff
+      #     cannot reach them, or in merge_group, which pass): chaos, fuzz,
+      #     image, demo-browsers. They were never merge_group jobs: the queue
+      #     entry is the PR plus later `main` commits, and `lint`/`test-*` build
+      #     it again, so repeating ~10 minute real-process/fuzz/image jobs would
+      #     only lengthen the one-at-a-time queue.
+      #   `prod-liveness` is deliberately NOT here: it is required separately.
       - name: Check gate results
+        env:
+          EVENT: ${{ github.event_name }}
+          CHANGES: ${{ needs.changes.result }}
+          LINT: ${{ needs.lint.result }}
+          WASM: ${{ needs.wasm.result }}
+          ARCHIVE: ${{ needs.test-archive.result }}
+          SHARDS: ${{ needs.test-shard.result }}
+          DOC: ${{ needs.test-doc.result }}
+          CORPUS: ${{ needs.corpus-changed.result }}
+          S3: ${{ needs.s3-real-endpoint.result }}
+          UPGRADE: ${{ needs.upgrade-previous-release.result }}
+          CHAOS: ${{ needs.chaos.result }}
+          FUZZ: ${{ needs.fuzz.result }}
+          IMAGE: ${{ needs.image.result }}
+          DEMO: ${{ needs.demo-browsers.result }}
+          DCO: ${{ needs.dco.result }}
+          WANT_CHAOS: ${{ needs.changes.outputs.chaos }}
+          WANT_FUZZ: ${{ needs.changes.outputs.fuzz }}
+          WANT_IMAGE: ${{ needs.changes.outputs.image }}
+          WANT_DEMO: ${{ needs.changes.outputs.demo }}
         run: |
-          lint="${{ needs.lint.result }}"
-          shards="${{ needs.test-shard.result }}"
-          doc="${{ needs.test-doc.result }}"
-          wasm="${{ needs.wasm.result }}"
-          echo "lint (fmt, fixtures, clippy, build, deny): ${lint}"
-          echo "test-shard (all shards): ${shards}"
-          echo "test-doc: ${doc}"
-          echo "wasm (browser build): ${wasm}"
-          if [ "${wasm}" != "success" ] || [ "${lint}" != "success" ] || [ "${shards}" != "success" ] || [ "${doc}" != "success" ]; then
+          fail=0
+          # require <name> <result> <want>: want=true -> must be success;
+          # want=false -> must have been skipped on purpose (success tolerated).
+          require() {
+            name="$1"; result="$2"; want="$3"
+            if [ "${want}" = "true" ]; then
+              ok=$([ "${result}" = "success" ] && echo yes || echo no)
+              note="required"
+            else
+              ok=$([ "${result}" = "success" ] || [ "${result}" = "skipped" ] && echo yes || echo no)
+              note="not applicable here, skip is a pass"
+            fi
+            echo "${name}: ${result} (${note})"
+            if [ "${ok}" != "yes" ]; then
+              echo "::error::${name} is ${result}"
+              fail=1
+            fi
+          }
+
+          pr=false
+          [ "${EVENT}" = "pull_request" ] && pr=true
+
+          require changes "${CHANGES}" true
+          require lint "${LINT}" true
+          require wasm "${WASM}" true
+          require test-archive "${ARCHIVE}" true
+          require test-shard "${SHARDS}" true
+          require test-doc "${DOC}" true
+          require s3-real-endpoint "${S3}" true
+          require upgrade-previous-release "${UPGRADE}" true
+          require corpus-changed "${CORPUS}" "${pr}"
+          require dco "${DCO}" "${pr}"
+          # The path filters are only computed (non-false) for a pull_request.
+          require chaos "${CHAOS}" "$([ "${pr}" = true ] && echo "${WANT_CHAOS}" || echo false)"
+          require fuzz "${FUZZ}" "$([ "${pr}" = true ] && echo "${WANT_FUZZ}" || echo false)"
+          require image "${IMAGE}" "$([ "${pr}" = true ] && echo "${WANT_IMAGE}" || echo false)"
+          require demo-browsers "${DEMO}" "$([ "${pr}" = true ] && echo "${WANT_DEMO}" || echo false)"
+
+          if [ "${fail}" != 0 ]; then
             echo "::error::one or more gates jobs failed"
             exit 1
           fi
+
+  # Which PR-only workflows apply to this diff. `paths:` filters do not apply
+  # to `workflow_call`, and a path-filtered workflow cannot be a required check
+  # (an unrelated PR never reports it), so the filters live in
+  # scripts/ci-changes.sh and the workflows are called from the jobs below.
+  # Runs on every event (outputs are all false except on a pull_request) so
+  # `gates` can always require it to have succeeded.
+  changes:
+    name: changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      chaos: ${{ steps.filter.outputs.chaos }}
+      fuzz: ${{ steps.filter.outputs.fuzz }}
+      image: ${{ steps.filter.outputs.image }}
+      demo: ${{ steps.filter.outputs.demo }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Compute path filters
+        id: filter
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          if [ "${EVENT}" = "pull_request" ]; then
+            scripts/ci-changes.sh "origin/${BASE_REF}" | tee -a "$GITHUB_OUTPUT"
+          else
+            scripts/ci-changes.sh --none | tee -a "$GITHUB_OUTPUT"
+          fi
+
+  # The called workflows below are PR-only. Each keeps its own push / schedule /
+  # workflow_dispatch triggers, and a fixed-prefix concurrency group so it never
+  # shares (and cancels) this workflow's group.
+  chaos:
+    name: chaos
+    needs: changes
+    if: github.event_name == 'pull_request' && needs.changes.outputs.chaos == 'true'
+    uses: ./.github/workflows/chaos.yml
+
+  fuzz:
+    name: fuzz
+    needs: changes
+    if: github.event_name == 'pull_request' && needs.changes.outputs.fuzz == 'true'
+    uses: ./.github/workflows/fuzz.yml
+
+  # The images' "does it still build and start" proof. image.yml itself now
+  # only runs on `push` (it publishes); see image-pr-build.yml for why this is
+  # a separate reusable file.
+  image:
+    name: image
+    needs: changes
+    if: github.event_name == 'pull_request' && needs.changes.outputs.image == 'true'
+    uses: ./.github/workflows/image-pr-build.yml
+
+  demo-browsers:
+    name: demo-browsers
+    needs: changes
+    if: github.event_name == 'pull_request' && needs.changes.outputs.demo == 'true'
+    uses: ./.github/workflows/demo-browsers.yml
+
+  # Every commit of the PR needs a sign-off; always checked on a PR, no path
+  # filter. Skipped in merge_group (a queue entry has no PR commit range).
+  dco:
+    name: dco
+    if: github.event_name == 'pull_request'
+    uses: ./.github/workflows/dco.yml
 
   lint:
     name: lint
@@ -856,8 +1018,8 @@ jobs:
   # panic. The server is RustFS (the same pinned image and settings as
   # `scripts/e2e-kind.sh`; MinIO images stopped resolving, issue #863), and
   # the bucket is created by a SigV4-signed curl PUT (no image, #1312). Credentials
-  # are throwaway, for this one ephemeral container only. Not part of the
-  # `gates`/`prod-liveness` aggregates.
+  # are throwaway, for this one ephemeral container only. Required via the
+  # `gates` aggregate (its `needs` list).
   s3-real-endpoint:
     name: s3-real-endpoint
     runs-on: ubuntu-latest
@@ -967,9 +1129,8 @@ jobs:
   # `ANIMUS_UPGRADE_FROM_BIN` panics instead of skipping.
   #
   # Runs on `pull_request`, `push` to main and `merge_group` like every job in
-  # this file. It is deliberately NOT folded into the `prod-liveness` aggregate
-  # (same shape as `s3-real-endpoint`): adding it to the required checks is a
-  # repo-ruleset decision, made once it has a green track record on `main`.
+  # this file. It is covered by the `gates` aggregate (its `needs` list), not
+  # `prod-liveness`, so a red run blocks the merge queue.
   # Cutting a release means moving `scripts/upgrade-from.txt` to the previous
   # tag and getting this job green BEFORE tagging (docs/release.md).
   upgrade-previous-release:

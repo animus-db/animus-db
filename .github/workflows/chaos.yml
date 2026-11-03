@@ -5,12 +5,14 @@ name: chaos
 # (kill -9, SIGSTOP, a userspace loopback fault proxy for partitions/delay),
 # the animus-test oracles over the recorded history.
 #
-# NOT a required check. A red run here is a finding (the sim corpora are the
+# Not itself a required check, but on a pull request `ci.yml`'s required
+# `gates` aggregate fails if it is red. A red run here is a finding (the sim corpora are the
 # correctness proof; this checks the ProdEnv seams), so a failure must be
 # triaged, never retried or quarantined: see docs/chaos.md "When it fails".
 #
-#   - pull_request / push: the ~3 minute smoke (one control-leader kill + one
-#     partition), path-filtered to the surfaces it exercises.
+#   - pull_request (called from ci.yml, which path-filters it) / push: the
+#     ~3 minute smoke (one control-leader kill + one partition), path-filtered
+#     to the surfaces it exercises.
 #   - the `chaos-disk-full` job (pull_request / push, same path filters): the
 #     disk-full scenario (issue #1221) on real size-limited tmpfs mounts, which
 #     needs `sudo mount` (CAP_SYS_ADMIN); ANIMUS_CHAOS_REQUIRE_MOUNT=1 makes a
@@ -43,15 +45,17 @@ on:
       - "crates/animusd/tests/chaos_support/**"
       - "crates/animusd/Cargo.toml"
       - ".github/workflows/chaos.yml"
-  pull_request:
-    paths:
-      - "crates/animusd/tests/chaos.rs"
-      - "crates/animusd/tests/chaos_support/**"
-      - "crates/animusd/Cargo.toml"
-      - ".github/workflows/chaos.yml"
+  # Pull requests do not trigger this workflow directly: `ci.yml` calls it
+  # (job `chaos`, gated by its `changes` job on the same path list as `push`
+  # above), so the `gates` aggregate can wait on it. A `paths:` filter on a
+  # `pull_request` trigger would leave a required check that never reports.
+  workflow_call:
 
+# NOT `${{ github.workflow }}`: in a called workflow that is the CALLER's name
+# ("CI"), which would put this run in ci.yml's own concurrency group and
+# cancel (or be cancelled by) it. A fixed prefix keeps the group separate.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: chaos-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:

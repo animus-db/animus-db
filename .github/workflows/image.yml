@@ -1,11 +1,16 @@
 name: image
 
-# Builds the animusd and animus-operator container images on every push/PR
-# that could affect them (both are stages of the same root Dockerfile, see
-# its own header). A PR run only proves the images still build (no registry
-# credentials are available to a `pull_request` event anyway); pushes to
-# `main` and version tags additionally push to GHCR so `main` and tagged
-# releases always have a corresponding image for both.
+# Builds the animusd and animus-operator container images on every push to
+# `main` / version tag that could affect them (both are stages of the same
+# root Dockerfile, see its own header), and pushes them to GHCR so `main` and
+# tagged releases always have a corresponding image for both.
+#
+# Pull requests do NOT trigger this workflow: the PR-only "do the images still
+# build" proof is the reusable `image-pr-build.yml`, which ci.yml calls (job
+# `image`, path-filtered by its `changes` job) so the required `gates`
+# aggregate can wait on it. It is a separate file because a reusable
+# workflow's jobs may not request more permissions than their caller grants,
+# and this file's `build`/`merge` jobs need `packages: write`/`id-token: write`.
 #
 # Multi-arch, signed, attested (docs/release.md). Structure:
 #   build - one leg per (image, platform). amd64 always; arm64 only on a `v*`
@@ -40,26 +45,12 @@ name: image
 # only ever proved the *images* build, and none of these paths reach them.
 # A `#[cfg(test)]` module living anywhere else under `src/` still triggers
 # a build — the filter is by path, not by cfg, so it stays conservative.
-# Both event blocks must list identical patterns (GitHub applies them per
-# event and negations only take effect against an earlier positive match).
+# The same path list is mirrored, as a `git diff` filter, by the `changes`
+# job in ci.yml (see its `image` output): keep the two in step.
 on:
   push:
     branches: [main]
     tags: ["v*"]
-    paths:
-      - "Dockerfile"
-      - ".dockerignore"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "crates/**"
-      - "!crates/**/tests/**"
-      - "!crates/**/benches/**"
-      - "!crates/animus-sim/**"
-      - "!crates/animus-test/**"
-      - "!crates/animusd/src/sim_cluster*.rs"
-      - "!crates/*/CLAUDE.md"
-      - ".github/workflows/image.yml"
-  pull_request:
     paths:
       - "Dockerfile"
       - ".dockerignore"
