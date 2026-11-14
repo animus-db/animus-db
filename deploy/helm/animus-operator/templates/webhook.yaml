@@ -1,0 +1,81 @@
+{{- if .Values.webhook.enabled }}
+{{- if and (not .Values.webhook.certManager.enabled) (not .Values.webhook.caBundle) }}
+{{- fail "webhook.enabled needs a certificate source: set webhook.certManager.enabled=true with webhook.certManager.issuerRef.name, or provide an existing kubernetes.io/tls Secret (webhook.tlsSecretName) together with webhook.caBundle (base64 CA certificate)" }}
+{{- end }}
+{{- if and .Values.webhook.certManager.enabled (not .Values.webhook.certManager.issuerRef.name) }}
+{{- fail "webhook.certManager.enabled needs webhook.certManager.issuerRef.name" }}
+{{- end }}
+{{- $svc := include "animus-operator.webhookServiceName" . }}
+{{- $ns := .Release.Namespace }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $svc }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "animus-operator.labels" . | nindent 4 }}
+spec:
+  selector:
+    {{- include "animus-operator.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: webhook
+      port: 443
+      targetPort: webhook
+{{- if .Values.webhook.certManager.enabled }}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ include "animus-operator.webhookCertName" . }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "animus-operator.labels" . | nindent 4 }}
+spec:
+  secretName: {{ include "animus-operator.webhookTlsSecretName" . }}
+  commonName: {{ $svc }}
+  dnsNames:
+    - {{ $svc }}
+    - {{ $svc }}.{{ $ns }}
+    - {{ $svc }}.{{ $ns }}.svc
+    - {{ $svc }}.{{ $ns }}.svc.cluster.local
+  issuerRef:
+    name: {{ .Values.webhook.certManager.issuerRef.name }}
+    kind: {{ .Values.webhook.certManager.issuerRef.kind }}
+    {{- with .Values.webhook.certManager.issuerRef.group }}
+    group: {{ . }}
+    {{- end }}
+  usages: ["server auth", "client auth"]
+  isCA: false
+{{- end }}
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: {{ include "animus-operator.fullname" . }}-validating-webhook
+  labels:
+    {{- include "animus-operator.labels" . | nindent 4 }}
+  {{- if .Values.webhook.certManager.enabled }}
+  annotations:
+    cert-manager.io/inject-ca-from: {{ $ns }}/{{ include "animus-operator.webhookCertName" . }}
+  {{- end }}
+webhooks:
+  - name: validate.animuscluster.animusdb.io
+    admissionReviewVersions: ["v1"]
+    sideEffects: None
+    # A webhook the API server cannot reach blocks every AnimusCluster write
+    # (ADR 0070): deliberate.
+    failurePolicy: Fail
+    timeoutSeconds: 5
+    rules:
+      - apiGroups: ["animusdb.io"]
+        apiVersions: ["v1alpha1"]
+        resources: ["animusclusters"]
+        operations: ["CREATE", "UPDATE"]
+    clientConfig:
+      service:
+        name: {{ $svc }}
+        namespace: {{ $ns }}
+        path: /validate
+        port: 443
+      caBundle: {{ .Values.webhook.caBundle | default "" | quote }}
+{{- end }}

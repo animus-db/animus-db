@@ -1,0 +1,108 @@
+# Default values for the animus-operator chart. Nothing here makes the chart
+# phone home: AnimusDB ships no telemetry and neither does this chart.
+
+# -- The operator image (published by .github/workflows/image.yml).
+image:
+  repository: ghcr.io/animus-db/animus-operator
+  # Empty means the chart's appVersion (for example 0.1.0-alpha.0). Until the
+  # first release tag is cut that tag does not exist in the registry yet:
+  # install with --set image.tag=latest (the main-branch build).
+  tag: ""
+  pullPolicy: IfNotPresent
+
+# -- Secrets for pulling the image from a private registry.
+imagePullSecrets: []
+
+# -- Override the chart name used in object names (labels keep
+# app.kubernetes.io/name=animus-operator regardless: the operator's own
+# NetworkPolicy selects its pod by that label).
+nameOverride: ""
+# -- Override the full object name prefix.
+fullnameOverride: ""
+
+serviceAccount:
+  # -- Create the ServiceAccount.
+  create: true
+  # -- Name to use; empty means the release fullname (or "default" when
+  # create is false).
+  name: ""
+  # -- Annotations, for example an IRSA / workload-identity binding.
+  annotations: {}
+
+rbac:
+  # -- Create the ClusterRole and ClusterRoleBinding. The rules are identical to
+  # deploy/operator/rbac.yaml. Turn off only if you provision equivalent RBAC
+  # yourself.
+  create: true
+
+# -- How the operator reaches a pod's admin port (scale-down drain, roll
+# gating): "proxy" goes through the API server's pod-proxy subresource (default,
+# works everywhere); "direct" dials the pod and needs pod-network reachability
+# from the operator pod. NOTE: "direct" additionally requires the operator to
+# run in the namespace "animus-operator", because the generated cluster
+# NetworkPolicy admits that namespace by name (a constant in the operator).
+adminAccess: proxy
+
+# -- Extra command-line arguments appended after `run`.
+extraArgs: []
+
+# -- The operator is a single replica (no leader election), so this chart does
+# not expose a replica count.
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+# -- Extra pod labels / annotations.
+podLabels: {}
+podAnnotations: {}
+
+# -- Pod-level security context. The image runs as uid/gid 1000.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  seccompProfile:
+    type: RuntimeDefault
+
+# -- Container security context. The operator writes nothing to its own
+# filesystem (it only talks to the API server), so the root filesystem is
+# read-only.
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+priorityClassName: ""
+
+# Optional validating admission webhook for AnimusCluster (ADR 0070). Rejects an
+# invalid spec at the API server instead of surfacing a status condition. It
+# uses failurePolicy: Fail: while the operator pod is down, AnimusCluster
+# writes are refused. Needs one of the two certificate sources below.
+webhook:
+  enabled: false
+  # -- Name of the kubernetes.io/tls Secret mounted at /etc/animus/webhook.
+  # Empty means <fullname>-webhook-tls. With certManager enabled the Certificate
+  # writes this Secret; otherwise create it yourself in the release namespace.
+  tlsSecretName: ""
+  # -- Base64 PEM CA certificate for the API server to trust the webhook
+  # (`base64 -w0 ca.crt`). Required when certManager is not used; with
+  # cert-manager the cainjector fills it in.
+  caBundle: ""
+  certManager:
+    # -- Render a cert-manager Certificate and inject its CA into the
+    # ValidatingWebhookConfiguration. cert-manager must already be installed.
+    enabled: false
+    issuerRef:
+      # -- An existing Issuer/ClusterIssuer (this chart never creates one).
+      name: ""
+      kind: ClusterIssuer
+      group: ""

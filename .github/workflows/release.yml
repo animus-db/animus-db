@@ -8,7 +8,9 @@ name: release
 #   2. build   - linux/amd64 + linux/arm64 release binaries, built in the same
 #                `rust:1.96-bookworm` image the Dockerfile uses so the glibc
 #                floor (2.36) matches the container runtime stage.
-#   3. publish - SBOM (CycloneDX), changelog section (git-cliff), cosign
+#   3. charts  - package both Helm charts (deploy/helm/) at the tag's version
+#                and push them to oci://ghcr.io/animus-db/charts.
+#   4. publish - SBOM (CycloneDX), changelog section (git-cliff), cosign
 #                keyless `sign-blob` of every artifact, GitHub build
 #                provenance attestation, then the GitHub release.
 #
@@ -103,6 +105,48 @@ jobs:
           name: dist-${{ matrix.arch }}
           path: dist/*.tar.gz
           if-no-files-found: error
+
+  # Helm charts as OCI artifacts. Chart version and appVersion both become the
+  # tag's version (v stripped), so `helm install ... --version X` pulls the
+  # animusd/animus-operator image tag X that image.yml pushes on the same tag.
+  # Not exercised by a real tag push yet.
+  charts:
+    name: publish helm charts
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write # push to ghcr.io/animus-db/charts
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.16.4
+
+      - name: Install the schema-check dependencies
+        run: python3 -m pip install --user pyyaml jsonschema
+
+      - name: Check the charts
+        run: scripts/check-helm-charts.sh
+
+      - name: Log in to ghcr.io
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: echo "${GH_TOKEN}" | helm registry login ghcr.io --username "${GITHUB_ACTOR}" --password-stdin
+
+      - name: Package and push
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist-charts
+          for chart in animus-operator animus-cluster; do
+            helm package "deploy/helm/${chart}" --version "${VERSION}" --app-version "${VERSION}" --destination dist-charts
+            helm push "dist-charts/${chart}-${VERSION}.tgz" oci://ghcr.io/animus-db/charts
+          done
 
   publish:
     name: sign and publish

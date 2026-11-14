@@ -1,0 +1,92 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "animus-operator.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "animus-operator.labels" . | nindent 4 }}
+spec:
+  # Fixed at 1: the operator has no leader election, so a second replica would
+  # run a second reconcile loop over the same objects.
+  replicas: 1
+  strategy:
+    # Recreate, so the old and new controller never reconcile concurrently
+    # during an upgrade (no leader election).
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "animus-operator.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "animus-operator.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "animus-operator.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . | quote }}
+      {{- end }}
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: animus-operator
+          image: {{ include "animus-operator.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - "run"
+            - {{ printf "--admin-access=%s" .Values.adminAccess | quote }}
+            {{- if .Values.webhook.enabled }}
+            - "--webhook-addr=0.0.0.0:9443"
+            - "--webhook-cert=/etc/animus/webhook/tls.crt"
+            - "--webhook-key=/etc/animus/webhook/tls.key"
+            {{- end }}
+            {{- range .Values.extraArgs }}
+            - {{ . | quote }}
+            {{- end }}
+          {{- if .Values.webhook.enabled }}
+          ports:
+            - name: webhook
+              containerPort: 9443
+          volumeMounts:
+            - name: webhook-tls
+              mountPath: /etc/animus/webhook
+              readOnly: true
+          {{- end }}
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      {{- if .Values.webhook.enabled }}
+      volumes:
+        - name: webhook-tls
+          secret:
+            secretName: {{ include "animus-operator.webhookTlsSecretName" . }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

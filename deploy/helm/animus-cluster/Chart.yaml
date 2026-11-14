@@ -1,0 +1,12 @@
+apiVersion: v2
+name: animus-cluster
+description: One AnimusDB cluster (an AnimusCluster custom resource) for the animus-operator chart to run.
+type: application
+version: 0.1.0
+# Must equal the workspace version in Cargo.toml (scripts/check-helm-charts.sh
+# enforces it); the release workflow overrides both on a v* tag.
+appVersion: "0.1.0-alpha.0"
+home: https://github.com/animus-db/animus-db
+sources:
+  - https://github.com/animus-db/animus-db
+keywords: [animusdb, dynamodb, database, cluster]

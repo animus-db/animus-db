@@ -1,0 +1,836 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: animusclusters.animusdb.io
+spec:
+  group: animusdb.io
+  names:
+    kind: AnimusCluster
+    plural: animusclusters
+    shortNames:
+    - adbc
+    singular: animuscluster
+  scope: Namespaced
+  versions:
+  - name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for AnimusClusterSpec via `CustomResource`
+        properties:
+          spec:
+            description: '`AnimusCluster.spec` — the desired state of one AnimusDB cluster.'
+            properties:
+              allowInsecurePeers:
+                description: |-
+                  **Dev only.** Permit cross-cluster MREC traffic with no `spec.tls`
+                  (maps to `cluster_settings.allow_insecure_peers`): the peer link is
+                  then unauthenticated and unencrypted. Without it a spec with `peers`
+                  and no `tls` is refused (`PeersSpecInvalid`).
+                nullable: true
+                type: boolean
+              autoSplitBytes:
+                description: |-
+                  The scoped-bytes threshold that auto-splits a led tablet (ADR 0034).
+                  **S-06**: like `quiesce_after_secs` above, now emitted into the
+                  generated `cluster.json`'s `cluster_settings.auto_split_bytes`
+                  section rather than a CLI flag — `--auto-split-bytes` itself only
+                  ever existed on the dev-only `--cluster N` in-process mode, so this
+                  field went from **never wired into `entrypoint.sh` at all** to
+                  reaching every pod (combined and data-role) through the config file
+                  instead.
+                format: uint64
+                minimum: 0.0
+                nullable: true
+                type: integer
+              background:
+                description: |-
+                  Node-local background-work limits (ADR 0081). Every field is an
+                  **explicit** operator choice; nothing here is derived from the pod's
+                  resource requests or the volume (the operator cannot know the disk's
+                  bandwidth). Additive and skipped when unset.
+                nullable: true
+                properties:
+                  compactionIoMibPerSec:
+                    description: |-
+                      The node-wide compaction write budget in MiB per second (rendered into
+                      `cluster_settings.bg_compaction_io_bytes_per_sec`, MiB x 2^20). It is a
+                      token bucket with debt that paces the bytes compaction writes; flush is
+                      never delayed and an L0 build-up past twice the compaction trigger
+                      overrides it. **Never derived**: the operator cannot know the volume's
+                      bandwidth, so unset (or `0`) leaves the limit off, which is the node's
+                      default. Size it below the sustained write bandwidth the pod's volume
+                      delivers, leaving room for the WAL and flush.
+                    format: uint64
+                    minimum: 0.0
+                    nullable: true
+                    type: integer
+                type: object
+              backupStore:
+                description: |-
+                  The **non-S3** `--backup-store` value for every combined-role pod
+                  (S-07b, closing `docs/roadmap.md`'s S-07 item b — `spec.s3` above is
+                  the CRD surface for an `s3://...` URI specifically). Accepts exactly
+                  `"cluster"` (the default K-replicated store, spelled out — the same
+                  literal keyword `animusd`'s own `--backup-store cluster` accepts) or
+                  `"fs:<absolute path>"`, where `<path>` must live under the pod's own
+                  data volume (`crate::desired::cluster_config::DATA_DIR`) to persist
+                  — see [`AnimusClusterSpec::validate_store_spec`]. `None` (default)
+                  leaves `--backup-store` unset, i.e. `animusd`'s own default
+                  (`cluster`) — byte-for-byte the pre-S-07b behavior. Mutually
+                  exclusive with `spec.s3.backupStore`: set at most one.
+                nullable: true
+                type: string
+              basePort:
+                description: |-
+                  The first of the six-port stride every pod binds
+                  (`base_port + {internal:0, client:1, dynamo:2, admin:3, intra:4,
+                  console:5}`). Defaults to [`DEFAULT_BASE_PORT`](Self::DEFAULT_BASE_PORT).
+                format: int32
+                nullable: true
+                type: integer
+              campaignMaxInflight:
+                description: |-
+                  Per-node cap on simultaneously active Raft campaigns across the
+                  data-plane groups a node hosts (ADR 0078 step 3, the
+                  `CampaignGovernor`). Emitted into `cluster.json`'s
+                  `cluster_settings.campaign_max_inflight`. `None` (default) leaves the
+                  node's own default (32); `0` disables the governor. Additive and
+                  skipped when unset, so an existing spec's `cluster.json` is
+                  byte-identical.
+                format: uint64
+                minimum: 0.0
+                nullable: true
+                type: integer
+              clientService:
+                default: {}
+                description: The client-facing dynamo port's own `Service`.
+                properties:
+                  type:
+                    description: |-
+                      `Service.spec.type` — `ClusterIP` (default), `LoadBalancer`, or
+                      `NodePort`.
+                    nullable: true
+                    type: string
+                type: object
+              controlNodes:
+                description: |-
+                  How many of the leading pods (ordinals `0..controlNodes`) run the
+                  combined control+data role (`NodeRole::Both`); the rest run
+                  data-only (`NodeRole::Data`). Defaults to `min(3, nodes)`.
+                  **Grow-only since S-07d (ADR 0060's 2026-09-06 amendment)**: an
+                  increase is honored — the controller drives ADR 0037's
+                  `control/member/add` against the newly-promoted ordinals, one voter
+                  at a time, resuming idempotently from `GET /admin/control/members`
+                  truth across restarts (see `crate::controller`'s own growth
+                  machinery doc). A **decrease** is rejected — by the validating
+                  webhook at write time when installed (`crate::webhook`, S-07e/ADR
+                  0070), and always by the reconciler too (a status condition,
+                  [`CONDITION_CONTROL_NODES_SHRINK_REJECTED`], is set; the field's
+                  last-achieved value keeps governing the cluster) — since control
+                  voters can only be removed one at a time through their own careful
+                  quorum-loss checks (ADR 0037 §2), never inferred from a bare spec
+                  edit. An increase above `spec.nodes` is rejected the same way a
+                  `spec.nodes` decrease below `controlNodes` already is.
+                format: int32
+                nullable: true
+                type: integer
+              dynamoAuthSecretName:
+                description: |-
+                  Name of a `Secret` (in the same namespace) holding the DynamoDB
+                  SigV4 credential store (`{"credentials": {"AKID...": "secret...",
+                  ...}}`, ADR 0057). Mounted read-only at `/etc/animus/dynamo-auth/`
+                  and passed as `--dynamo-auth /etc/animus/dynamo-auth/credentials.json`
+                  to every pod (both roles accept the flag).
+                nullable: true
+                type: string
+              encryptionKeySecretName:
+                description: |-
+                  Name of a pre-existing `Secret` (same namespace) holding the AEAD
+                  data-at-rest encryption key (ADR 0069, S-03 PR 3) under one
+                  well-known data key,
+                  [`crate::desired::cluster_config::ENCRYPTION_KEY_SECRET_DATA_KEY`]
+                  (`"key"`) — the 64-hex-character format `animus_env::EncryptionKey::
+                  load_from_file` parses (`openssl rand -hex 32 > key.hex` generates
+                  one). **This operator never generates, inspects, or stores key
+                  material itself** — the Secret is entirely user-provisioned; see
+                  `crate::controller`'s reconcile for the live existence/data-key
+                  presence check surfaced as
+                  [`CONDITION_ENCRYPTION_KEY_SECRET_INVALID`].
+
+                  Mounted read-only, `defaultMode` restricted, at
+                  [`crate::desired::cluster_config::ENCRYPTION_KEY_MOUNT_DIR`] on
+                  every pod (one shared Secret, the same idiom `tls`/
+                  `dynamoAuthSecretName`/`s3` already use) and threaded into the
+                  generated `cluster.json`'s `RoleAddrs::encryption_key_path` for
+                  every node — mirroring `spec.tls`'s own `RoleAddrs.tls` wiring,
+                  **never** an `--encryption-key` CLI flag: ADR 0069 PR 1's flag
+                  reaches only `--config FILE --node I`/`--cluster N`, and the
+                  config-file route this field uses already reaches every role this
+                  operator's `entrypoint.sh` ever execs. `None` (default) leaves
+                  every pod's data directory plaintext, byte-for-byte pre-S-03-PR-3
+                  behavior.
+
+                  **No key rotation in v1** (ADR 0069's own stance — there is no
+                  in-place re-encryption mechanism to roll a running pod *into*):
+                  changing the Secret's own *content* under an unchanged name is
+                  invisible to this field and to the config-hash restart annotation
+                  (`desired::statefulset::RestartRelevantConfig`), so it never rolls
+                  pods — correct, not a gap. Adding, removing, or pointing this field
+                  at a *different* Secret name DOES roll every pod: the volume's own
+                  presence/`secretName` is itself a `spec.template` change the
+                  `StatefulSet` controller already diffs on its own, and this field's
+                  own presence (not the secret name) is additionally baked into the
+                  config-hash annotation so an add/remove is never missed even though
+                  nothing else about the pod template would otherwise change.
+                nullable: true
+                type: string
+              hostSettleTimeoutMs:
+                description: |-
+                  How long, in milliseconds, a freshly hosted group holds a staggered
+                  hosting slot before it is released even without a leader (ADR 0078
+                  section 3). Emitted into `cluster_settings.host_settle_timeout_ms`.
+                  `None` (default) leaves the node's own default (600); `0` is refused
+                  ([`AnimusClusterSpec::validate_election_backpressure_spec`]). Additive
+                  and skipped when unset.
+                format: uint64
+                minimum: 0.0
+                nullable: true
+                type: integer
+              hostUnsettledMax:
+                description: |-
+                  Most freshly hosted tablet groups a node lets be unsettled at once
+                  (ADR 0078 section 3, staggered hosting, `H`). Emitted into
+                  `cluster_settings.host_unsettled_max`. `None` (default) leaves the
+                  node's own default (100); `0` disables staggering. Additive and
+                  skipped when unset.
+                format: uint64
+                minimum: 0.0
+                nullable: true
+                type: integer
+              image:
+                description: |-
+                  The `animusd` container image. Defaults to
+                  [`DEFAULT_IMAGE`](Self::DEFAULT_IMAGE) when omitted.
+                nullable: true
+                type: string
+              lagStretchMaxX:
+                description: |-
+                  Cap on the lag-stretched election timeout as a multiple of the
+                  election base (ADR 0078 step 4, `S_max`). Emitted into
+                  `cluster_settings.lag_stretch_max_x`. `None` (default) leaves the
+                  node's own default (4); `0` disables the load monitor and the stretch.
+                  Additive and skipped when unset.
+                format: uint64
+                minimum: 0.0
+                nullable: true
+                type: integer
+              maxRegionRttMs:
+                description: |-
+                  An upper bound, in milliseconds, on the round trip between any two
+                  **regions** of a stretch cluster (ADR 0075 section 3.4, G-01 G-c; ADR
+                  0060 stretch shape). Emitted into the generated `cluster.json`'s
+                  `cluster_settings.max_region_rtt_ms`, where it sizes the WAN Raft
+                  timing profile of every group whose replicas span more than one
+                  `topology.kubernetes.io/region`. `None` (default) leaves the node's own
+                  default (150 ms); **inert on a single-region or unlabelled cluster**.
+                  Additive and skipped when unset, so an existing spec's `cluster.json`
+                  is byte-identical.
+                format: uint64
+                minimum: 0.0
+                nullable: true
+                type: integer
+              mrecMaxClockSkewMs:
+                description: |-
+                  Bound, in milliseconds, on how far ahead of a receiver's own wall
+                  clock a replicated MREC stamp may be (maps to
+                  `cluster_settings.mrec_max_clock_skew_ms`). Unset keeps animusd's
+                  default (500); `0` is refused.
+                format: uint64
+                minimum: 0.0
+                nullable: true
+                type: integer
+              nodeCapacity:
+                description: |-
+                  Explicit per-node placement capacity overrides (ADR 0079 section 1).
+                  Left unset, the operator **derives** both values from
+                  `spec.resources.requests` ([`derive_node_capacity`](crate::desired::
+                  cluster_config::derive_node_capacity)); a field set here wins over the
+                  derived one. Rendered into `cluster_settings.node_weight` /
+                  `node_max_replicas`, which each node advertises through
+                  `SetNodeCapacity` once the cluster has finalized version 5. Additive
+                  and skipped when unset.
+                nullable: true
+                properties:
+                  cores:
+                    description: |-
+                      The **configured** core count of each pod (ADR 0079 layers 2 and 3):
+                      the multiplier of the awake-group cap (`cores x 1500`) and the default
+                      size of the compaction pool (`max(1, cores / 2)`). Rendered into
+                      `cluster_settings.cores`; never autodetected at runtime. Derived
+                      default: `max(1, floor(cpuRequest))` from `spec.resources.requests.cpu`
+                      (a 500m pod is 1, a 2500m pod is 2, a 4-core pod is 4); with neither
+                      set the cap and the pools stay off. `0` is refused.
+                    format: uint32
+                    minimum: 0.0
+                    nullable: true
+                    type: integer
+                  maxReplicas:
+                    description: |-
+                      Absolute ceiling on the replicas (voters and learners) placement puts on
+                      a node. Derived default: `min(memoryRequest / 2 / 64 KiB, 1000)` when a
+                      memory request is set, else unset (no ceiling).
+                    format: uint32
+                    minimum: 0.0
+                    nullable: true
+                    type: integer
+                  weight:
+                    description: |-
+                      Relative placement weight (only ratios between nodes matter; a node that
+                      declares nothing is 100). Derived default: `max(1, cpuMillicores / 100)`.
+                      `0` is refused.
+                    format: uint32
+                    minimum: 0.0
+                    nullable: true
+                    type: integer
+                type: object
+              nodes:
+                description: Total pod count (`StatefulSet.spec.replicas`). Must be at least 1.
+                format: int32
+                type: integer
+              peers:
+                description: |-
+                  The **peer clusters** this cluster replicates MREC global tables with
+                  (ADR 0075 section 5.4). One `AnimusCluster` per Kubernetes cluster;
+                  peers are symmetric (each side lists the others); there is no
+                  federation CRD. Rendered into `cluster.json`'s
+                  `cluster_settings.peers`. Requires `spec.tls` (mutual TLS on the
+                  intra port authenticates the peer) unless
+                  [`allow_insecure_peers`](Self::allow_insecure_peers). See [`PeerSpec`]
+                  and [`AnimusClusterSpec::validate_peers_spec`].
+                items:
+                  description: |-
+                    One entry of `spec.peers` (ADR 0075 section 5.4, G-01 stage G-e): a peer
+                    cluster's MREC region name, the `host:port` endpoints of its nodes'
+                    **intra** ports (explicit, user-supplied LoadBalancer or multi-cluster
+                    DNS names; there is no automatic discovery), and optionally the Secret
+                    holding that peer's CA.
+                  properties:
+                    caSecretRef:
+                      description: |-
+                        A `Secret` in this namespace holding the peer cluster's CA
+                        certificate(s), only **referenced** (never created or written by this
+                        operator; a cert-manager user points it at the CA `Certificate`'s
+                        Secret). Mounted read-only, added to this cluster's inbound trust
+                        bundle and used to verify this peer's server certificate. Omit when
+                        the peer's certificates chain to the same CA as `spec.tls`.
+                      nullable: true
+                      properties:
+                        key:
+                          description: The data key holding the PEM CA bundle. Defaults to `ca.crt`.
+                          nullable: true
+                          type: string
+                        name:
+                          description: The `Secret`'s name (same namespace).
+                          type: string
+                      required:
+                      - name
+                      type: object
+                    endpoints:
+                      description: |-
+                        `host:port` of the peer's intra port (any peer data node accepts a
+                        frame). At least one.
+                      items:
+                        type: string
+                      type: array
+                    region:
+                      description: The peer's own `spec.region`.
+                      type: string
+                  required:
+                  - endpoints
+                  - region
+                  type: object
+                type: array
+              quiesceAfterSecs:
+                description: |-
+                  The idle-before-quiescing grace period for a data-plane CP group
+                  (ADR 0044 phase-1 / ADR 0048). **S-06**: emitted into the generated
+                  `cluster.json`'s `cluster_settings.quiesce_after_secs` section
+                  (`desired::cluster_config::build_cluster_config`), not a CLI flag —
+                  this now applies to **every** pod, combined and data-role alike (an
+                  `animusd` data-only node had no route to quiescence at all before
+                  S-06 closed that gap; see `crates/animus-operator/CLAUDE.md`'s
+                  CLI-flag-support table for the full before/after picture).
+                format: uint64
+                minimum: 0.0
+                nullable: true
+                type: integer
+              region:
+                description: |-
+                  This cluster's **MREC region name** (ADR 0075 section 5.4, G-01 stage
+                  G-e): the namespace of [`peers`](Self::peers) and of an MREC global
+                  table's replica set. Emitted into `cluster.json`'s
+                  `cluster_settings.region`. Distinct from the `topology.kubernetes.io/
+                  region` node label MRSC uses. Required when `peers` is non-empty.
+                  Additive: absent on every pre-G-e spec.
+                nullable: true
+                type: string
+              resources:
+                description: Passthrough container resource requests/limits.
+                nullable: true
+                properties:
+                  claims:
+                    description: |-
+                      Claims lists the names of resources, defined in spec.resourceClaims, that are used by this container.
+
+                      This field depends on the DynamicResourceAllocation feature gate.
+
+                      This field is immutable. It can only be set for containers.
+                    items:
+                      description: ResourceClaim references one entry in PodSpec.ResourceClaims.
+                      properties:
+                        name:
+                          description: Name must match the name of one entry in pod.spec.resourceClaims of the Pod where this field is used. It makes that resource available inside a container.
+                          type: string
+                        request:
+                          description: Request is the name chosen for a request in the referenced claim. If empty, everything from the claim is made available, otherwise only the result of this request.
+                          type: string
+                      required:
+                      - name
+                      type: object
+                    type: array
+                  limits:
+                    additionalProperties:
+                      description: "Quantity is a fixed-point representation of a number. It provides convenient marshaling/unmarshaling in JSON and YAML, in addition to String() and AsInt64() accessors.\n\nThe serialization format is:\n\n``` <quantity>        ::= <signedNumber><suffix>\n\n\t(Note that <suffix> may be empty, from the \"\" case in <decimalSI>.)\n\n<digit>           ::= 0 | 1 | ... | 9 <digits>          ::= <digit> | <digit><digits> <number>          ::= <digits> | <digits>.<digits> | <digits>. | .<digits> <sign>            ::= \"+\" | \"-\" <signedNumber>    ::= <number> | <sign><number> <suffix>          ::= <binarySI> | <decimalExponent> | <decimalSI> <binarySI>        ::= Ki | Mi | Gi | Ti | Pi | Ei\n\n\t(International System of units; See: http://physics.nist.gov/cuu/Units/binary.html)\n\n<decimalSI>       ::= m | \"\" | k | M | G | T | P | E\n\n\t(Note that 1024 = 1Ki but 1000 = 1k; I didn't choose the capitalization.)\n\n<decimalExponent> ::= \"e\" <signedNumber> | \"E\" <signedNumber> ```\n\nNo matter which of the three exponent forms is used, no quantity may represent a number greater than 2^63-1 in magnitude, nor may it have more than 3 decimal places. Numbers larger or more precise will be capped or rounded up. (E.g.: 0.1m will rounded up to 1m.) This may be extended in the future if we require larger or smaller quantities.\n\nWhen a Quantity is parsed from a string, it will remember the type of suffix it had, and will use the same type again when it is serialized.\n\nBefore serializing, Quantity will be put in \"canonical form\". This means that Exponent/suffix will be adjusted up or down (with a corresponding increase or decrease in Mantissa) such that:\n\n- No precision is lost - No fractional digits will be emitted - The exponent (or suffix) is as large as possible.\n\nThe sign will be omitted unless the number is negative.\n\nExamples:\n\n- 1.5 will be serialized as \"1500m\" - 1.5Gi will be serialized as \"1536Mi\"\n\nNote that the quantity will NEVER be internally represented by a floating point number. That is the whole point of this exercise.\n\nNon-canonical values will still parse as long as they are well formed, but will be re-emitted in their canonical form. (So always use canonical form, or don't diff.)\n\nThis format is intended to make it difficult to use these numbers without writing some sort of special handling code in the hopes that that will cause implementors to also use a fixed point implementation."
+                      x-kubernetes-int-or-string: true
+                    description: 'Limits describes the maximum amount of compute resources allowed. More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/'
+                    type: object
+                  requests:
+                    additionalProperties:
+                      description: "Quantity is a fixed-point representation of a number. It provides convenient marshaling/unmarshaling in JSON and YAML, in addition to String() and AsInt64() accessors.\n\nThe serialization format is:\n\n``` <quantity>        ::= <signedNumber><suffix>\n\n\t(Note that <suffix> may be empty, from the \"\" case in <decimalSI>.)\n\n<digit>           ::= 0 | 1 | ... | 9 <digits>          ::= <digit> | <digit><digits> <number>          ::= <digits> | <digits>.<digits> | <digits>. | .<digits> <sign>            ::= \"+\" | \"-\" <signedNumber>    ::= <number> | <sign><number> <suffix>          ::= <binarySI> | <decimalExponent> | <decimalSI> <binarySI>        ::= Ki | Mi | Gi | Ti | Pi | Ei\n\n\t(International System of units; See: http://physics.nist.gov/cuu/Units/binary.html)\n\n<decimalSI>       ::= m | \"\" | k | M | G | T | P | E\n\n\t(Note that 1024 = 1Ki but 1000 = 1k; I didn't choose the capitalization.)\n\n<decimalExponent> ::= \"e\" <signedNumber> | \"E\" <signedNumber> ```\n\nNo matter which of the three exponent forms is used, no quantity may represent a number greater than 2^63-1 in magnitude, nor may it have more than 3 decimal places. Numbers larger or more precise will be capped or rounded up. (E.g.: 0.1m will rounded up to 1m.) This may be extended in the future if we require larger or smaller quantities.\n\nWhen a Quantity is parsed from a string, it will remember the type of suffix it had, and will use the same type again when it is serialized.\n\nBefore serializing, Quantity will be put in \"canonical form\". This means that Exponent/suffix will be adjusted up or down (with a corresponding increase or decrease in Mantissa) such that:\n\n- No precision is lost - No fractional digits will be emitted - The exponent (or suffix) is as large as possible.\n\nThe sign will be omitted unless the number is negative.\n\nExamples:\n\n- 1.5 will be serialized as \"1500m\" - 1.5Gi will be serialized as \"1536Mi\"\n\nNote that the quantity will NEVER be internally represented by a floating point number. That is the whole point of this exercise.\n\nNon-canonical values will still parse as long as they are well formed, but will be re-emitted in their canonical form. (So always use canonical form, or don't diff.)\n\nThis format is intended to make it difficult to use these numbers without writing some sort of special handling code in the hopes that that will cause implementors to also use a fixed point implementation."
+                      x-kubernetes-int-or-string: true
+                    description: 'Requests describes the minimum amount of compute resources required. If Requests is omitted for a container, it defaults to Limits if that is explicitly specified, otherwise to an implementation-defined value. Requests cannot exceed Limits. More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/'
+                    type: object
+                type: object
+              s3:
+                description: |-
+                  S3-compatible object-store wiring for the cluster's backup and/or
+                  stream-segment stores (S-04 PR 3). `None` (default) leaves both
+                  stores at their pre-existing default (`cluster`/`ClusterSegmentStore`)
+                  or whatever `backupStore`/`segmentStore` below set instead.
+                  See [`S3StoreSpec`]'s own doc for the two mutually-independent store
+                  fields, the referenced credential `Secret`, and the egress CIDRs.
+                nullable: true
+                properties:
+                  allowInsecureHttp:
+                    default: false
+                    description: |-
+                      Whether a plain-`http://` `endpoint=` (`insecure_http=true` in
+                      either store URI's own query string) is allowed. Defaults to
+                      `false`; a URI setting `insecure_http=true` while this is `false` is
+                      rejected by [`Self::validate`] — the same two-flag deliberate-opt-in
+                      posture `animusd`'s own `--allow-insecure-s3` establishes
+                      (`parse_s3_uri`'s "refused unless `--allow-insecure-s3` is also
+                      given"), mirrored here since this field's only job is to become
+                      that flag on the generated `entrypoint.sh`.
+                    type: boolean
+                  backupStore:
+                    description: '`--backup-store` value for every combined-role pod.'
+                    nullable: true
+                    type: string
+                  credentialsSecretName:
+                    description: |-
+                      Name of a pre-existing `Secret` (same namespace) holding two keys,
+                      `access_key_id`/`secret_access_key` — this operator only ever
+                      *references* it (mounted read-only at `/etc/animus/s3` on every
+                      pod, `crate::desired::statefulset::build`), never creates or writes
+                      one. A combined-role pod's own generated `entrypoint.sh` reads both
+                      files at container-start time and writes a small `--s3-credentials`
+                      JSON file naming only the *path* to `secret_access_key`
+                      (`crate::desired::cluster_config::entrypoint_script`) — the secret
+                      value itself is never copied into the `ConfigMap` or `cluster.json`,
+                      only read out of the mounted `Secret` at runtime, inside the pod.
+                      **Exactly one of this and [`Self::web_identity`] must be set**
+                      (S-08 M1; previously this field was required).
+                    nullable: true
+                    type: string
+                  egressCidrs:
+                    default:
+                    - 0.0.0.0/0
+                    description: |-
+                      CIDRs the generated `NetworkPolicy`'s egress section allows toward
+                      the S3 endpoint's own port, in addition to the cluster's baseline
+                      intra-cluster + DNS egress (`crate::desired::networkpolicy`).
+                      Defaults to `["0.0.0.0/0"]`.
+
+                      **`NetworkPolicy` cannot express a hostname allowlist** — only IP
+                      blocks — so this operator has no way to resolve `endpoint=...`'s
+                      hostname into the right CIDR for you. **Narrow this list to your
+                      object store's actual address range in any environment where
+                      open-to-any-destination egress on that port is unacceptable** — see
+                      `deploy/operator/example.yaml`'s own commented `s3:` section.
+                    items:
+                      type: string
+                    type: array
+                  segmentStore:
+                    description: '`--segment-store` value for every combined-role pod.'
+                    nullable: true
+                    type: string
+                  webIdentity:
+                    description: |-
+                      Temporary credentials via the pod's projected service-account token
+                      exchanged with STS `AssumeRoleWithWebIdentity` (EKS IRSA) instead of
+                      a long-lived `Secret`. See [`S3WebIdentitySpec`]. Exactly one of this
+                      and [`Self::credentials_secret_name`].
+                    nullable: true
+                    properties:
+                      audience:
+                        description: Audience of the projected token. Defaults to `sts.amazonaws.com`.
+                        nullable: true
+                        type: string
+                      roleArn:
+                        description: The IAM role to assume (`arn:aws:iam::<account>:role/<name>`).
+                        type: string
+                      serviceAccountName:
+                        description: |-
+                          `serviceAccountName` for every pod (the SA the role's trust policy
+                          names). `None` keeps the namespace's `default` ServiceAccount.
+                        nullable: true
+                        type: string
+                    required:
+                    - roleArn
+                    type: object
+                type: object
+              schemaVersion:
+                description: |-
+                  The internal content-schema version of this spec (ADR 0073 Phase 0,
+                  Workstream E) — **distinct from the Kubernetes API version**
+                  (`v1alpha1`, which stays): that one names the CRD's served API shape,
+                  this one names the meaning of the spec's *content*, so a future
+                  operator can tell an old CR from a new one without guessing. Required,
+                  with **no serde default** — a CR that omits it is rejected by the API
+                  server's structural schema (it is listed under `required:`) and, for
+                  anything that bypasses that, by serde at decode. Must be in
+                  `1..=`[`CONTENT_SCHEMA_VERSION`] (`crate::validate::
+                  validate_schema_version`); `0` and a version this operator does not
+                  know are refused by both the webhook and the reconciler.
+                format: uint32
+                minimum: 1.0
+                type: integer
+              segmentStore:
+                description: |-
+                  The **non-S3** `--segment-store` value for every combined-role pod
+                  (S-07b). Accepts only `"dir:<absolute path>"` with the same
+                  under-`DATA_DIR` rule `backupStore` above uses — **`animusd`'s own
+                  `--segment-store` has no `"cluster"` keyword at all** (omitting the
+                  flag is the only way to select its default), so a literal
+                  `"cluster"` here is rejected by [`Self::validate_store_spec`] rather
+                  than silently treated as "omit the flag". `None` (default) leaves
+                  `--segment-store` unset. Mutually exclusive with
+                  `spec.s3.segmentStore`: set at most one.
+                nullable: true
+                type: string
+              storage:
+                default: {}
+                description: Data volume configuration.
+                properties:
+                  ephemeral:
+                    description: |-
+                      When `true`, every pod uses an `emptyDir` instead of a
+                      `PersistentVolumeClaim`, and `animusd` is started with `--ephemeral`
+                      (the volatile in-memory storage engine) — data does not survive a
+                      pod restart. Defaults to `false`.
+
+                      **Rejected together with more than one control voter (issue #989,
+                      ADR 0060's 2026-09-19 amendment)**: `true` here with `spec.
+                      controlNodes` resolving (via [`AnimusClusterSpec::
+                      control_nodes_or_default`]) to more than `1` fails admission
+                      (`crate::validate::validate_ephemeral_voters`, enforced by the
+                      validating webhook when installed, and by `crate::controller::
+                      reconcile`'s own fallback otherwise) — an `emptyDir` wipe on any
+                      config-affecting pod recreation gets a wiped EXISTING voter
+                      permanently refused by issue #667's boot-time check, and enough
+                      refusals cost the control group its quorum for good. A single voter
+                      (`controlNodes: 1`, or `nodes: 1` with `controlNodes` omitted) has no
+                      quorum to lose beyond itself, so that shape stays allowed — see
+                      [`CONDITION_EPHEMERAL_VOTER_STORAGE_HAZARD`]'s own doc for what it
+                      still warns about there.
+                    nullable: true
+                    type: boolean
+                  size:
+                    description: PVC size (e.g. `"10Gi"`). Defaults to `"10Gi"` when omitted.
+                    nullable: true
+                    type: string
+                  storageClassName:
+                    description: |-
+                      `StorageClassName` for the PVC. Omitted lets the cluster default
+                      apply.
+                    nullable: true
+                    type: string
+                type: object
+              tls:
+                description: |-
+                  TLS material for the cluster (ADR 0064 commit 3). `None` (default)
+                  keeps every pod on plain TCP, byte-for-byte the pre-existing
+                  behavior. See [`TlsSpec`]'s own doc for the two mutually exclusive
+                  shapes and how the resolved `Secret` is mounted/wired.
+                nullable: true
+                properties:
+                  certManager:
+                    description: |-
+                      Have cert-manager issue and renew the cluster's cert via a
+                      `Certificate` resource this operator creates and owns (`crate::
+                      desired::certificate::build`). Mutually exclusive with `secretName`.
+
+                      **`issuerRef` must never resolve to a bare `selfSigned` issuer
+                      directly** (issue #913): every pod mounts the identical resulting
+                      `Secret` (one shared leaf, not one per pod), and a `selfSigned`
+                      issuer's output `Secret` sets `ca.crt` equal to that same leaf — so
+                      any future reissuance mints a brand-new, mutually-untrusted root
+                      rather than a renewed leaf under a stable CA, and `animusd` never
+                      reloads TLS material after boot to recover from that. Put a
+                      `ca`-typed issuer between a self-signed root and this field instead
+                      (mint one CA `Certificate` off the `selfSigned` issuer, then a
+                      second issuer signing real leaves from that CA's key) — see
+                      `docs/adr/0064-tls-on-every-port.md`'s issue #913 amendment and
+                      `scripts/e2e-kind.sh`'s own TLS setup for the reference shape.
+                    nullable: true
+                    properties:
+                      duration:
+                        description: |-
+                          `Certificate.spec.duration` (e.g. `"2160h"`), passed through
+                          verbatim. Omitted lets cert-manager/the issuer apply its own
+                          default.
+                        nullable: true
+                        type: string
+                      issuerRef:
+                        description: |-
+                          `spec.tls.certManager.issuerRef` — mirrors cert-manager's own
+                          `ObjectReference` shape (`name`/`kind`/`group`).
+                        properties:
+                          group:
+                            description: |-
+                              `Certificate.spec.issuerRef.group` — omitted lets cert-manager
+                              apply its own default (`cert-manager.io`).
+                            nullable: true
+                            type: string
+                          kind:
+                            default: Issuer
+                            description: |-
+                              `"Issuer"` (namespace-scoped) or `"ClusterIssuer"`. Defaults to
+                              `"Issuer"`, matching cert-manager's own default when `kind` is
+                              omitted from a `Certificate`'s `issuerRef`.
+                            type: string
+                          name:
+                            type: string
+                        required:
+                        - name
+                        type: object
+                      renewBefore:
+                        description: |-
+                          `Certificate.spec.renewBefore` (e.g. `"360h"`), passed through
+                          verbatim.
+                        nullable: true
+                        type: string
+                    required:
+                    - issuerRef
+                    type: object
+                  secretName:
+                    description: |-
+                      Name of a pre-existing `Secret` (same namespace, `kubernetes.io/tls`
+                      shape: `tls.crt`/`tls.key`/`ca.crt`) an operator user issued and
+                      placed by hand. Mutually exclusive with `certManager`.
+                    nullable: true
+                    type: string
+                type: object
+              topology:
+                description: |-
+                  Topology-aware scheduling (G-01 stage G-a, ADR 0060's 2026-10-04
+                  amendment). `None` (default) is [`TopologySpec::default`]: the
+                  `StatefulSet` carries a zone `topologySpreadConstraints` entry and a
+                  preferred hostname pod anti-affinity. Node region/zone label
+                  resolution (the operator patching each scheduled pod's node labels
+                  onto the pod as annotations, projected to `--labels-file`) is **not**
+                  controlled by this field: it is always on.
+                nullable: true
+                properties:
+                  spread:
+                    description: |-
+                      Emit the pod `topologySpreadConstraints` (zone, `maxSkew: 1`,
+                      `whenUnsatisfiable: ScheduleAnyway`) and the preferred hostname pod
+                      anti-affinity. Default `true`; `false` leaves scheduling entirely to
+                      the cluster's defaults.
+                    nullable: true
+                    type: boolean
+                type: object
+              upgrade:
+                description: |-
+                  Rolling-upgrade behaviour (ADR 0073 Phase 3, P3-D, additive). `None`
+                  is [`UpgradeSpec::default`]: finalize stays manual, no soak.
+                nullable: true
+                properties:
+                  finalize:
+                    description: |-
+                      `Manual` (default): the operator never raises the cluster version; it
+                      reports `UpgradeFinalizePending` and a human runs `animus cluster
+                      finalize` (irreversible). `Auto` (opt-in): the operator finalizes once
+                      the roll it drove is complete, `can_finalize` is true and every
+                      verdict has been `ok` for [`soak_seconds`](Self::soak_seconds).
+                    enum:
+                    - Manual
+                    - Auto
+                    - null
+                    nullable: true
+                    type: string
+                  soakSeconds:
+                    description: |-
+                      With `finalize: Auto`: how long the finished roll must stay healthy
+                      before the operator finalizes. Default `0`.
+                    format: uint32
+                    minimum: 0.0
+                    nullable: true
+                    type: integer
+                type: object
+            required:
+            - nodes
+            - schemaVersion
+            type: object
+          status:
+            description: '`AnimusCluster.status`.'
+            nullable: true
+            properties:
+              conditions:
+                default: []
+                description: Typed conditions (`status.conditions[]`), the usual Kubernetes shape.
+                items:
+                  description: |-
+                    One `status.conditions[]` entry — the standard Kubernetes condition
+                    shape (`type`/`status`/`reason`/`message`/`lastTransitionTime`).
+                  properties:
+                    lastTransitionTime:
+                      nullable: true
+                      type: string
+                    message:
+                      nullable: true
+                      type: string
+                    reason:
+                      nullable: true
+                      type: string
+                    status:
+                      description: The three-valued Kubernetes condition status.
+                      enum:
+                      - 'True'
+                      - 'False'
+                      - Unknown
+                      type: string
+                    type:
+                      type: string
+                  required:
+                  - status
+                  - type
+                  type: object
+                type: array
+              observedGeneration:
+                description: The `.metadata.generation` this status was computed from.
+                format: int64
+                nullable: true
+                type: integer
+              phase:
+                description: The cluster's coarse lifecycle phase.
+                enum:
+                - Pending
+                - Bootstrapping
+                - Ready
+                - Degraded
+                - Deleting
+                - null
+                nullable: true
+                type: string
+              readyNodes:
+                description: |-
+                  Ready pod count, mirrored from the `StatefulSet`'s own
+                  `status.readyReplicas`.
+                format: int32
+                nullable: true
+                type: integer
+              upgrade:
+                description: |-
+                  The rolling upgrade the operator is driving, or last drove (ADR 0073
+                  Phase 3, D7). Additive; once present it is never removed (a merge
+                  patch cannot drop it), it ends in [`UpgradePhase::Complete`].
+                nullable: true
+                properties:
+                  activeClusterVersion:
+                    description: The cluster version currently active (`GET /admin/cluster-version`).
+                    format: uint32
+                    minimum: 0.0
+                    nullable: true
+                    type: integer
+                  fromImage:
+                    description: The container image before the roll started.
+                    nullable: true
+                    type: string
+                  fromVersion:
+                    description: The cluster version in force when the roll was first observed.
+                    format: uint32
+                    minimum: 0.0
+                    nullable: true
+                    type: integer
+                  inFlightNode:
+                    description: |-
+                      The node currently in flight (restarting or not yet healthy) and since
+                      when (epoch seconds): the stall clock.
+                    nullable: true
+                    type: string
+                  inFlightSince:
+                    format: int64
+                    nullable: true
+                    type: integer
+                  onNew:
+                    description: Pods on the new revision that are `Ready`.
+                    format: int32
+                    nullable: true
+                    type: integer
+                  phase:
+                    description: '`status.upgrade.phase`.'
+                    enum:
+                    - InProgress
+                    - Blocked
+                    - FinalizePending
+                    - Complete
+                    type: string
+                  settledSince:
+                    description: |-
+                      Since when (epoch seconds) every node has been done and healthy: the
+                      `spec.upgrade.soakSeconds` clock.
+                    format: int64
+                    nullable: true
+                    type: integer
+                  toImage:
+                    description: The container image the roll is rolling to.
+                    nullable: true
+                    type: string
+                  toVersion:
+                    description: |-
+                      The cluster version the roll finalizes to (the new binaries' own range
+                      max), once a pod on the new binary has reported it.
+                    format: uint32
+                    minimum: 0.0
+                    nullable: true
+                    type: integer
+                  total:
+                    description: Pods the roll covers (`StatefulSet` replicas).
+                    format: int32
+                    nullable: true
+                    type: integer
+                required:
+                - phase
+                type: object
+            type: object
+        required:
+        - spec
+        title: AnimusCluster
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

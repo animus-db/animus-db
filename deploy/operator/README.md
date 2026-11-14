@@ -1,5 +1,10 @@
 # AnimusDB Kubernetes operator — deploy manifests
 
+> **Prefer the Helm charts** in [`deploy/helm/`](../helm/README.md)
+> (`animus-operator` + `animus-cluster`). These raw manifests remain supported
+> for pipelines that cannot use Helm; CI keeps the RBAC rules and the CRD identical
+> to the chart's.
+
 Manifests for running the `animus-operator` controller (`crates/animus-operator`)
 and provisioning `AnimusCluster` custom resources against it. See that crate's
 own `CLAUDE.md` for the controller's design.
@@ -19,7 +24,11 @@ hand-editing it:
 
 ```sh
 cargo run -p animus-operator --bin animus-operator -- crd > deploy/operator/crd.yaml
+cp deploy/operator/crd.yaml deploy/helm/animus-operator/crds/animusclusters.animusdb.io.yaml
 ```
+
+(the second line keeps the Helm chart's copy byte-identical; the
+`crd_manifest_pinned` test fails on either being stale).
 
 Once the operator's own `Deployment` is `Ready`, create an `AnimusCluster`:
 
@@ -574,7 +583,7 @@ before this webhook existed.
 `webhook.yaml`'s `Service`/`ValidatingWebhookConfiguration` are static,
 hand-applied objects — the operator's reconcile loop never creates,
 updates, or watches either — matching `deployment.yaml`/`rbac.yaml`'s own
-precedent (this repo ships no Kustomize/Helm layer; every manifest here is
+precedent (the Helm chart in `deploy/helm/animus-operator` renders the same objects; every manifest here is
 already applied by hand or by a deployment pipeline outside this
 operator's own control). The alternative — the operator self-registering
 its own `ValidatingWebhookConfiguration` at startup — was considered and

@@ -79,6 +79,7 @@ jobs:
       - fuzz
       - image
       - demo-browsers
+      - helm
       - dco
     if: always()
     runs-on: ubuntu-latest
@@ -98,7 +99,7 @@ jobs:
       #     never ran in the queue), dco (a queue entry has no PR commit range).
       #   pull_request and path-filtered (skipped when `changes` says the diff
       #     cannot reach them, or in merge_group, which pass): chaos, fuzz,
-      #     image, demo-browsers. They were never merge_group jobs: the queue
+      #     image, demo-browsers, helm. They were never merge_group jobs: the queue
       #     entry is the PR plus later `main` commits, and `lint`/`test-*` build
       #     it again, so repeating ~10 minute real-process/fuzz/image jobs would
       #     only lengthen the one-at-a-time queue.
@@ -119,11 +120,13 @@ jobs:
           FUZZ: ${{ needs.fuzz.result }}
           IMAGE: ${{ needs.image.result }}
           DEMO: ${{ needs.demo-browsers.result }}
+          HELM: ${{ needs.helm.result }}
           DCO: ${{ needs.dco.result }}
           WANT_CHAOS: ${{ needs.changes.outputs.chaos }}
           WANT_FUZZ: ${{ needs.changes.outputs.fuzz }}
           WANT_IMAGE: ${{ needs.changes.outputs.image }}
           WANT_DEMO: ${{ needs.changes.outputs.demo }}
+          WANT_HELM: ${{ needs.changes.outputs.helm }}
         run: |
           fail=0
           # require <name> <result> <want>: want=true -> must be success;
@@ -162,6 +165,7 @@ jobs:
           require fuzz "${FUZZ}" "$([ "${pr}" = true ] && echo "${WANT_FUZZ}" || echo false)"
           require image "${IMAGE}" "$([ "${pr}" = true ] && echo "${WANT_IMAGE}" || echo false)"
           require demo-browsers "${DEMO}" "$([ "${pr}" = true ] && echo "${WANT_DEMO}" || echo false)"
+          require helm "${HELM}" "$([ "${pr}" = true ] && echo "${WANT_HELM}" || echo false)"
 
           if [ "${fail}" != 0 ]; then
             echo "::error::one or more gates jobs failed"
@@ -183,6 +187,7 @@ jobs:
       fuzz: ${{ steps.filter.outputs.fuzz }}
       image: ${{ steps.filter.outputs.image }}
       demo: ${{ steps.filter.outputs.demo }}
+      helm: ${{ steps.filter.outputs.helm }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -230,6 +235,31 @@ jobs:
     needs: changes
     if: github.event_name == 'pull_request' && needs.changes.outputs.demo == 'true'
     uses: ./.github/workflows/demo-browsers.yml
+
+  # Static checks of the Helm charts (deploy/helm/): lint, render, RBAC and CRD
+  # equality with the raw manifests, CRD-schema validation of the rendered
+  # AnimusCluster (scripts/check-helm-charts.sh). No cluster needed. PR-only and
+  # path-filtered through `changes`, like the jobs above.
+  helm:
+    name: helm
+    needs: changes
+    if: github.event_name == 'pull_request' && needs.changes.outputs.helm == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.16.4
+
+      - name: Install the schema-check dependencies
+        run: python3 -m pip install --user pyyaml jsonschema
+
+      - name: Check the charts
+        run: scripts/check-helm-charts.sh
 
   # Every commit of the PR needs a sign-off; always checked on a PR, no path
   # filter. Skipped in merge_group (a queue entry has no PR commit range).

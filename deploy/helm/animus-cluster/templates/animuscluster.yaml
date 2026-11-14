@@ -1,0 +1,25 @@
+{{- /*
+The spec is passed through verbatim (toYaml) so the chart can never drift from
+the CRD: any field the CRD accepts can be set under `spec:` in values. The only
+thing added is an image default.
+*/ -}}
+{{- $spec := deepCopy .Values.spec }}
+{{- if not $spec.image }}
+{{- $_ := set $spec "image" (printf "ghcr.io/animus-db/animusd:%s" .Chart.AppVersion) }}
+{{- end }}
+apiVersion: animusdb.io/v1alpha1
+kind: AnimusCluster
+metadata:
+  name: {{ include "animus-cluster.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "animus-cluster.labels" . | nindent 4 }}
+    {{- with .Values.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- with .Values.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- toYaml $spec | nindent 2 }}
