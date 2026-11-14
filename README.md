@@ -129,5 +129,7 @@ A reproducible simulation test that fails prints its seed; re-run it with
 
 ## License & contributing
 
-AGPL-3.0-only. Contributions require a DCO sign-off and CLA; see
-[CONTRIBUTING.md](CONTRIBUTING.md) and [ADR 0007](docs/adr/0007-agpl-cla.md).
+AGPL-3.0-only, with a commercial licence available on request for
+organisations that cannot use AGPL software ([licensing](https://animusdb.io/licence.html)).
+Contributions require a DCO sign-off and the [Contributor License Agreement](CLA.md);
+see [CONTRIBUTING.md](CONTRIBUTING.md) and [ADR 0007](docs/adr/0007-agpl-cla.md).

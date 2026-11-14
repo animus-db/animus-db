@@ -1,0 +1,11 @@
+{
+  "version": "1.0",
+  "document": "CLA.md",
+  "phrase": "I have read the AnimusDB CLA and I hereby sign it.",
+  "signaturesBranch": "cla-signatures",
+  "signaturesFile": "signatures/cla.json",
+  "_exempt": "GitHub logins that never need to sign: the Licensor's own accounts. Bot accounts (login ending in [bot]) are always exempt.",
+  "exempt": ["guillaumefont"],
+  "_assistantEmails": "Commit author e-mails of coding assistants. Their commits are made on behalf of the pull request's author, whose signature covers them; the e-mail is matched rather than the GitHub login, because noreply@anthropic.com resolves to an unrelated personal account named 'claude'.",
+  "assistantEmails": ["noreply@anthropic.com"]
+}

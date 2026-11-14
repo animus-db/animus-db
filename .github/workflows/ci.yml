@@ -80,6 +80,7 @@ jobs:
       - image
       - demo-browsers
       - dco
+      - cla
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -95,7 +96,8 @@ jobs:
       #     test-shard, test-doc, s3-real-endpoint, upgrade-previous-release.
       #   pull_request only (skipped on push and merge_group, which pass):
       #     corpus-changed (corpus-select is PR-only; the nightly-depth corpora
-      #     never ran in the queue), dco (a queue entry has no PR commit range).
+      #     never ran in the queue), dco (a queue entry has no PR commit range),
+      #     cla (the PR's authors are checked when the PR runs).
       #   pull_request and path-filtered (skipped when `changes` says the diff
       #     cannot reach them, or in merge_group, which pass): chaos, fuzz,
       #     image, demo-browsers. They were never merge_group jobs: the queue
@@ -120,6 +122,7 @@ jobs:
           IMAGE: ${{ needs.image.result }}
           DEMO: ${{ needs.demo-browsers.result }}
           DCO: ${{ needs.dco.result }}
+          CLA: ${{ needs.cla.result }}
           WANT_CHAOS: ${{ needs.changes.outputs.chaos }}
           WANT_FUZZ: ${{ needs.changes.outputs.fuzz }}
           WANT_IMAGE: ${{ needs.changes.outputs.image }}
@@ -157,6 +160,7 @@ jobs:
           require upgrade-previous-release "${UPGRADE}" true
           require corpus-changed "${CORPUS}" "${pr}"
           require dco "${DCO}" "${pr}"
+          require cla "${CLA}" "${pr}"
           # The path filters are only computed (non-false) for a pull_request.
           require chaos "${CHAOS}" "$([ "${pr}" = true ] && echo "${WANT_CHAOS}" || echo false)"
           require fuzz "${FUZZ}" "$([ "${pr}" = true ] && echo "${WANT_FUZZ}" || echo false)"
@@ -237,6 +241,47 @@ jobs:
     name: dco
     if: github.event_name == 'pull_request'
     uses: ./.github/workflows/dco.yml
+
+  # Everyone who must sign the CLA (CLA.md) has signed: the PR author and every
+  # linked commit author, minus exempt maintainers, bots and coding assistants
+  # (.github/cla.json). Read-only: signatures are recorded by cla.yml, which
+  # also re-runs this job once the last one is in. Skipped in merge_group,
+  # like dco. Logic and its unit tests: .github/scripts/cla{,.test}.js.
+  cla:
+    name: cla
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            .github
+            CLA.md
+
+      - name: Unit-test the CLA scripts
+        run: node --test .github/scripts/cla.test.js
+
+      - name: Check CLA signatures
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const cla = require(`${process.env.GITHUB_WORKSPACE}/.github/scripts/cla.js`);
+            const config = cla.loadConfig(process.env.GITHUB_WORKSPACE);
+            const { owner, repo } = context.repo;
+            const number = context.payload.pull_request.number;
+            const { missing, unlinked } = await cla.evaluate(github, owner, repo, number, config);
+            if (missing.length === 0 && unlinked.length === 0) {
+              core.info('Everyone on this pull request has signed the CLA.');
+              return;
+            }
+            for (const m of missing) core.error(`@${m.login} has not signed the CLA (CLA.md).`);
+            for (const u of unlinked) core.error(`commit ${u.sha.slice(0, 10)} is authored by ${u.email || 'no e-mail'}, which is linked to no GitHub account.`);
+            core.setFailed(`To sign, post this exact comment on the pull request: ${config.phrase}`);
 
   lint:
     name: lint

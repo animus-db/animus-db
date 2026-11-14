@@ -1,0 +1,86 @@
+name: CLA
+
+# Records Contributor License Agreement (CLA.md) signatures and keeps one
+# status comment on each pull request. The check that BLOCKS a PR is the
+# `cla` job in ci.yml (aggregated by `gates`); this workflow only writes.
+#
+# It needs a write token on fork PRs too, hence `pull_request_target` and
+# `issue_comment`. Both run the workflow and .github/scripts/cla.js as they
+# are on `main`, never the PR's: the checkout below is the base branch, and
+# no PR code is checked out or executed. Logic lives in .github/scripts/cla.js.
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize]
+  issue_comment:
+    types: [created]
+
+# Serialise every write to the signatures branch, across PRs; never cancel a
+# run that may be recording a signature.
+concurrency:
+  group: cla-signatures
+  cancel-in-progress: false
+
+permissions:
+  contents: write       # the cla-signatures branch
+  pull-requests: write  # read PR commits
+  issues: write         # the status comment
+  actions: write        # re-run the PR's failed CI jobs after a signature
+
+jobs:
+  cla:
+    name: CLA signatures
+    if: >-
+      github.event_name == 'pull_request_target' ||
+      (github.event.issue.pull_request && github.event.issue.state == 'open')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out main's CLA scripts (never PR code)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          sparse-checkout: |
+            .github
+            CLA.md
+          persist-credentials: false
+
+      - name: Record signature and update status
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const cla = require(`${process.env.GITHUB_WORKSPACE}/.github/scripts/cla.js`);
+            const config = cla.loadConfig(process.env.GITHUB_WORKSPACE);
+            const { owner, repo } = context.repo;
+            const repoUrl = `${context.serverUrl}/${owner}/${repo}`;
+            const number = context.payload.pull_request
+              ? context.payload.pull_request.number
+              : context.payload.issue.number;
+
+            let signedNow = false;
+            if (context.eventName === 'issue_comment') {
+              const comment = context.payload.comment;
+              if (!cla.isSigningComment(comment.body, config)) {
+                core.info('Not a signing comment; nothing to do.');
+                return;
+              }
+              signedNow = await cla.addSignature(github, owner, repo, config, {
+                login: comment.user.login,
+                id: comment.user.id,
+                version: config.version,
+                date: comment.created_at,
+                pull_request: number,
+                comment_url: comment.html_url,
+              });
+              core.info(signedNow
+                ? `Recorded the signature of @${comment.user.login}.`
+                : `@${comment.user.login} had already signed.`);
+            }
+
+            const { pr, missing, unlinked } = await cla.evaluate(github, owner, repo, number, config);
+            const needed = missing.length > 0 || unlinked.length > 0;
+            await cla.upsertStatusComment(
+              github, owner, repo, number,
+              cla.statusBody(missing, unlinked, config, repoUrl), needed);
+            if (signedNow && !needed) {
+              await cla.rerunFailedCi(github, owner, repo, pr.headSha, core);
+            }
