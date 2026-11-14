@@ -1,0 +1,67 @@
+{{- if .Values.rbac.create }}
+# Cluster-scoped: the operator watches AnimusCluster objects (and their
+# children) across namespaces; nodes and CRDs are cluster-scoped. The rules
+# are identical to deploy/operator/rbac.yaml (scripts/check-helm-charts.sh
+# asserts it); comments live there.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "animus-operator.fullname" . }}
+  labels:
+    {{- include "animus-operator.labels" . | nindent 4 }}
+rules:
+- apiGroups: [animusdb.io]
+  resources: [animusclusters]
+  verbs: [get, list, watch, update, patch]
+- apiGroups: [animusdb.io]
+  resources: [animusclusters/status]
+  verbs: [get, update, patch]
+- apiGroups: [apps]
+  resources: [statefulsets]
+  verbs: [get, list, watch, create, update, patch, delete]
+- apiGroups: ['']
+  resources: [services, configmaps]
+  verbs: [get, list, watch, create, update, patch, delete]
+- apiGroups: [networking.k8s.io]
+  resources: [networkpolicies]
+  verbs: [get, list, watch, create, update, patch, delete]
+- apiGroups: [policy]
+  resources: [poddisruptionbudgets]
+  verbs: [get, list, watch, create, update, patch, delete]
+- apiGroups: [cert-manager.io]
+  resources: [certificates]
+  verbs: [get, list, watch, create, update, patch, delete]
+- apiGroups: ['']
+  resources: [secrets]
+  verbs: [get, list, watch]
+- apiGroups: ['']
+  resources: [pods]
+  verbs: [get, list, watch]
+- apiGroups: ['']
+  resources: [pods]
+  verbs: [patch]
+- apiGroups: ['']
+  resources: [nodes]
+  verbs: [get, list, watch]
+- apiGroups: ['']
+  resources: [pods/proxy]
+  verbs: [get, create]
+- apiGroups: ['']
+  resources: [events]
+  verbs: [create, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "animus-operator.fullname" . }}
+  labels:
+    {{- include "animus-operator.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "animus-operator.fullname" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "animus-operator.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

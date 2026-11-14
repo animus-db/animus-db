@@ -85,7 +85,7 @@
   <div class="wrap">
     <h1>Get a cluster running</h1>
     <p>
-      Run the container image, or build from source with Cargo. There are no distro
+      Run the container image, install the Helm charts on Kubernetes, or build from source with Cargo. There are no distro
       packages yet. Either way it is a couple of commands, plus a compile if you build.
     </p>
   </div>
@@ -97,6 +97,7 @@
       <div>
         <h4>Quick start</h4>
         <a href="#docker">Run with Docker</a>
+        <a href="#kubernetes">Run on Kubernetes</a>
         <a href="#prereqs">Prerequisites</a>
         <a href="#build">Build from source</a>
         <a href="#run">Run a cluster</a>
@@ -166,6 +167,34 @@
       <p class="muted">
         Prefer to build it yourself, or want a three-node cluster in one process? Use the
         source build below.
+      </p>
+    </section>
+
+    <section id="kubernetes">
+      <h2>Run on Kubernetes</h2>
+      <p>
+        The Helm charts in <code>deploy/helm/</code> are the primary Kubernetes path:
+        <code>animus-operator</code> installs the CRD, RBAC and the operator (with an optional
+        validating admission webhook), and <code>animus-cluster</code> creates one
+        <code>AnimusCluster</code> the operator then runs as a StatefulSet. From a checkout:
+      </p>
+      <div class="code">
+<pre><span class="p">$</span> <span class="k">helm install animus-operator deploy/helm/animus-operator \</span>
+    <span class="k">--namespace animus-operator --create-namespace --set image.tag=latest</span>
+<span class="p">$</span> <span class="k">helm install my-db deploy/helm/animus-cluster \</span>
+    <span class="k">--set spec.image=ghcr.io/animus-db/animusd:latest</span>
+<span class="p">$</span> <span class="k">kubectl get animuscluster my-db -o wide</span>
+<span class="p">$</span> <span class="k">kubectl port-forward svc/my-db-dynamo 8000:14002</span>
+<span class="p">$</span> <span class="k">aws --endpoint-url http://localhost:8000 dynamodb list-tables</span></pre>
+      </div>
+      <p>
+        The <code>:latest</code> overrides are needed until the first release tag exists; after that the
+        charts default to the matching release image, and are published at
+        <code>oci://ghcr.io/animus-db/charts/animus-operator</code> and <code>.../animus-cluster</code>
+        on version tags. The charts are rendered and linted in CI but have not been installed on a
+        cluster yet. Helm does not upgrade CRDs: on a chart upgrade, apply
+        <code>deploy/helm/animus-operator/crds/</code> yourself. Prefer plain manifests? Apply
+        <code>deploy/operator/*.yaml</code> as described in <code>deploy/operator/README.md</code>.
       </p>
     </section>
 

@@ -139,6 +139,7 @@ binary for a build-time-only JSON shape. **Keeping that mirror in sync with
   annotation, is the source of truth), and, since S-07d, the growth
   machinery that drives an *increase* forward (`advance_control_growth`
   and its helpers — see this file's own S-07d section below).
+- `deploy/helm/` — the Helm charts (primary install path, ADR 0060 2026-11-14 amendment); the CRD in `animus-operator/crds/` is a byte-identical copy of `deploy/operator/crd.yaml` (regenerate both, `crd_manifest_pinned` pins both) and `scripts/check-helm-charts.sh` pins RBAC/webhook parity.
 - `src/main.rs` — two subcommands: `run` (the controller, `kube::Client::
   try_default()` — in-cluster service-account config when running as a pod,
   or the local kubeconfig otherwise) and `crd` (prints the

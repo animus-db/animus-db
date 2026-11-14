@@ -1,0 +1,12 @@
+AnimusCluster "{{ include "animus-cluster.fullname" . }}" submitted to namespace {{ .Release.Namespace }}.
+The animus-operator must already be installed (chart animus-operator), or nothing reconciles it.
+
+Watch it come up:
+  kubectl -n {{ .Release.Namespace }} get animuscluster {{ include "animus-cluster.fullname" . }} -o wide
+  kubectl -n {{ .Release.Namespace }} get pods -l app.kubernetes.io/instance={{ include "animus-cluster.fullname" . }}
+
+The DynamoDB endpoint is the Service {{ include "animus-cluster.fullname" . }}-dynamo, port {{ add (default 14000 .Values.spec.basePort | int) 2 }} (basePort + 2). From your machine:
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "animus-cluster.fullname" . }}-dynamo 8000:{{ add (default 14000 .Values.spec.basePort | int) 2 }}
+  export AWS_ACCESS_KEY_ID=local AWS_SECRET_ACCESS_KEY=local AWS_REGION=us-east-1
+  aws --endpoint-url http://localhost:8000 dynamodb list-tables
+(Credentials are not checked unless you set spec.dynamoAuthSecretName.)

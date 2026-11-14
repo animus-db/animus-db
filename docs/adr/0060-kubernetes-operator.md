@@ -2069,3 +2069,33 @@ extra gated roll to flip the probe path; a new cluster does not. No
 "bump `spec.image` with the operator upgrade" step is needed.
 The e2e script's `/admin/health` waits are unchanged (they check a pod's own
 control-plane view, not Service membership).
+
+## Amendment (2026-11-14): Helm charts are the primary distribution
+
+- **Two charts under `deploy/helm/`**: `animus-operator` (CRD, RBAC, Deployment, optional
+  validating webhook with cert-manager or an existing Secret + `caBundle`) and
+  `animus-cluster` (one `AnimusCluster`, `spec:` passed through verbatim so it cannot drift from
+  the CRD). They are the first-line install path; the website and `deploy/operator/README.md`
+  point at them.
+- **CRDs live in `crds/`.** Helm installs them once and never upgrades or deletes them, so the
+  chart README gives the manual `kubectl apply` for a chart upgrade. This was chosen over a
+  templated CRD (which a `helm uninstall` would delete along with every `AnimusCluster`) and
+  over a Helm-driven upgrade hook (extra RBAC for the operator or a Job). The chart copy is a
+  byte-identical copy of `deploy/operator/crd.yaml`, pinned to `AnimusCluster::crd()` by a second
+  `crd_manifest_pinned` test.
+- **The raw manifests stay**, supported and drift-checked: `scripts/check-helm-charts.sh`
+  (CI job `helm`, in `gates`' `needs`, path-filtered through `changes`) asserts the chart's
+  ClusterRole rules equal `rbac.yaml`'s, the webhook fields equal `webhook.yaml`'s, the CRDs are
+  identical, the rendered `AnimusCluster` validates against the CRD schema, and each chart's
+  `appVersion` equals the workspace version.
+- **Operator constraints the chart respects**: the pod label `app.kubernetes.io/name:
+  animus-operator` is fixed (the generated NetworkPolicy selects the operator by it), and
+  `--admin-access direct` only works in the namespace `animus-operator`
+  (`desired::networkpolicy::OPERATOR_NAMESPACE`); the default `proxy` works in any namespace.
+  The operator has no leader election, so the Deployment is one replica with `Recreate`.
+- **Publishing**: on `v*` tags `release.yml` packages both charts with the tag's version as
+  chart version and `appVersion` and pushes them to `oci://ghcr.io/animus-db/charts`. The chart's
+  default image tag is `appVersion`, so until the first tag exists installs pass
+  `image.tag=latest` / `spec.image=...:latest`. Not yet exercised by a real tag push.
+- **Not verified**: no chart has been installed on a cluster (`kind` cannot run in the authoring
+  sandbox); only `helm lint`/`template` and the schema checks above run.

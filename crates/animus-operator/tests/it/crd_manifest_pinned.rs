@@ -6,15 +6,22 @@
 //! CR that uses the new field ("unknown field spec.s3" was the first time
 //! this drifted, S-04 PR 3). This test pins the committed file to the type.
 //!
-//! To refresh after a spec change:
+//! The Helm chart (`deploy/helm/animus-operator/crds/`) carries a byte-identical
+//! copy, pinned by a second test below (Helm installs `crds/` files as-is, so
+//! they cannot be templated and must be copied).
+//!
+//! To refresh after a spec change (both places):
 //!
 //! ```sh
 //! cargo run -p animus-operator -- crd > deploy/operator/crd.yaml
+//! cp deploy/operator/crd.yaml deploy/helm/animus-operator/crds/animusclusters.animusdb.io.yaml
 //! ```
 
 use kube::CustomResourceExt;
 
 const COMMITTED: &str = include_str!("../../../../deploy/operator/crd.yaml");
+const HELM_COPY: &str =
+    include_str!("../../../../deploy/helm/animus-operator/crds/animusclusters.animusdb.io.yaml");
 
 #[test]
 fn committed_crd_manifest_matches_the_generated_one() {
@@ -24,5 +31,18 @@ fn committed_crd_manifest_matches_the_generated_one() {
         COMMITTED == generated,
         "deploy/operator/crd.yaml is stale relative to `AnimusCluster::crd()`; regenerate it with \
          `cargo run -p animus-operator -- crd > deploy/operator/crd.yaml`"
+    );
+}
+
+#[test]
+fn helm_chart_crd_copy_matches_the_generated_one() {
+    let generated = serde_norway::to_string(&animus_operator::AnimusCluster::crd())
+        .expect("CustomResourceDefinition serializes to YAML");
+    assert!(
+        HELM_COPY == generated,
+        "deploy/helm/animus-operator/crds/animusclusters.animusdb.io.yaml is stale relative to \
+         `AnimusCluster::crd()`; regenerate both copies with `cargo run -p animus-operator -- crd \
+         > deploy/operator/crd.yaml && cp deploy/operator/crd.yaml \
+         deploy/helm/animus-operator/crds/animusclusters.animusdb.io.yaml`"
     );
 }

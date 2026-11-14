@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Path filters for the PR-only workflows ci.yml calls (chaos, fuzz, image,
-# demo-browsers). GitHub's `paths:` filter does not apply to `workflow_call`,
+# Path filters for the PR-only checks ci.yml runs conditionally (chaos, fuzz,
+# image, demo-browsers workflows; the `helm` job). GitHub's `paths:` filter does not apply to `workflow_call`,
 # and a path-filtered workflow cannot be a required check (it never reports on
 # an unrelated PR), so ci.yml's `changes` job evaluates the same lists here
 # and calls the workflows conditionally; the required `gates` aggregate then
@@ -38,3 +38,4 @@ echo "chaos=$(hit '^crates/animusd/tests/chaos\.rs$|^crates/animusd/tests/chaos_
 echo "fuzz=$(hit '^crates/|^fuzz/|^Cargo\.toml$|^Cargo\.lock$|^\.github/workflows/fuzz\.yml$')"
 echo "demo=$(hit '^website/|^crates/animus-web/|^crates/animusd/|^crates/animus-sim/|^Cargo\.toml$|^Cargo\.lock$|^scripts/build-web-demo\.sh$|^scripts/demo-browser-smoke\.mjs$|^\.github/workflows/demo-browsers\.yml$')"
 echo "image=${image}"
+echo "helm=$(hit '^deploy/helm/|^deploy/operator/|^crates/animus-operator/|^scripts/check-helm-charts\.sh$|^Cargo\.toml$')"

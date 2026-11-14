@@ -1,0 +1,37 @@
+# Default values for the animus-cluster chart: one AnimusCluster custom
+# resource. The animus-operator chart must already be installed.
+
+# -- Alternative object name (same effect as fullnameOverride).
+nameOverride: ""
+# -- Override the object name (default: the release name).
+fullnameOverride: ""
+
+# -- Extra labels / annotations on the AnimusCluster object.
+labels: {}
+annotations: {}
+
+# -- The AnimusCluster spec, passed through to the CRD verbatim (toYaml). Every
+# field the CRD accepts can be set here (see `kubectl explain animuscluster.spec`
+# and deploy/operator/example.yaml for tls, s3, backupStore, upgrade,
+# encryptionKeySecretName, dynamoAuthSecretName, resources, ...). Defaults
+# mirror deploy/operator/example.yaml.
+spec:
+  # Internal content-schema version (ADR 0073); required by the CRD.
+  schemaVersion: 1
+  # animusd image. Empty means ghcr.io/animus-db/animusd:<chart appVersion>.
+  # Until the first release tag exists that tag is not published yet: set
+  # spec.image=ghcr.io/animus-db/animusd:latest (the main-branch build).
+  image: ""
+  nodes: 3
+  # Defaults to min(3, nodes) when omitted; immutable downward. Spelled out
+  # to match example.yaml.
+  controlNodes: 3
+  storage:
+    size: 10Gi
+    # storageClassName: fast-ssd
+    # ephemeral: true is rejected when controlNodes resolves to more than 1.
+    ephemeral: false
+  basePort: 14000
+  clientService:
+    type: ClusterIP
+  quiesceAfterSecs: 5

@@ -1,0 +1,22 @@
+The AnimusDB operator {{ .Chart.AppVersion }} is installed in namespace {{ .Release.Namespace }}.
+
+Check it:
+  kubectl -n {{ .Release.Namespace }} rollout status deploy/{{ include "animus-operator.fullname" . }}
+  kubectl get crd animusclusters.animusdb.io
+
+Create a cluster next (3 nodes, 10Gi each):
+  helm install my-db oci://ghcr.io/animus-db/charts/animus-cluster \
+    --namespace default{{ if not .Values.image.tag }} --set spec.image=ghcr.io/animus-db/animusd:{{ .Chart.AppVersion }}{{ end }}
+or from a checkout:
+  helm install my-db deploy/helm/animus-cluster --namespace default
+
+Then watch it:
+  kubectl get animuscluster -o wide
+{{- if not .Values.webhook.enabled }}
+
+The validating admission webhook is off (webhook.enabled=false): an invalid
+AnimusCluster is accepted and reported as a status condition instead.
+{{- end }}
+
+Chart upgrades do NOT upgrade the CRD (Helm never touches crds/ after the
+first install); apply it yourself, see the chart README.
