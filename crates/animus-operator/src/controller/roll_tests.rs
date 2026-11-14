@@ -717,6 +717,66 @@ async fn a_failed_finalize_is_retried_never_forced() {
     assert_eq!(roll.posts("/admin/cluster-version/finalize").len(), 2);
 }
 
+/// Script the cluster-version view of a fully rolled cluster at `active`
+/// whose new binary supports up to `max` (every node reports `max`).
+fn done_world_to(roll: &Roll, active: u32, max: u32) {
+    done_world(roll, true);
+    let mut view = cv_view(true, active, true, &[max, max, max], &[]);
+    view["own_range"] = json!({"min": 1, "max": max});
+    roll.admin()
+        .script_get(None, "/admin/cluster-version", Ok(view));
+}
+
+/// The nightly `kind` roll's bug: the server raises the cluster version one
+/// step per finalize, and the operator used to mark the roll `Complete` after
+/// the first step, stranding the cluster below the new binary's maximum.
+#[tokio::test]
+async fn auto_finalize_steps_one_version_at_a_time_up_to_the_goal() {
+    let mut c = cluster(3, 3, NEW);
+    c.spec.upgrade = Some(UpgradeSpec {
+        finalize: Some(FinalizePolicy::Auto),
+        soak_seconds: None,
+    });
+    let mut roll = Roll::new(c);
+    roll.cluster.status = Some(rolling_status());
+
+    // active 1, the new binary supports 3: first step, not complete
+    done_world_to(&roll, 1, 3);
+    roll.tick().await;
+    assert_eq!(
+        roll.posts("/admin/cluster-version/finalize"),
+        vec![json!({"to": 2, "expected": 1})]
+    );
+    assert_eq!(roll.upgrade().phase, UpgradePhase::FinalizePending);
+    assert_eq!(roll.upgrade().active_cluster_version, Some(2));
+    assert!(roll.cond(CONDITION_ROLL_COMPLETE).is_none());
+    let msg = roll.cond(CONDITION_UPGRADE_FINALIZE_PENDING).unwrap();
+    assert!(msg.contains("up to 3"), "{msg}");
+
+    // the next reconcile sees active 2 and takes the last step
+    done_world_to(&roll, 2, 3);
+    roll.tick().await;
+    assert_eq!(
+        roll.posts("/admin/cluster-version/finalize"),
+        vec![
+            json!({"to": 2, "expected": 1}),
+            json!({"to": 3, "expected": 2})
+        ]
+    );
+    assert_eq!(roll.upgrade().phase, UpgradePhase::Complete);
+    assert!(
+        roll.cond(CONDITION_ROLL_COMPLETE)
+            .unwrap()
+            .contains("finalized to 3")
+    );
+
+    // and then it stays put: no third finalize
+    done_world_to(&roll, 3, 3);
+    roll.tick().await;
+    assert_eq!(roll.posts("/admin/cluster-version/finalize").len(), 2);
+    assert_eq!(roll.upgrade().phase, UpgradePhase::Complete);
+}
+
 #[tokio::test]
 async fn a_config_only_roll_completes_without_a_finalize() {
     let mut roll = Roll::new(cluster(3, 3, NEW));

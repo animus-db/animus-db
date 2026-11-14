@@ -1415,6 +1415,11 @@ decided *before* the `StatefulSet` apply) and `controller::reconcile` (edit hold
   whole-cluster stop-upgrade-restart. `spec.upgrade.finalize: Auto` finalizes only when the
   machine says `Finalize` (`can_finalize`, no blocker, soak elapsed): on the leader's
   `POST /admin/cluster-version/finalize {to, expected}`; a failure is retried, never forced.
+  The server raises the version **one step per call**, so a successful finalize marks the
+  roll `Complete` only when `to` reaches `goal`; below it the phase stays `FinalizePending`
+  and the next reconcile takes the next step (fixed 2026-11-14: the first step used to end
+  the roll, stranding the nightly kind roll at 3 of 10;
+  `auto_finalize_steps_one_version_at_a_time_up_to_the_goal`).
 - `status.upgrade` is additive and never removed (a merge patch cannot drop a key): its fields
   serialize as explicit `null`s so clearing a clock really clears it. Conditions:
   `UpgradeInProgress`, `UpgradeBlocked`, `UpgradeFinalizePending`, `RollComplete`,

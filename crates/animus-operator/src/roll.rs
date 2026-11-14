@@ -1181,6 +1181,11 @@ pub async fn step<C: ClusterApi, A: AdminOps>(
                 &facts,
             )
             .await;
+            // The version the roll finalizes to: the highest `own_range.max`
+            // a new pod reports. The server raises the cluster version one
+            // step per finalize, so one successful finalize is the end of
+            // the roll only when it reaches this goal.
+            let goal = obs.as_ref().ok().map(|o| o.goal);
             let mut out = match obs {
                 Err(why) => {
                     warn!(cluster = %name, error = %why, "roll gate cannot be evaluated; holding the partition");
@@ -1214,11 +1219,26 @@ pub async fn step<C: ClusterApi, A: AdminOps>(
                     Ok(()) => {
                         info!(cluster = %name, ?effect, "roll effect executed");
                         if let Some(to) = finalized_to {
-                            out.phase = UpgradePhase::Complete;
                             out.active = Some(to);
-                            out.cond = RollCond::Complete(format!(
-                                "roll complete: cluster version finalized to {to}"
-                            ));
+                            match goal {
+                                // More steps to go: stay FinalizePending, so
+                                // the next reconcile is still a Drive and
+                                // finalizes the next step (never Complete
+                                // after the first step: the nightly kind
+                                // roll stopped at 3 of 10 that way).
+                                Some(g) if to < g => {
+                                    out.cond = RollCond::FinalizePending(format!(
+                                        "cluster version finalized to {to}; finalizing one \
+                                         step at a time up to {g}"
+                                    ));
+                                }
+                                _ => {
+                                    out.phase = UpgradePhase::Complete;
+                                    out.cond = RollCond::Complete(format!(
+                                        "roll complete: cluster version finalized to {to}"
+                                    ));
+                                }
+                            }
                         }
                     }
                     Err(e) => {
