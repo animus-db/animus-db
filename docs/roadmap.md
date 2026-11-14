@@ -1776,6 +1776,9 @@ RPC; adds a request field, needs its own classification).
 
 - **Gap:** the project is "pre-alpha" (root `CLAUDE.md`, `website/index.html`
   meta description) with no written definition of what would end that.
+  **Historical text, as checked 2026-10-04: most of the absences below have since
+  been filled; the current per-criterion state is `docs/production-readiness.md`
+  (re-verified 2026-11-14).**
   Correctness is strong in simulation (ADR 0003 and the corpora) but the
   following were checked absent by grep/ls this session: no `cargo-fuzz`
   target or `fuzz/` directory (the word appears only in in-crate
@@ -1791,8 +1794,8 @@ RPC; adds a request field, needs its own classification).
   DynamoDB edge beyond the 1 MiB `MAX_BODY` request cap
   (`crates/animus-node/src/http.rs`) and per-table throttling (ADR 0065).
   Disk-full is injected in simulation (`animus-sim` `DiskConfig`,
-  `StorageFull`); handling landed with (d) (issue #1185), but its behaviour on
-  real nodes is still untested.
+  `StorageFull`); handling landed with (d) (issue #1185) and is exercised on real
+  nodes by `chaos_disk_full` (#1221).
 - **Plan:** define **beta exit criteria** as a checklist in a new
   `docs/production-readiness.md` (ratified by the ADR), each item
   checkable and owned by a sub-track below. Beta means: every criterion
@@ -1863,9 +1866,9 @@ RPC; adds a request field, needs its own classification).
     **Disk-full landed (issue #1185, 2026-10-05):** ENOSPC marks the WAL suspect,
     writes are refused with a named 503 `StorageFull`, and the WAL is rewritten
     from the in-memory log onto free space without a restart (sim corpus
-    `ANIMUS_DISK_FULL_SEEDS`; `docs/resource-bounds.md` section 3). LSM-engine ENOSPC (#1218) and leader step-down (#1219)
-    have since landed. **Still open:** exporting `spawned_task_panics` and a
-    `ProdEnv` tmpfs test. Each
+    `ANIMUS_DISK_FULL_SEEDS`; `docs/resource-bounds.md` section 3). LSM-engine ENOSPC (#1218), leader step-down (#1219),
+    the panic export (#1220) and the real-tmpfs test (`chaos_disk_full`, #1221)
+    have since landed. Each
     bound gets a sim test with fault injection where possible and a
     `ProdEnv` test where not.
   - **(e) Operations runbook (independent; M).** `docs/runbook/`: node
