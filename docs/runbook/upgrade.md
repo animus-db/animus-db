@@ -24,9 +24,11 @@ unrelated builds in one cluster, and never skip a release.**
 Plan a maintenance window; clients cannot be served during it.
 
 1. **Before.**
-   - Read the release notes for format or flag changes. There is no changelog or
-     version endpoint yet (workspace version is `0.0.0`, no `--version` flag): identify
-     builds by image digest or binary checksum, and record the exact old and new ones.
+   - Read the release notes for format or flag changes. `CHANGELOG.md` and
+     `docs/release.md` carry them (no release has been tagged yet, so the changelog has only
+     `Unreleased`). `animusd --version` prints the binary version (informational only, never used for
+     a compatibility decision); also record the image digest or binary checksum of the exact old and
+     new builds.
    - Healthy cluster: `/admin/health` 200 everywhere, every member `Active`, no tablet
      `under-replicated` ([tablet-unavailable.md](tablet-unavailable.md)), no firing alerts.
    - **Take and verify a rollback copy with the old version**: an on-demand backup of
