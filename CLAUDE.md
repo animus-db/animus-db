@@ -689,7 +689,7 @@ truth; this map is just for navigation.
   soon as the PR is opened; `gates` aggregates every PR check, so the queue
   only takes a fully green PR. `gates` covers `lint`, `wasm`, `test-archive`,
   `test-shard`, `test-doc`, `s3-real-endpoint`, `upgrade-previous-release`,
-  `corpus-changed` and `dco` (PR only), and the path-filtered `chaos`, `fuzz`,
+  `corpus-changed`, `dco` and `cla` (PR only), and the path-filtered `chaos`, `fuzz`,
   `image` and `demo-browsers` (PR only, called from `ci.yml`; a skip because
   the diff cannot reach them is a pass). `prod-liveness` is the second
   required check. Do not hold it for a human approval. "Green" is the full

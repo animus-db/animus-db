@@ -13,7 +13,7 @@ relevant ADR (or supersede it) in the same PR as the code change.
 | [0004](0004-dynamo-storage-primitive.md) | Dynamo-lineage storage primitive (partitioned sorted map-of-maps) | Accepted |
 | [0005](0005-placement-residency.md) | Placement groups + topology-aware data residency | Accepted |
 | [0006](0006-dual-cql-dynamo-adapters.md) | Dual CQL + DynamoDB adapters over a common core | Superseded by [0053](0053-dynamodb-only-drop-cql.md) |
-| [0007](0007-agpl-cla.md) | AGPL-3.0 + CLA | Accepted |
+| [0007](0007-agpl-cla.md) | AGPL-3.0 + CLA (commercial licence on request, CLA as built: 2026-11-14 amendment) | Accepted |
 | [0008](0008-borrowed-storage-first.md) | Borrowed storage engine first, custom LSM deferred | Accepted |
 | [0009](0009-in-house-raft-over-env.md) | In-house Raft over the `Env` seam (deviation from openraft) | Accepted |
 | [0010](0010-ap-repair-anti-entropy.md) | AP repair: read-repair + background anti-entropy | Accepted |

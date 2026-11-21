@@ -54,9 +54,34 @@ This adds a `Signed-off-by: Your Name <you@example.com>` trailer.
 
 ## Contributor License Agreement (CLA)
 
-To preserve future licensing optionality (see
-[ADR 0007](docs/adr/0007-agpl-cla.md)), contributions also require accepting the
-project CLA. A CLA bot will comment on your first PR with a one-time signing link.
+AnimusDB is licensed under the AGPL-3.0 and is also offered under a commercial
+licence on request (see [ADR 0007](docs/adr/0007-agpl-cla.md)). For your
+contribution to ship in both, you also accept the
+[AnimusDB Contributor License Agreement](CLA.md). You keep the copyright in
+your work; the agreement grants the project a licence to distribute it, and
+commits the project to keeping it available under the AGPL.
+
+Signing takes one comment, once per GitHub account:
+
+1. Open your pull request. If you have not signed yet, the `CLA` workflow
+   comments with what to do, and the required `cla` check stays red.
+2. Read [CLA.md](CLA.md), then post this exact comment on the pull request:
+
+   ```
+   I have read the AnimusDB CLA and I hereby sign it.
+   ```
+
+3. The workflow records your signature (GitHub account, date, agreement
+   version, link to your comment) on the public `cla-signatures` branch and
+   re-runs the failed CI jobs, so the check turns green without a new push.
+
+Everyone who authored a commit in the PR signs, not just the person who opened
+it. Commits must be authored by an e-mail address linked to your GitHub
+account, or they cannot be matched to your signature. Commits written by a
+coding assistant on your behalf are covered by your own signature
+(`.github/cla.json` lists the assistant e-mails). The mechanism lives in
+`.github/workflows/cla.yml`, the `cla` job of `.github/workflows/ci.yml`, and
+`.github/scripts/cla.js`.
 
 ## Code of Conduct
 
